@@ -126,7 +126,7 @@ export async function writeMemoryOnIdle(opts: {
       return
     }
 
-    const llmConfig = await getLLMConfig(v2Client, directory)
+    const llmConfig = await getLLMConfig(v2Client, directory, client)
     if (!llmConfig.enabled || !llmConfig.model) {
       void log(client, "info", "llm extraction skipped: model unavailable", {
         reason: boundedDiagnosticValue(llmConfig.reason ?? "model resolution returned no model"),

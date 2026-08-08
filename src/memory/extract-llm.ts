@@ -1,9 +1,8 @@
 /**
  * SDK-v2 structured extraction.
  *
- * This module deliberately knows nothing about the v1 plugin client. The v1
- * client is still used by the writer to read the source transcript, while all
- * structured-output requests go through the lazily-created v2 client.
+ * The v1 plugin client is used only for the lazily-resolved project config;
+ * all structured-output requests go through the lazily-created v2 client.
  */
 import type { ExtractedFacts } from "../types"
 import {
@@ -117,6 +116,12 @@ type V2ClientLike = {
   }
 }
 
+type V1ConfigClientLike = {
+  config?: {
+    get: (parameters: { query: { directory: string } }) => Promise<unknown>
+  }
+}
+
 type ProviderInventoryEntry = {
   id: string
   disabled: boolean
@@ -138,6 +143,13 @@ type ModelDiscoveryResult = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function readConfiguredModel(result: unknown): SmallModel | undefined {
+  if (!isRecord(result) || result.error != null || !isRecord(result.data)) return undefined
+
+  const smallModel = result.data.small_model
+  return parseSmallModel(typeof smallModel === "string" ? smallModel : undefined)
 }
 
 /** Read the response body used by the v2 inventory endpoints. */
@@ -237,6 +249,7 @@ async function discoverFreeSmallModel(
 export async function getLLMConfig(
   v2Client: unknown,
   directory = "",
+  configClient?: unknown,
 ): Promise<LLMExtractionConfig> {
   if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
     return { enabled: false, reason: "TOKENMAXXER_LLM_EXTRACT is disabled" }
@@ -246,15 +259,25 @@ export async function getLLMConfig(
     const client = v2Client as V2ClientLike
     let configuredModel: SmallModel | undefined
 
-    if (client.config?.get) {
+    // The plugin's v1 client reads the project config through the nested query
+    // shape. This is the authoritative source for an explicit small_model,
+    // but it must remain inside the session.idle path that calls this helper.
+    const v1Client = configClient as V1ConfigClientLike | undefined
+    if (v1Client?.config?.get) {
       try {
-        const result = await client.config.get({ directory })
-        const response = result as { data?: { small_model?: unknown }; error?: unknown } | null
-        if (response && response.error == null && response.data) {
-          configuredModel = parseSmallModel(
-            typeof response.data.small_model === "string" ? response.data.small_model : undefined,
-          )
-        }
+        configuredModel = readConfiguredModel(
+          await v1Client.config.get({ query: { directory } }),
+        )
+      } catch {
+        // An unavailable v1 config endpoint falls through to the v2 attempt.
+      }
+    }
+
+    // Keep the root-v2 config request as a compatibility fallback for callers
+    // that do not expose the v1 client or when its explicit value is absent.
+    if (!configuredModel && client.config?.get) {
+      try {
+        configuredModel ??= readConfiguredModel(await client.config.get({ directory }))
       } catch {
         // A config read failure is equivalent to an absent/malformed override;
         // try the dynamic inventory before falling back to heuristics.

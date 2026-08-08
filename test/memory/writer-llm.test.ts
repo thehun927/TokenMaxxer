@@ -134,13 +134,16 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
         },
       },
     }))
+    const v2ConfigGet = vi.fn(async () => ({ data: { small_model: "root-provider/root-model" } }))
     const v2 = {
-      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      config: { get: v2ConfigGet },
       session: { create, prompt },
     }
     const appLog = vi.fn()
+    const v1ConfigGet = vi.fn(async () => ({ data: { small_model: "provider/model" } }))
     const v1 = {
       app: { log: appLog },
+      config: { get: v1ConfigGet },
       session: { messages: vi.fn(async () => ({ data: sourceMessages() })) },
     }
 
@@ -155,6 +158,8 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
     const memory = await readMemory({ worktree, directory: worktree })
     expect(create).toHaveBeenCalledTimes(1)
     expect(prompt).toHaveBeenCalledTimes(1)
+    expect(v1ConfigGet).toHaveBeenCalledWith({ query: { directory: worktree } })
+    expect(v2ConfigGet).not.toHaveBeenCalled()
     expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
       directory: worktree,
       sessionID: "audit-session",

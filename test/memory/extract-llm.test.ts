@@ -285,6 +285,54 @@ describe("SDK-v2 structured extraction", () => {
     expect(listProviders).not.toHaveBeenCalled()
   })
 
+  it("prefers the valid v1 config override and uses the nested query shape", async () => {
+    const v1Get = vi.fn(async () => ({ data: { small_model: "v1-provider/v1-model" } }))
+    const v2Get = vi.fn(async () => ({ data: { small_model: "v2-provider/v2-model" } }))
+    const listModels = vi.fn()
+    const listProviders = vi.fn()
+
+    await expect(getLLMConfig({
+      config: { get: v2Get },
+      v2: { model: { list: listModels }, provider: { list: listProviders } },
+    }, "/worktree", {
+      config: { get: v1Get },
+    })).resolves.toEqual({
+      enabled: true,
+      model: { providerID: "v1-provider", modelID: "v1-model" },
+    })
+
+    expect(v1Get).toHaveBeenCalledWith({ query: { directory: "/worktree" } })
+    expect(v2Get).not.toHaveBeenCalled()
+    expect(listModels).not.toHaveBeenCalled()
+    expect(listProviders).not.toHaveBeenCalled()
+  })
+
+  it("falls through from a failed v1 config request to v2 config and inventory", async () => {
+    const v1Get = vi.fn(async () => { throw new Error("v1 config unavailable") })
+    const v2Get = vi.fn(async () => ({ data: {} }))
+    const listModels = vi.fn(async () => inventoryResponse([
+      inventoryModel({ id: "fallback-model", providerID: "fallback-provider" }),
+    ]))
+    const listProviders = vi.fn(async () => inventoryResponse([
+      { id: "fallback-provider" },
+    ]))
+
+    await expect(getLLMConfig({
+      config: { get: v2Get },
+      v2: { model: { list: listModels }, provider: { list: listProviders } },
+    }, "/worktree", {
+      config: { get: v1Get },
+    })).resolves.toEqual({
+      enabled: true,
+      model: { providerID: "fallback-provider", modelID: "fallback-model" },
+    })
+
+    expect(v1Get).toHaveBeenCalledWith({ query: { directory: "/worktree" } })
+    expect(v2Get).toHaveBeenCalledWith({ directory: "/worktree" })
+    expect(listModels).toHaveBeenCalledTimes(1)
+    expect(listProviders).toHaveBeenCalledTimes(1)
+  })
+
   it("discovers the first eligible zero-cost model in API order", async () => {
     const listModels = vi.fn(async (parameters: unknown) => {
       expect(parameters).toEqual({ location: { directory: "/worktree" } })
