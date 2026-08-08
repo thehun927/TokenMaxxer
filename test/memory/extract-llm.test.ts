@@ -93,6 +93,30 @@ describe("v1 structured extraction", () => {
     }))
   })
 
+  it("binds the host session receiver for create and prompt", async () => {
+    const session = {
+      create: vi.fn(function (this: unknown) {
+        expect(this).toBe(session)
+        return Promise.resolve({ data: { id: "audit-bound" } })
+      }),
+      prompt: vi.fn(function (this: unknown) {
+        expect(this).toBe(session)
+        return Promise.resolve({ data: { info: { structured: facts } } })
+      }),
+    }
+
+    await expect(extractFactsLLM(
+      canonical(),
+      "source-bound",
+      "project",
+      { session },
+      { enabled: true, model: { providerID: "provider", modelID: "model" } },
+      { directory: "/worktree" },
+    )).resolves.toEqual(facts)
+    expect(session.create).toHaveBeenCalledTimes(1)
+    expect(session.prompt).toHaveBeenCalledTimes(1)
+  })
+
   it("does not create a session for a validated cache hit", async () => {
     const client = {
       session: {

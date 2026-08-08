@@ -322,7 +322,7 @@ export async function extractFactsLLM(
       }
       query: { directory: string }
     }) => Promise<unknown>
-    const created = await create({
+    const created = await create.call(client.session, {
       body: {
         title: `tokenmaxxer extract · ${projectName} · ${sourceSessionID.slice(-8)}`,
         metadata: {
@@ -378,7 +378,7 @@ export async function extractFactsLLM(
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const result = await prompt(promptParameters)
+      const result = await prompt.call(client.session, promptParameters)
       const response = result as {
         data?: { info?: unknown }
         error?: unknown
