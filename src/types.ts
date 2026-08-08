@@ -42,6 +42,17 @@ export interface TranscriptMessage {
 
 export type TranscriptPart =
   | { type: "text"; text: string; [key: string]: unknown }
-  | { type: "tool"; tool: string; input: Record<string, unknown>; output?: { state?: { status?: string }; [key: string]: unknown }; [key: string]: unknown }
+  | {
+      type: "tool"
+      tool: string
+      state?: {
+        status?: string
+        input?: Record<string, unknown>
+        output?: string
+        error?: string
+        [key: string]: unknown
+      }
+      [key: string]: unknown
+    }
   | { type: "step-finish"; tokens?: { input: number; output: number; reasoning?: number; cache?: { read: number; write: number } }; [key: string]: unknown }
   | { type: string; [key: string]: unknown }

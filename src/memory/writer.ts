@@ -138,7 +138,7 @@ function extractActiveFiles(
       if (part.type !== "tool") continue
 
       const toolName = part.tool
-      const input = (part.input || {}) as Record<string, unknown>
+      const input = ((part as { state?: { input?: Record<string, unknown> } }).state?.input || {}) as Record<string, unknown>
 
       if (
         toolName === "read" ||
@@ -171,8 +171,8 @@ function extractActiveFiles(
 function extractPaths(tool: string, input: Record<string, unknown>): string[] {
   const paths: string[] = []
 
-  // Direct path fields
-  for (const key of ["path", "filePath", "file"]) {
+  // Direct path fields (filePath is the real opencode field name)
+  for (const key of ["filePath", "path", "file"]) {
     const val = input[key]
     if (typeof val === "string" && val.length > 0) {
       paths.push(val)
@@ -200,13 +200,19 @@ function extractPaths(tool: string, input: Record<string, unknown>): string[] {
     }
   }
 
-  // Bash command: extract paths from command string
+  // Bash command: extract file-like paths from command string
   if (tool === "bash") {
     const command = input["command"]
     if (typeof command === "string") {
-      const pathMatches = command.matchAll(/(?:\.\/?[\w\-/.]+)/g)
+      // Match paths that look like files: contain / and have a file-like extension or path structure
+      // e.g. "src/index.ts", "test/memory/writer.test.ts", "./dist/index.js"
+      const pathMatches = command.matchAll(/(?:\.?\/)?(?:[\w-]+\/)+[\w.-]+/g)
       for (const m of pathMatches) {
-        paths.push(m[0])
+        const p = m[0]
+        // Filter out obvious non-file paths (URLs, node_modules, etc.)
+        if (!p.includes("://") && !p.startsWith("node_modules")) {
+          paths.push(p)
+        }
       }
     }
   }
@@ -239,13 +245,8 @@ function extractDecisions(messages: TranscriptMessage[]): {
   for (const msg of messages) {
     for (const part of msg.parts) {
       if (part.type === "tool") {
-        const outputState = (part.output as Record<string, unknown> | undefined)?.state
-        if (
-          outputState &&
-          typeof outputState === "object" &&
-          (outputState as Record<string, unknown>).status === "completed"
-        ) {
-          // Extract text from tool output
+        const state = (part as { state?: { status?: string } }).state
+        if (state && state.status === "completed") {
           const outputText = extractToolOutputText(part)
           if (outputText) {
             allDecisions.push(...scanTextForDecisions(outputText))
@@ -480,15 +481,13 @@ function getMessageText(msg: TranscriptMessage): string {
 /** Extract text from a tool part's output for decision scanning. */
 function extractToolOutputText(part: TranscriptPart): string | null {
   if (part.type !== "tool") return null
-  const output = part.output
-  if (!output) return null
+  const state = (part as { state?: { output?: string; error?: string } }).state
+  if (!state) return null
 
-  // Try common output text fields
-  const outputAny = output as Record<string, unknown>
-  for (const key of ["text", "content", "output", "stdout", "result", "message"]) {
-    const val = outputAny[key]
-    if (typeof val === "string") return val
-  }
+  // The output field is a string in the real transcript
+  if (typeof state.output === "string") return state.output
+  if (typeof state.error === "string") return state.error
+
   return null
 }
 

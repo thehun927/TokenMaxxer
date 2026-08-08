@@ -128,24 +128,24 @@ describe("extractFactsHeuristic", () => {
   })
 
   describe("active_files extraction", () => {
-    it("parses paths from read/edit/write tool parts", () => {
+    it("parses paths from read/edit/write tool parts (real transcript structure)", () => {
       const messages: TranscriptMessage[] = [
         {
           info: { id: "m1", role: "assistant" },
           parts: [
-            { type: "tool", tool: "read", input: { path: "src/index.ts" } },
+            { type: "tool", tool: "read", state: { status: "completed", input: { filePath: "src/index.ts" } } },
           ],
         },
         {
           info: { id: "m2", role: "assistant" },
           parts: [
-            { type: "tool", tool: "edit", input: { path: "src/index.ts" } },
+            { type: "tool", tool: "edit", state: { status: "completed", input: { filePath: "src/index.ts" } } },
           ],
         },
         {
           info: { id: "m3", role: "assistant" },
           parts: [
-            { type: "tool", tool: "write", input: { path: "src/util.ts" } },
+            { type: "tool", tool: "write", state: { status: "completed", input: { filePath: "src/util.ts" } } },
           ],
         },
       ]
@@ -167,13 +167,27 @@ describe("extractFactsHeuristic", () => {
         messages.push({
           info: { id: `m${i}`, role: "assistant" },
           parts: [
-            { type: "tool", tool: "read", input: { path: `src/file-${i}.ts` } },
+            { type: "tool", tool: "read", state: { status: "completed", input: { filePath: `src/file-${i}.ts` } } },
           ],
         })
       }
 
       const facts = extractFactsHeuristic(messages)
       expect(facts.active_files.length).toBeLessThanOrEqual(5)
+    })
+
+    it("extracts paths from bash commands", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            { type: "tool", tool: "bash", state: { status: "completed", input: { command: "cat src/index.ts && npm run build", workdir: "/proj" } } },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      expect(facts.active_files.length).toBeGreaterThan(0)
+      expect(facts.active_files.some((f) => f.path.includes("src/index.ts"))).toBe(true)
     })
   })
 

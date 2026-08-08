@@ -376,7 +376,7 @@ function extractActiveFiles(messages) {
     for (const part of msg.parts) {
       if (part.type !== "tool") continue;
       const toolName = part.tool;
-      const input = part.input || {};
+      const input = part.state?.input || {};
       if (toolName === "read" || toolName === "edit" || toolName === "write" || toolName === "glob" || toolName === "grep" || toolName === "bash") {
         const paths = extractPaths(toolName, input);
         for (const p of paths) {
@@ -393,7 +393,7 @@ function extractActiveFiles(messages) {
 }
 function extractPaths(tool4, input) {
   const paths = [];
-  for (const key of ["path", "filePath", "file"]) {
+  for (const key of ["filePath", "path", "file"]) {
     const val = input[key];
     if (typeof val === "string" && val.length > 0) {
       paths.push(val);
@@ -418,9 +418,12 @@ function extractPaths(tool4, input) {
   if (tool4 === "bash") {
     const command = input["command"];
     if (typeof command === "string") {
-      const pathMatches = command.matchAll(/(?:\.\/?[\w\-/.]+)/g);
+      const pathMatches = command.matchAll(/(?:\.?\/)?(?:[\w-]+\/)+[\w.-]+/g);
       for (const m of pathMatches) {
-        paths.push(m[0]);
+        const p = m[0];
+        if (!p.includes("://") && !p.startsWith("node_modules")) {
+          paths.push(p);
+        }
       }
     }
   }
@@ -440,8 +443,8 @@ function extractDecisions(messages) {
   for (const msg of messages) {
     for (const part of msg.parts) {
       if (part.type === "tool") {
-        const outputState = part.output?.state;
-        if (outputState && typeof outputState === "object" && outputState.status === "completed") {
+        const state = part.state;
+        if (state && state.status === "completed") {
           const outputText = extractToolOutputText(part);
           if (outputText) {
             allDecisions.push(...scanTextForDecisions(outputText));
@@ -627,13 +630,10 @@ function getMessageText(msg) {
 }
 function extractToolOutputText(part) {
   if (part.type !== "tool") return null;
-  const output = part.output;
-  if (!output) return null;
-  const outputAny = output;
-  for (const key of ["text", "content", "output", "stdout", "result", "message"]) {
-    const val = outputAny[key];
-    if (typeof val === "string") return val;
-  }
+  const state = part.state;
+  if (!state) return null;
+  if (typeof state.output === "string") return state.output;
+  if (typeof state.error === "string") return state.error;
   return null;
 }
 function markReferencedDecisions(mem, messages, sessionId) {
@@ -1057,6 +1057,11 @@ var TokenmaxxerPlugin = async (ctx) => {
           output.context.push(durable);
         }
         setLastCompaction((/* @__PURE__ */ new Date()).toISOString());
+        await log(client, "info", "compaction hook fired", {
+          session: input.sessionID,
+          promptReplaced: options.compactionPrompt,
+          durableLength: durable.length
+        });
         try {
           const project2 = resolveProjectPath(worktree, directory);
           const logPath = join4(project2, ".opencode", "memory", "last_compaction.log");

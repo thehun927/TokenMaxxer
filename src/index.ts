@@ -86,6 +86,13 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
         // Record compaction timestamp for the status tool
         setLastCompaction(new Date().toISOString())
 
+        // Diagnostic: confirm compaction hook fired
+        await log(client, "info", "compaction hook fired", {
+          session: input.sessionID,
+          promptReplaced: options.compactionPrompt,
+          durableLength: durable.length,
+        })
+
         // Dump the injected prompt for debugging (best effort)
         try {
           const project = resolveProjectPath(worktree, directory)
