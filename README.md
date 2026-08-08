@@ -194,17 +194,31 @@ discovered model. Remove it (or correct it) to use free-model discovery.
 
 ### Run a real extraction test
 
-Use a fresh source session so an earlier cache entry cannot satisfy the test:
+Use a fresh source session so an earlier cache entry cannot satisfy the test.
+Do not use `opencode run` for this validation: `opencode run` may exit before
+the fire-and-forget `session.idle` handlers finish. It can therefore create the
+source session without persisting memory or the retained audit extraction
+session.
 
-```bash
-TOKENMAXXER_LLM_EXTRACT=1 opencode run "For an extraction test, make an explicit decision to keep the heuristic fallback available, state one next step, and do not edit files."
-```
+1. In the target project, start an interactive OpenCode process:
 
-You can instead export the variable and use a normal interactive session.
-After the source session becomes idle, look in OpenCode's session list for the
-visible retained session titled `tokenmaxxer extract · ...`. It is a normal
-audit session and is never deleted. If discovery finds no eligible free model,
-no audit session is created because the run correctly uses heuristics only.
+   ```bash
+   TOKENMAXXER_LLM_EXTRACT=1 opencode
+   ```
+
+2. Send a prompt with an explicit decision and next step, for example: “For an
+   extraction test, explicitly decide to keep the heuristic fallback available,
+   state one next step, and do not edit files.”
+3. Keep the process open after the response until the source session is idle and
+   its detached idle work has completed.
+4. Confirm that `.opencode/memory/STATE.json` has a newer timestamp than before
+   the test and contains a new `llm_extraction_cache` entry.
+5. Run `opencode session list` and confirm it includes a visible retained
+   session titled `tokenmaxxer extract · ...`.
+
+The retained session is a normal audit record and is never deleted. If
+discovery finds no eligible free model, no cache entry or audit session is
+created because the opt-in path correctly uses heuristics only.
 
 ## Debugging
 
