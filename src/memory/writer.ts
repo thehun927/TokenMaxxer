@@ -245,33 +245,23 @@ function extractDecisions(messages: TranscriptMessage[]): {
 }[] {
   const allDecisions: RawDecision[] = []
 
-  // Source 1: first user message
+  // Source 1: first user message (strip code blocks)
   const firstUser = messages.find((m) => m.info.role === "user")
   if (firstUser) {
-    allDecisions.push(...scanTextForDecisions(getMessageText(firstUser)))
+    allDecisions.push(...scanTextForDecisions(stripCodeBlocks(getMessageText(firstUser))))
   }
 
-  // Source 2: all assistant messages
+  // Source 2: all assistant messages (strip code blocks first)
   for (const msg of messages) {
     if (msg.info.role === "assistant") {
-      allDecisions.push(...scanTextForDecisions(getMessageText(msg)))
+      const text = stripCodeBlocks(getMessageText(msg))
+      allDecisions.push(...scanTextForDecisions(text))
     }
   }
 
-  // Source 3: tool outputs with completed status
-  for (const msg of messages) {
-    for (const part of msg.parts) {
-      if (part.type === "tool") {
-        const state = (part as { state?: { status?: string } }).state
-        if (state && state.status === "completed") {
-          const outputText = extractToolOutputText(part)
-          if (outputText) {
-            allDecisions.push(...scanTextForDecisions(outputText))
-          }
-        }
-      }
-    }
-  }
+  // Source 3: REMOVED — tool outputs contain file contents, JSON, and logs
+  // that produce false positives (e.g. "Let's set up the schema" inside a JSON
+  // fixture). Decisions should only come from natural language conversation.
 
   // Dedupe by exact normalized topic (NOT substring)
   const seen = new Set<string>()
@@ -543,6 +533,36 @@ function getMessageText(msg: TranscriptMessage): string {
     .filter((p): p is { type: "text"; text: string } & typeof p => p.type === "text" && typeof (p as { text?: unknown }).text === "string")
     .map((p) => (p as unknown as { text: string }).text)
     .join("\n")
+}
+
+/**
+ * Strip code blocks and inline code from text before decision scanning.
+ * Code blocks contain file contents, JSON, logs — not natural language decisions.
+ * Matches: ```...```, `...`, and lines that look like JSON (start with { or ").
+ */
+function stripCodeBlocks(text: string): string {
+  // Remove fenced code blocks (```...```)
+  let stripped = text.replace(/```[\s\S]*?```/g, "")
+  // Remove inline code (`...`)
+  stripped = stripped.replace(/`[^`]+`/g, "")
+  // Remove lines that look like JSON (start with { " or } )
+  stripped = stripped
+    .split("\n")
+    .filter((line) => {
+      const trimmed = line.trim()
+      if (
+        trimmed.startsWith("{") ||
+        trimmed.startsWith("}") ||
+        trimmed.startsWith('"') ||
+        trimmed.startsWith("[") ||
+        trimmed.startsWith("]")
+      ) {
+        return false
+      }
+      return true
+    })
+    .join("\n")
+  return stripped
 }
 
 /** Extract text from a tool part's output for decision scanning. */

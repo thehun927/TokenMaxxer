@@ -438,24 +438,12 @@ function extractDecisions(messages) {
   const allDecisions = [];
   const firstUser = messages.find((m) => m.info.role === "user");
   if (firstUser) {
-    allDecisions.push(...scanTextForDecisions(getMessageText(firstUser)));
+    allDecisions.push(...scanTextForDecisions(stripCodeBlocks(getMessageText(firstUser))));
   }
   for (const msg of messages) {
     if (msg.info.role === "assistant") {
-      allDecisions.push(...scanTextForDecisions(getMessageText(msg)));
-    }
-  }
-  for (const msg of messages) {
-    for (const part of msg.parts) {
-      if (part.type === "tool") {
-        const state = part.state;
-        if (state && state.status === "completed") {
-          const outputText = extractToolOutputText(part);
-          if (outputText) {
-            allDecisions.push(...scanTextForDecisions(outputText));
-          }
-        }
-      }
+      const text = stripCodeBlocks(getMessageText(msg));
+      allDecisions.push(...scanTextForDecisions(text));
     }
   }
   const seen = /* @__PURE__ */ new Set();
@@ -652,13 +640,17 @@ function extractNextSteps(messages) {
 function getMessageText(msg) {
   return msg.parts.filter((p) => p.type === "text" && typeof p.text === "string").map((p) => p.text).join("\n");
 }
-function extractToolOutputText(part) {
-  if (part.type !== "tool") return null;
-  const state = part.state;
-  if (!state) return null;
-  if (typeof state.output === "string") return state.output;
-  if (typeof state.error === "string") return state.error;
-  return null;
+function stripCodeBlocks(text) {
+  let stripped = text.replace(/```[\s\S]*?```/g, "");
+  stripped = stripped.replace(/`[^`]+`/g, "");
+  stripped = stripped.split("\n").filter((line) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("}") || trimmed.startsWith('"') || trimmed.startsWith("[") || trimmed.startsWith("]")) {
+      return false;
+    }
+    return true;
+  }).join("\n");
+  return stripped;
 }
 function markReferencedDecisions(mem, messages, sessionId) {
   let recalled = false;

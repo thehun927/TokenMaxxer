@@ -365,5 +365,69 @@ describe("extractFactsHeuristic", () => {
       expect(facts.decisions).toHaveLength(1)
       expect(facts.decisions[0].topic.toLowerCase()).toContain("postgres")
     })
+
+    it("does not extract decisions from code blocks (JSON fixtures)", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            {
+              type: "text",
+              text: 'Here is the fixture:\n```json\n[\n  {\n    "text": "Let\'s set up the schema."\n  }\n]\n```\nLet\'s use Postgres for the database.',
+            },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      // "Let's set up the schema" inside the code block should NOT be extracted
+      const schemaDecision = facts.decisions.find((d) => d.topic.toLowerCase().includes("schema"))
+      expect(schemaDecision).toBeUndefined()
+      // "Let's use Postgres" outside the code block SHOULD be extracted
+      const pgDecision = facts.decisions.find((d) => d.topic.toLowerCase().includes("postgres"))
+      expect(pgDecision).toBeDefined()
+    })
+
+    it("does not extract decisions from JSON-like lines", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            {
+              type: "text",
+              text: '"topic": "x"), then check `state.json` after idle, we\'ll know",\nLet\'s use Postgres for the database.',
+            },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      // The JSON-like line should NOT produce a decision
+      expect(facts.decisions.some((d) => d.topic.includes('know",') || d.topic.includes('state.json'))).toBe(false)
+      // The real decision should be extracted
+      const pgDecision = facts.decisions.find((d) => d.topic.toLowerCase().includes("postgres"))
+      expect(pgDecision).toBeDefined()
+    })
+
+    it("does not extract decisions from tool outputs (source 3 removed)", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            {
+              type: "tool",
+              tool: "read",
+              state: {
+                status: "completed",
+                input: { filePath: "src/index.ts" },
+                output: 'Let\'s use MongoDB for the database.',
+              },
+            },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      // Tool outputs should NOT be scanned for decisions
+      const mongoDecision = facts.decisions.find((d) => d.topic.toLowerCase().includes("mongodb"))
+      expect(mongoDecision).toBeUndefined()
+    })
   })
 })
