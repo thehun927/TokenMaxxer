@@ -361,11 +361,17 @@ function scanTextForDecisions(text: string): RawDecision[] {
       const topic = extractTopicPhrase(afterText)
       if (!topic) continue
 
+      // Quality filter: reject low-confidence topics
+      if (!isPlausibleTopic(topic.normalized)) continue
+
       // Auto-detect foundational
       const foundational = FOUNDATIONAL_RE.test(trimmedSentence)
 
       // Decision text: the full sentence, trimmed
       const decision = trimmedSentence
+
+      // Quality filter: reject decisions containing JSON/code artifacts
+      if (!isPlausibleDecision(decision)) continue
 
       // Dedup by sentence — if the same sentence produced multiple matches,
       // keep only the first (prevents "let's go with" matching both "let's" and "go with")
@@ -382,6 +388,50 @@ function scanTextForDecisions(text: string): RawDecision[] {
   }
 
   return decisions
+}
+
+/**
+ * Check if a topic is plausible as a real decision topic.
+ * Rejects: common English words, code fragments, JSON artifacts, too-short topics.
+ */
+function isPlausibleTopic(topic: string): boolean {
+  // Must be at least 3 chars
+  if (topic.length < 3) return false
+
+  // Reject if contains non-alphanumeric chars (code fragments like know", schema." })
+  if (!/^[a-z0-9\s-]+$/i.test(topic)) return false
+
+  // Reject common English words that are not decision topics
+  const COMMON_WORDS = new Set([
+    "know", "go", "schema", "topics", "keywords", "regex", "pattern",
+    "heuristic", "extraction", "negation", "keyword", "decision",
+    "the", "this", "that", "what", "which", "how", "why", "when",
+    "use", "using", "used", "set", "get", "put", "run", "try",
+    "fix", "test", "code", "file", "data", "type", "name", "path",
+    "line", "word", "text", "part", "step", "next", "last", "first",
+    "new", "old", "add", "del", "mod", "put", "see", "say",
+    "one", "two", "all", "any", "some", "each", "both",
+  ])
+  if (COMMON_WORDS.has(topic.toLowerCase())) return false
+
+  return true
+}
+
+/**
+ * Check if a decision text is plausible as a real decision.
+ * Rejects: JSON artifacts, escaped quotes, code fragments.
+ */
+function isPlausibleDecision(decision: string): boolean {
+  // Reject if contains escaped quotes (JSON artifact)
+  if (decision.includes('\\"') || decision.includes("\\\\")) return false
+
+  // Reject if contains JSON key-value patterns like "topic": " or "decision": "
+  if (/"\w+":\s*"/.test(decision)) return false
+
+  // Reject if starts with a quote (likely code/JSON)
+  if (decision.startsWith('"') || decision.startsWith("'")) return false
+
+  return true
 }
 
 /**

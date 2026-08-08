@@ -502,8 +502,10 @@ function scanTextForDecisions(text) {
       }
       const topic = extractTopicPhrase(afterText);
       if (!topic) continue;
+      if (!isPlausibleTopic(topic.normalized)) continue;
       const foundational = FOUNDATIONAL_RE.test(trimmedSentence);
       const decision = trimmedSentence;
+      if (!isPlausibleDecision(decision)) continue;
       const sentenceKey = decision.slice(0, 100);
       if (seenSentences.has(sentenceKey)) continue;
       seenSentences.add(sentenceKey);
@@ -516,6 +518,79 @@ function scanTextForDecisions(text) {
     }
   }
   return decisions;
+}
+function isPlausibleTopic(topic) {
+  if (topic.length < 3) return false;
+  if (!/^[a-z0-9\s-]+$/i.test(topic)) return false;
+  const COMMON_WORDS = /* @__PURE__ */ new Set([
+    "know",
+    "go",
+    "schema",
+    "topics",
+    "keywords",
+    "regex",
+    "pattern",
+    "heuristic",
+    "extraction",
+    "negation",
+    "keyword",
+    "decision",
+    "the",
+    "this",
+    "that",
+    "what",
+    "which",
+    "how",
+    "why",
+    "when",
+    "use",
+    "using",
+    "used",
+    "set",
+    "get",
+    "put",
+    "run",
+    "try",
+    "fix",
+    "test",
+    "code",
+    "file",
+    "data",
+    "type",
+    "name",
+    "path",
+    "line",
+    "word",
+    "text",
+    "part",
+    "step",
+    "next",
+    "last",
+    "first",
+    "new",
+    "old",
+    "add",
+    "del",
+    "mod",
+    "put",
+    "see",
+    "say",
+    "one",
+    "two",
+    "all",
+    "any",
+    "some",
+    "each",
+    "both"
+  ]);
+  if (COMMON_WORDS.has(topic.toLowerCase())) return false;
+  return true;
+}
+function isPlausibleDecision(decision) {
+  if (decision.includes('\\"') || decision.includes("\\\\")) return false;
+  if (/"\w+":\s*"/.test(decision)) return false;
+  if (decision.startsWith('"') || decision.startsWith("'")) return false;
+  return true;
 }
 function extractTopicPhrase(afterKeyword) {
   let words = afterKeyword.trim().split(/\s+/);

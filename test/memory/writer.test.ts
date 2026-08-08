@@ -429,5 +429,49 @@ describe("extractFactsHeuristic", () => {
       const mongoDecision = facts.decisions.find((d) => d.topic.toLowerCase().includes("mongodb"))
       expect(mongoDecision).toBeUndefined()
     })
+
+    it("rejects topics that are common English words", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            { type: "text", text: "Let's know the answer. Let's fix the code. Let's set the path." },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      // "know", "code", "path" are common words, not decision topics
+      expect(facts.decisions.some((d) => d.topic === "know")).toBe(false)
+      expect(facts.decisions.some((d) => d.topic === "code")).toBe(false)
+      expect(facts.decisions.some((d) => d.topic === "path")).toBe(false)
+    })
+
+    it("rejects decisions containing JSON artifacts (escaped quotes)", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            { type: "text", text: 'Let\'s use \\"postgres\\" for the database.' },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      // Escaped quotes indicate JSON/code, not a real decision
+      expect(facts.decisions).toHaveLength(0)
+    })
+
+    it("rejects topics with non-alphanumeric chars (code fragments)", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            { type: "text", text: 'Let\'s use schema." } for the database.' },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      // Topic "schema." }" contains non-alphanumeric chars
+      expect(facts.decisions).toHaveLength(0)
+    })
   })
 })
