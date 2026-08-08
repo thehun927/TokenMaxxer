@@ -1,8 +1,8 @@
 /**
- * SDK-v2 structured extraction.
+ * Structured extraction through the client supplied to the plugin.
  *
- * The v1 plugin client is used only for the lazily-resolved project config;
- * all structured-output requests go through the lazily-created v2 client.
+ * The client is deliberately used lazily: config discovery and all session
+ * requests are made only from the session.idle path.
  */
 import type { ExtractedFacts } from "../types"
 import {
@@ -88,52 +88,47 @@ export function parseSmallModel(smallModel: string | undefined): SmallModel | un
   return { providerID, modelID }
 }
 
-type V2ClientLike = {
+type V1ClientLike = {
   config?: {
-    get: (parameters: { directory: string }) => Promise<unknown>
+    get: (parameters: { query: { directory: string } }) => Promise<unknown>
   }
-  v2?: {
-    model?: {
-      list: (parameters: { location: { directory: string } }) => Promise<unknown>
-    }
-    provider?: {
-      list: (parameters: { location: { directory: string } }) => Promise<unknown>
-    }
+  provider?: {
+    list: (parameters: { query: { directory: string } }) => Promise<unknown>
   }
   session?: {
     create: (parameters: {
-      directory: string
-      title: string
-      metadata: Record<string, unknown>
+      body: { title: string }
+      query: { directory: string }
     }) => Promise<unknown>
     prompt: (parameters: {
-      sessionID: string
-      directory: string
-      model: SmallModel
-      format: { type: "json_schema"; schema: Record<string, unknown> }
-      parts: Array<{ type: "text"; text: string }>
+      path: { id: string }
+      query: { directory: string }
+      body: {
+        model: SmallModel
+        parts: Array<{ type: "text"; text: string }>
+      }
     }) => Promise<unknown>
   }
 }
 
-type V1ConfigClientLike = {
-  config?: {
-    get: (parameters: { query: { directory: string } }) => Promise<unknown>
+type StructuredPromptParameters = {
+  path: { id: string }
+  query: { directory: string }
+  body: {
+    model: SmallModel
+    parts: Array<{ type: "text"; text: string }>
+    format: { type: "json_schema"; schema: Record<string, unknown> }
   }
+}
+
+type StructuredResponseInfo = {
+  structured?: unknown
+  error?: unknown
 }
 
 type ProviderInventoryEntry = {
   id: string
-  disabled: boolean
-}
-
-type ModelInventoryEntry = {
-  id: string
-  providerID: string
-  enabled: boolean
-  status: string
-  tools: boolean
-  cost: unknown[]
+  models: Record<string, unknown>
 }
 
 type ModelDiscoveryResult = {
@@ -152,149 +147,94 @@ function readConfiguredModel(result: unknown): SmallModel | undefined {
   return parseSmallModel(typeof smallModel === "string" ? smallModel : undefined)
 }
 
-/** Read the response body used by the v2 inventory endpoints. */
-function readInventoryData(result: unknown): unknown[] | undefined {
+function readProviderInventory(result: unknown): ProviderInventoryEntry[] | undefined {
   if (!isRecord(result) || result.error != null || !isRecord(result.data)) return undefined
-  return Array.isArray(result.data.data) ? result.data.data : undefined
+  if (!Array.isArray(result.data.all)) return undefined
+
+  // Array iteration preserves the API's provider order; Object.entries below
+  // preserves each provider's model object order.
+  return result.data.all.flatMap((value) => {
+    if (!isRecord(value) || typeof value.id !== "string" || !isRecord(value.models)) return []
+    return [{ id: value.id, models: value.models }]
+  })
 }
 
-function readProviderInventoryEntry(value: unknown): ProviderInventoryEntry | undefined {
-  if (!isRecord(value) || typeof value.id !== "string" || value.id.length === 0) return undefined
-  if (value.disabled !== undefined && typeof value.disabled !== "boolean") return undefined
-  return { id: value.id, disabled: value.disabled === true }
-}
-
-function readModelInventoryEntry(value: unknown): ModelInventoryEntry | undefined {
-  if (!isRecord(value)) return undefined
-  if (typeof value.id !== "string" || value.id.length === 0) return undefined
-  if (typeof value.providerID !== "string" || value.providerID.length === 0) return undefined
-  if (value.enabled !== true || typeof value.status !== "string" || value.status !== "active") {
-    return undefined
-  }
-
-  const capabilities = value.capabilities
-  if (!isRecord(capabilities) || capabilities.tools !== true) return undefined
-  if (!Array.isArray(value.cost) || value.cost.length === 0) return undefined
-
-  return {
-    id: value.id,
-    providerID: value.providerID,
-    enabled: true,
-    status: value.status,
-    tools: true,
-    cost: value.cost,
-  }
-}
-
-function hasOnlyZeroInputOutputCost(cost: unknown[]): boolean {
-  return cost.every((tier) => (
-    isRecord(tier) &&
-    typeof tier.input === "number" && tier.input === 0 &&
-    typeof tier.output === "number" && tier.output === 0
-  ))
+function isFreeToolCallingModel(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  if (value.status !== undefined && value.status !== "active") return false
+  if (value.tool_call !== true) return false
+  if (!isRecord(value.cost)) return false
+  return value.cost.input === 0 && value.cost.output === 0
 }
 
 /**
- * Find the first eligible model in the API's release-date order. The endpoint
- * already defines that order; no local quality or provider ranking is applied.
+ * Find the first eligible model in provider order, then model object order.
+ * No local ranking or paid-model fallback is applied.
  */
 async function discoverFreeSmallModel(
-  client: V2ClientLike,
+  client: V1ClientLike,
   directory: string,
 ): Promise<ModelDiscoveryResult> {
-  if (!client.v2?.model?.list || !client.v2?.provider?.list) {
-    return { reason: "model inventory is unavailable" }
-  }
+  if (!client.provider?.list) return { reason: "model inventory is unavailable" }
 
   try {
-    const [modelsResult, providersResult] = await Promise.all([
-      client.v2.model.list({ location: { directory } }),
-      client.v2.provider.list({ location: { directory } }),
-    ])
-    const models = readInventoryData(modelsResult)
-    const providers = readInventoryData(providersResult)
-    if (!models || !providers) return { reason: "model inventory response is malformed" }
+    const providers = readProviderInventory(
+      await client.provider.list({ query: { directory } }),
+    )
+    if (!providers) return { reason: "model inventory response is malformed" }
 
-    const providersByID = new Map<string, ProviderInventoryEntry>()
-    for (const value of providers) {
-      const provider = readProviderInventoryEntry(value)
-      if (provider && !providersByID.has(provider.id)) {
-        providersByID.set(provider.id, provider)
-      }
-    }
-
-    for (const value of models) {
-      const model = readModelInventoryEntry(value)
-      if (!model) continue
-
-      const provider = providersByID.get(model.providerID)
-      if (!provider || provider.disabled || !hasOnlyZeroInputOutputCost(model.cost)) continue
-
-      return {
-        model: { providerID: model.providerID, modelID: model.id },
-        reason: "eligible model discovered",
+    for (const provider of providers) {
+      for (const [modelID, model] of Object.entries(provider.models)) {
+        if (!modelID || !isFreeToolCallingModel(model)) continue
+        const valueModelID = isRecord(model) && typeof model.id === "string" && model.id.length > 0
+          ? model.id
+          : modelID
+        return {
+          model: { providerID: provider.id, modelID: valueModelID },
+          reason: "eligible model discovered",
+        }
       }
     }
 
     return { reason: "no eligible free model found" }
   } catch {
-    // Inventory is optional. A failed or unavailable discovery request must
-    // leave the durable heuristic path as the only fallback.
+    // Discovery is optional. A failed request leaves heuristic persistence as
+    // the only fallback.
+    return { reason: "model inventory request failed" }
   }
-
-  return { reason: "model inventory request failed" }
 }
 
 /** Resolve the opt-in model. This function is only called by session.idle. */
 export async function getLLMConfig(
-  v2Client: unknown,
+  clientValue: unknown,
   directory = "",
-  configClient?: unknown,
 ): Promise<LLMExtractionConfig> {
   if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
     return { enabled: false, reason: "TOKENMAXXER_LLM_EXTRACT is disabled" }
   }
 
-  try {
-    const client = v2Client as V2ClientLike
-    let configuredModel: SmallModel | undefined
+  const client = (clientValue ?? {}) as V1ClientLike
+  let configuredModel: SmallModel | undefined
 
-    // The plugin's v1 client reads the project config through the nested query
-    // shape. This is the authoritative source for an explicit small_model,
-    // but it must remain inside the session.idle path that calls this helper.
-    const v1Client = configClient as V1ConfigClientLike | undefined
-    if (v1Client?.config?.get) {
-      try {
-        configuredModel = readConfiguredModel(
-          await v1Client.config.get({ query: { directory } }),
-        )
-      } catch {
-        // An unavailable v1 config endpoint falls through to the v2 attempt.
-      }
+  if (client.config?.get) {
+    try {
+      configuredModel = readConfiguredModel(
+        await client.config.get({ query: { directory } }),
+      )
+    } catch {
+      // A config read failure is equivalent to an absent/malformed override;
+      // try discovery before falling back to heuristics.
     }
-
-    // Keep the root-v2 config request as a compatibility fallback for callers
-    // that do not expose the v1 client or when its explicit value is absent.
-    if (!configuredModel && client.config?.get) {
-      try {
-        configuredModel ??= readConfiguredModel(await client.config.get({ directory }))
-      } catch {
-        // A config read failure is equivalent to an absent/malformed override;
-        // try the dynamic inventory before falling back to heuristics.
-      }
-    }
-
-    // A syntactically valid explicit override is authoritative and does not
-    // need to be present in the inventory response.
-    if (configuredModel) return { enabled: true, model: configuredModel }
-
-    const discovered = await discoverFreeSmallModel(client, directory)
-    return discovered.model
-      ? { enabled: true, model: discovered.model }
-      : { enabled: false, reason: discovered.reason }
-  } catch {
-    return { enabled: false, reason: "model resolution failed" }
   }
+
+  // A syntactically valid explicit override is authoritative and does not
+  // need to be present in the provider inventory.
+  if (configuredModel) return { enabled: true, model: configuredModel }
+
+  const discovered = await discoverFreeSmallModel(client, directory)
+  return discovered.model
+    ? { enabled: true, model: discovered.model }
+    : { enabled: false, reason: discovered.reason }
 }
 
 export type LLMExtractionDiagnostic =
@@ -323,7 +263,7 @@ export type LLMExtractionDiagnosticCallback = (
 ) => void | Promise<void>
 
 export interface ExtractFactsLLMOptions {
-  /** Project directory required by every flattened v2 request. */
+  /** Project directory required by every v1 request. */
   directory?: string
   /** A validated cache result, checked before creating an audit session. */
   cachedFacts?: ExtractedFacts | null
@@ -355,14 +295,14 @@ export async function extractFactsLLM(
   canonicalInput: CanonicalExtractionInput,
   sourceSessionID: string,
   projectName: string,
-  v2Client: unknown,
+  clientValue: unknown,
   config: LLMExtractionConfig,
   options?: ExtractFactsLLMOptions,
 ): Promise<ExtractedFacts | null> {
   if (!config.enabled || !config.model) return null
   if (options?.cachedFacts) return options.cachedFacts
 
-  const client = (v2Client ?? {}) as V2ClientLike
+  const client = (clientValue ?? {}) as V1ClientLike
   if (!client.session?.create || !client.session.prompt) {
     emitDiagnostic(options?.onDiagnostic, {
       kind: "unavailable-client",
@@ -373,15 +313,26 @@ export async function extractFactsLLM(
 
   let extractionSessionID: string | undefined
   try {
-    const created = await client.session.create({
-      directory: options?.directory ?? "",
-      title: `tokenmaxxer extract · ${projectName} · ${sourceSessionID.slice(-8)}`,
-      metadata: {
-        tokenmaxxer: {
-          kind: "llm-extraction",
-          sourceSessionID,
+    // The v1 create type omits metadata. Keep the compatibility cast at this
+    // call site rather than widening the rest of the client surface.
+    const create = client.session.create as unknown as (parameters: {
+      body: {
+        title: string
+        metadata: Record<string, unknown>
+      }
+      query: { directory: string }
+    }) => Promise<unknown>
+    const created = await create({
+      body: {
+        title: `tokenmaxxer extract · ${projectName} · ${sourceSessionID.slice(-8)}`,
+        metadata: {
+          tokenmaxxer: {
+            kind: "llm-extraction",
+            sourceSessionID,
+          },
         },
       },
+      query: { directory: options?.directory ?? "" },
     })
     const response = created as { data?: { id?: unknown }; error?: unknown } | null
     if (!response || response.error != null || typeof response.data?.id !== "string") {
@@ -395,6 +346,8 @@ export async function extractFactsLLM(
       return null
     }
     extractionSessionID = response.data.id
+    // Register before the first prompt so the audit session's idle event can
+    // never re-enter extraction.
     retainedExtractionSessionIDs.add(extractionSessionID)
   } catch (error) {
     emitDiagnostic(options?.onDiagnostic, {
@@ -405,29 +358,37 @@ export async function extractFactsLLM(
     return null
   }
 
-  const promptParameters = {
-    sessionID: extractionSessionID,
-    directory: options?.directory ?? "",
-    model: config.model,
-    format: {
-      type: "json_schema" as const,
-      schema: ExtractedFactsJsonSchema,
+  // The v1 prompt type omits structured format. Cast only this request shape;
+  // response text is intentionally never inspected as a fallback.
+  const prompt = client.session.prompt as unknown as (
+    parameters: StructuredPromptParameters,
+  ) => Promise<unknown>
+  const promptParameters: StructuredPromptParameters = {
+    path: { id: extractionSessionID },
+    query: { directory: options?.directory ?? "" },
+    body: {
+      model: config.model,
+      parts: [{ type: "text", text: buildExtractionPrompt(canonicalInput) }],
+      format: {
+        type: "json_schema",
+        schema: ExtractedFactsJsonSchema,
+      },
     },
-    parts: [{ type: "text" as const, text: buildExtractionPrompt(canonicalInput) }],
   }
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const result = await client.session.prompt(promptParameters)
+      const result = await prompt(promptParameters)
       const response = result as {
-        data?: { info?: { structured?: unknown; error?: unknown } }
+        data?: { info?: unknown }
         error?: unknown
       } | null
 
-      // v2 may return an SDK error field without throwing. It is a failed
+      // The SDK may return an error field without throwing. It is a failed
       // attempt even if a partial data object happens to be present.
-      if (!response || response.error != null || response.data?.info?.error != null) {
-        const responseError = response?.error ?? response?.data?.info?.error
+      const info = response?.data?.info as StructuredResponseInfo | undefined
+      if (!response || response.error != null || info?.error != null) {
+        const responseError = response?.error ?? info?.error
         emitDiagnostic(options?.onDiagnostic, {
           kind: "structured-output-failed",
           attempt: attempt + 1,
@@ -439,12 +400,13 @@ export async function extractFactsLLM(
 
       // Structured output is the only response value that is inspected. In
       // particular, assistant text and free-form JSON are never fallbacks.
-      const facts = validateStructuredResult(response.data?.info?.structured)
+      const structured = info?.structured
+      const facts = validateStructuredResult(structured)
       if (facts) return facts
       emitDiagnostic(options?.onDiagnostic, {
         kind: "structured-output-failed",
         attempt: attempt + 1,
-        reason: response?.data?.info?.structured === undefined
+        reason: structured === undefined
           ? "malformed-response"
           : "invalid-structured-output",
       })

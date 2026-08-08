@@ -55,14 +55,12 @@ function logLLMDiagnostic(client: unknown, diagnostic: LLMExtractionDiagnostic):
  */
 export async function writeMemoryOnIdle(opts: {
   client: unknown
-  /** Lazily constructed SDK-v2 client; never the v1 plugin client. */
-  v2Client?: unknown
   worktree: string
   directory: string
   sessionId: string
 }): Promise<void> {
   try {
-    const { client, v2Client, worktree, directory, sessionId } = opts
+    const { client, worktree, directory, sessionId } = opts
 
     // Fetch session messages
     const c = client as {
@@ -107,18 +105,14 @@ export async function writeMemoryOnIdle(opts: {
     // Prune to 8KB cap
     const pruned = pruneOld(withRecentSession)
 
-    // Write to disk before doing any LLM work. This is the durable v1
-    // fallback if the process exits or the v2 request is unavailable.
+    // Write to disk before doing any LLM work. This is the durable heuristic
+    // fallback if the process exits or an LLM request is unavailable.
     await writeMemory({ worktree, directory }, pruned)
     await generateHeader(worktree, directory, pruned)
 
-    // The feature is opt-in and the v2 client is only used after the idle
-    // handler has entered this function. In particular, initialization never
-    // resolves config.small_model.
-    if (!v2Client) {
-      void log(client, "debug", "llm extraction skipped: v2 client unavailable")
-      return
-    }
+    // The feature is opt-in and all LLM calls happen after the idle handler has
+    // entered this function. In particular, initialization never resolves
+    // config.small_model.
     if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
       void log(client, "debug", "llm extraction skipped: TOKENMAXXER_LLM_EXTRACT is disabled", {
         reason: "TOKENMAXXER_LLM_EXTRACT is disabled",
@@ -126,7 +120,7 @@ export async function writeMemoryOnIdle(opts: {
       return
     }
 
-    const llmConfig = await getLLMConfig(v2Client, directory, client)
+    const llmConfig = await getLLMConfig(client, directory)
     if (!llmConfig.enabled || !llmConfig.model) {
       void log(client, "info", "llm extraction skipped: model unavailable", {
         reason: boundedDiagnosticValue(llmConfig.reason ?? "model resolution returned no model"),
@@ -158,7 +152,7 @@ export async function writeMemoryOnIdle(opts: {
       canonicalInput,
       sessionId,
       projectName,
-      v2Client,
+      client,
       llmConfig,
       {
         directory,

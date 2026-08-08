@@ -30,23 +30,20 @@ function canonical() {
   return buildCanonicalInput(messages, emptyMemory("/worktree"))
 }
 
-function inventoryResponse(data: unknown[]) {
-  return { data: { location: { directory: "/worktree" }, data } }
+function providerResponse(all: unknown[]) {
+  return { data: { all } }
 }
 
 function inventoryModel(overrides: Record<string, unknown> = {}) {
   return {
-    id: "small-free",
-    providerID: "free-provider",
-    enabled: true,
-    status: "active",
-    capabilities: { tools: true },
-    cost: [{ input: 0, output: 0 }],
+    name: "Small Free",
+    tool_call: true,
+    cost: { input: 0, output: 0 },
     ...overrides,
   }
 }
 
-describe("SDK-v2 structured extraction", () => {
+describe("v1 structured extraction", () => {
   beforeEach(() => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
   })
@@ -61,7 +58,7 @@ describe("SDK-v2 structured extraction", () => {
     expect(parseSmallModel(undefined)).toBeUndefined()
   })
 
-  it("uses flattened v2 calls and retains one visible audit session", async () => {
+  it("uses nested v1 calls and retains one visible audit session", async () => {
     const create = vi.fn(async (parameters: unknown) => ({ data: { id: "audit-1" }, parameters }))
     const prompt = vi.fn(async () => ({ data: { info: { structured: facts } } }))
     const client = { session: { create, prompt } }
@@ -78,17 +75,21 @@ describe("SDK-v2 structured extraction", () => {
     expect(isRetainedExtractionSession("audit-1")).toBe(true)
 
     expect(create).toHaveBeenCalledWith(expect.objectContaining({
-      directory: "/worktree",
-      title: "tokenmaxxer extract · project · 12345678",
-      metadata: { tokenmaxxer: { kind: "llm-extraction", sourceSessionID: "source-12345678" } },
+      body: {
+        title: "tokenmaxxer extract · project · 12345678",
+        metadata: { tokenmaxxer: { kind: "llm-extraction", sourceSessionID: "source-12345678" } },
+      },
+      query: { directory: "/worktree" },
     }))
     expect(prompt).toHaveBeenCalledTimes(1)
     expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
-      sessionID: "audit-1",
-      directory: "/worktree",
-      model: { providerID: "anthropic", modelID: "haiku" },
-      format: expect.objectContaining({ type: "json_schema" }),
-      parts: [{ type: "text", text: expect.any(String) }],
+      path: { id: "audit-1" },
+      query: { directory: "/worktree" },
+      body: {
+        model: { providerID: "anthropic", modelID: "haiku" },
+        format: expect.objectContaining({ type: "json_schema" }),
+        parts: [{ type: "text", text: expect.any(String) }],
+      },
     }))
   })
 
@@ -257,175 +258,82 @@ describe("SDK-v2 structured extraction", () => {
   it("does not call config when extraction is disabled", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
     const get = vi.fn()
-    const listModels = vi.fn()
-    const listProviders = vi.fn()
+    const list = vi.fn()
     await expect(getLLMConfig({
       config: { get },
-      v2: { model: { list: listModels }, provider: { list: listProviders } },
+      provider: { list },
     }, "/worktree")).resolves.toEqual({
       enabled: false,
       reason: "TOKENMAXXER_LLM_EXTRACT is disabled",
     })
     expect(get).not.toHaveBeenCalled()
-    expect(listModels).not.toHaveBeenCalled()
-    expect(listProviders).not.toHaveBeenCalled()
+    expect(list).not.toHaveBeenCalled()
   })
 
   it("uses a valid configured provider/model override without discovery", async () => {
-    const listModels = vi.fn()
-    const listProviders = vi.fn()
+    const list = vi.fn()
+    const get = vi.fn(async () => ({ data: { small_model: "configured/model" } }))
     await expect(getLLMConfig({
-      config: { get: vi.fn(async () => ({ data: { small_model: "configured/model" } })) },
-      v2: { model: { list: listModels }, provider: { list: listProviders } },
+      config: { get },
+      provider: { list },
     }, "/worktree")).resolves.toEqual({
       enabled: true,
       model: { providerID: "configured", modelID: "model" },
     })
-    expect(listModels).not.toHaveBeenCalled()
-    expect(listProviders).not.toHaveBeenCalled()
+    expect(get).toHaveBeenCalledWith({ query: { directory: "/worktree" } })
+    expect(list).not.toHaveBeenCalled()
   })
 
-  it("prefers the valid v1 config override and uses the nested query shape", async () => {
-    const v1Get = vi.fn(async () => ({ data: { small_model: "v1-provider/v1-model" } }))
-    const v2Get = vi.fn(async () => ({ data: { small_model: "v2-provider/v2-model" } }))
-    const listModels = vi.fn()
-    const listProviders = vi.fn()
-
-    await expect(getLLMConfig({
-      config: { get: v2Get },
-      v2: { model: { list: listModels }, provider: { list: listProviders } },
-    }, "/worktree", {
-      config: { get: v1Get },
-    })).resolves.toEqual({
-      enabled: true,
-      model: { providerID: "v1-provider", modelID: "v1-model" },
-    })
-
-    expect(v1Get).toHaveBeenCalledWith({ query: { directory: "/worktree" } })
-    expect(v2Get).not.toHaveBeenCalled()
-    expect(listModels).not.toHaveBeenCalled()
-    expect(listProviders).not.toHaveBeenCalled()
-  })
-
-  it("falls through from a failed v1 config request to v2 config and inventory", async () => {
-    const v1Get = vi.fn(async () => { throw new Error("v1 config unavailable") })
-    const v2Get = vi.fn(async () => ({ data: {} }))
-    const listModels = vi.fn(async () => inventoryResponse([
-      inventoryModel({ id: "fallback-model", providerID: "fallback-provider" }),
-    ]))
-    const listProviders = vi.fn(async () => inventoryResponse([
-      { id: "fallback-provider" },
-    ]))
-
-    await expect(getLLMConfig({
-      config: { get: v2Get },
-      v2: { model: { list: listModels }, provider: { list: listProviders } },
-    }, "/worktree", {
-      config: { get: v1Get },
-    })).resolves.toEqual({
-      enabled: true,
-      model: { providerID: "fallback-provider", modelID: "fallback-model" },
-    })
-
-    expect(v1Get).toHaveBeenCalledWith({ query: { directory: "/worktree" } })
-    expect(v2Get).toHaveBeenCalledWith({ directory: "/worktree" })
-    expect(listModels).toHaveBeenCalledTimes(1)
-    expect(listProviders).toHaveBeenCalledTimes(1)
-  })
-
-  it("discovers the first eligible zero-cost model in API order", async () => {
-    const listModels = vi.fn(async (parameters: unknown) => {
-      expect(parameters).toEqual({ location: { directory: "/worktree" } })
-      return inventoryResponse([
-        inventoryModel({ id: "released-first", providerID: "provider-a" }),
-        inventoryModel({ id: "released-second", providerID: "provider-b" }),
-      ])
-    })
-    const listProviders = vi.fn(async (parameters: unknown) => {
-      expect(parameters).toEqual({ location: { directory: "/worktree" } })
-      return inventoryResponse([
-        { id: "provider-a" },
-        { id: "provider-b" },
+  it("discovers the first eligible free model in provider and model order", async () => {
+    const get = vi.fn(async () => ({ data: {} }))
+    const list = vi.fn(async (parameters: unknown) => {
+      expect(parameters).toEqual({ query: { directory: "/worktree" } })
+      return providerResponse([
+        {
+          id: "providerA",
+          models: {
+            paid: inventoryModel({ cost: { input: 0.1, output: 0 } }),
+            inactive: inventoryModel({ status: "beta" }),
+            freeA: inventoryModel(),
+          },
+        },
+        {
+          id: "providerB",
+          models: { freeB: inventoryModel() },
+        },
       ])
     })
 
+    await expect(getLLMConfig({ config: { get }, provider: { list } }, "/worktree"))
+      .resolves.toEqual({
+        enabled: true,
+        model: { providerID: "providerA", modelID: "freeA" },
+      })
+  })
+
+  it("accepts omitted status and rejects non-tool or explicitly non-active models", async () => {
+    const list = vi.fn(async () => providerResponse([
+      { id: "paid", models: { paid: inventoryModel({ cost: { input: 1, output: 0 } }) } },
+      { id: "tools", models: { noTools: inventoryModel({ tool_call: false }) } },
+      { id: "inactive", models: { inactive: inventoryModel({ status: "beta" }) } },
+      { id: "eligible", models: { omittedStatus: inventoryModel() } },
+    ]))
+
     await expect(getLLMConfig({
       config: { get: vi.fn(async () => ({ data: {} })) },
-      v2: { model: { list: listModels }, provider: { list: listProviders } },
+      provider: { list },
     }, "/worktree")).resolves.toEqual({
       enabled: true,
-      model: { providerID: "provider-a", modelID: "released-first" },
+      model: { providerID: "eligible", modelID: "omittedStatus" },
     })
-    expect(listModels).toHaveBeenCalledTimes(1)
-    expect(listProviders).toHaveBeenCalledTimes(1)
   })
 
-  it("discovers inventory from the nested v2 namespace", async () => {
-    const listModels = vi.fn(async () => inventoryResponse([
-      inventoryModel({ id: "nested-model", providerID: "nested-provider" }),
-    ]))
-    const listProviders = vi.fn(async () => inventoryResponse([
-      { id: "nested-provider" },
-    ]))
+  it("returns the heuristic fallback when provider discovery errors", async () => {
+    const list = vi.fn(async () => { throw new Error("inventory unavailable") })
 
     await expect(getLLMConfig({
       config: { get: vi.fn(async () => ({ data: {} })) },
-      v2: { model: { list: listModels }, provider: { list: listProviders } },
-    }, "/worktree")).resolves.toEqual({
-      enabled: true,
-      model: { providerID: "nested-provider", modelID: "nested-model" },
-    })
-    expect(listModels).toHaveBeenCalledWith({ location: { directory: "/worktree" } })
-    expect(listProviders).toHaveBeenCalledWith({ location: { directory: "/worktree" } })
-  })
-
-  it("filters paid, disabled, non-tool, and inactive models", async () => {
-    const listModels = vi.fn(async () => inventoryResponse([
-      inventoryModel({ id: "paid", providerID: "paid-provider", cost: [{ input: 0.1, output: 0 }] }),
-      inventoryModel({ id: "disabled", providerID: "disabled-provider" }),
-      inventoryModel({ id: "no-tools", providerID: "no-tools-provider", capabilities: { tools: false } }),
-      inventoryModel({ id: "inactive", providerID: "inactive-provider", status: "beta" }),
-      inventoryModel({ id: "eligible", providerID: "eligible-provider" }),
-    ]))
-    const listProviders = vi.fn(async () => inventoryResponse([
-      { id: "paid-provider" },
-      { id: "disabled-provider", disabled: true },
-      { id: "no-tools-provider" },
-      { id: "inactive-provider" },
-      { id: "eligible-provider" },
-    ]))
-
-    await expect(getLLMConfig({
-      config: { get: vi.fn(async () => ({ data: { small_model: "not valid" } })) },
-      v2: { model: { list: listModels }, provider: { list: listProviders } },
-    }, "/worktree")).resolves.toEqual({
-      enabled: true,
-      model: { providerID: "eligible-provider", modelID: "eligible" },
-    })
-  })
-
-  it("returns the heuristic fallback when no model qualifies", async () => {
-    const listModels = vi.fn(async () => inventoryResponse([
-      inventoryModel({ cost: [{ input: 1, output: 1 }] }),
-    ]))
-    const listProviders = vi.fn(async () => inventoryResponse([{ id: "free-provider" }]))
-
-    await expect(getLLMConfig({
-      config: { get: vi.fn(async () => ({ data: {} })) },
-      v2: { model: { list: listModels }, provider: { list: listProviders } },
-    }, "/worktree")).resolves.toEqual({
-      enabled: false,
-      reason: "no eligible free model found",
-    })
-  })
-
-  it("returns the heuristic fallback when inventory discovery errors", async () => {
-    const listModels = vi.fn(async () => { throw new Error("inventory unavailable") })
-    const listProviders = vi.fn(async () => inventoryResponse([{ id: "free-provider" }]))
-
-    await expect(getLLMConfig({
-      config: { get: vi.fn(async () => ({ data: {} })) },
-      v2: { model: { list: listModels }, provider: { list: listProviders } },
+      provider: { list },
     }, "/worktree")).resolves.toEqual({
       enabled: false,
       reason: "model inventory request failed",

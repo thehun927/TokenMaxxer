@@ -36,7 +36,7 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
 })
 
-describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
+describe("writeMemoryOnIdle v1 dispatch", () => {
   it("writes heuristic facts and makes no config call when disabled", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
     const worktree = await makeWorktree()
@@ -44,12 +44,12 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
     const appLog = vi.fn()
     const v1 = {
       app: { log: appLog },
+      config: { get },
       session: { messages: vi.fn(async () => ({ data: sourceMessages() })) },
     }
 
     await writeMemoryOnIdle({
       client: v1,
-      v2Client: { config: { get } },
       worktree,
       directory: worktree,
       sessionId: "source-disabled",
@@ -67,7 +67,7 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
     }))
   })
 
-  it("logs when the heuristic path has no v2 client", async () => {
+  it("logs the heuristic fallback when provider discovery is unavailable", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
     const worktree = await makeWorktree()
     const appLog = vi.fn()
@@ -85,8 +85,9 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
 
     expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
       body: expect.objectContaining({
-        level: "debug",
-        message: "llm extraction skipped: v2 client unavailable",
+        level: "info",
+        message: "llm extraction skipped: model unavailable",
+        extra: { reason: "model inventory is unavailable" },
       }),
     }))
   })
@@ -97,12 +98,12 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
     const appLog = vi.fn()
     const v1 = {
       app: { log: appLog },
+      config: { get: vi.fn(async () => ({ data: {} })) },
       session: { messages: vi.fn(async () => ({ data: sourceMessages() })) },
     }
 
     await writeMemoryOnIdle({
       client: v1,
-      v2Client: { config: { get: vi.fn(async () => ({ data: {} })) } },
       worktree,
       directory: worktree,
       sessionId: "source-no-model",
@@ -117,7 +118,7 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
     }))
   })
 
-  it("persists heuristic state first, then stores validated v2 facts and cache", async () => {
+  it("persists heuristic state first, then stores validated v1 facts and cache", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
     const worktree = await makeWorktree()
     const create = vi.fn(async () => ({ data: { id: "audit-session" } }))
@@ -134,22 +135,16 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
         },
       },
     }))
-    const v2ConfigGet = vi.fn(async () => ({ data: { small_model: "root-provider/root-model" } }))
-    const v2 = {
-      config: { get: v2ConfigGet },
-      session: { create, prompt },
-    }
     const appLog = vi.fn()
     const v1ConfigGet = vi.fn(async () => ({ data: { small_model: "provider/model" } }))
     const v1 = {
       app: { log: appLog },
       config: { get: v1ConfigGet },
-      session: { messages: vi.fn(async () => ({ data: sourceMessages() })) },
+      session: { messages: vi.fn(async () => ({ data: sourceMessages() })), create, prompt },
     }
 
     await writeMemoryOnIdle({
       client: v1,
-      v2Client: v2,
       worktree,
       directory: worktree,
       sessionId: "source-success",
@@ -159,12 +154,13 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
     expect(create).toHaveBeenCalledTimes(1)
     expect(prompt).toHaveBeenCalledTimes(1)
     expect(v1ConfigGet).toHaveBeenCalledWith({ query: { directory: worktree } })
-    expect(v2ConfigGet).not.toHaveBeenCalled()
     expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
-      directory: worktree,
-      sessionID: "audit-session",
-      model: { providerID: "provider", modelID: "model" },
-      format: { type: "json_schema", schema: expect.any(Object) },
+      path: { id: "audit-session" },
+      query: { directory: worktree },
+      body: expect.objectContaining({
+        model: { providerID: "provider", modelID: "model" },
+        format: expect.objectContaining({ type: "json_schema", schema: expect.any(Object) }),
+      }),
     }))
     expect(memory?.recent_sessions).toEqual(["source-success"])
     expect(memory?.decisions.some((decision) => decision.topic === "transport")).toBe(true)
@@ -202,19 +198,15 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
 
     const create = vi.fn()
     const prompt = vi.fn()
-    const v2 = {
-      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
-      session: { create, prompt },
-    }
     const appLog = vi.fn()
     const v1 = {
       app: { log: appLog },
-      session: { messages: vi.fn(async () => ({ data: messages })) },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: { messages: vi.fn(async () => ({ data: messages })), create, prompt },
     }
 
     await writeMemoryOnIdle({
       client: v1,
-      v2Client: v2,
       worktree,
       directory: worktree,
       sessionId: "source-cache",
@@ -235,22 +227,19 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
     const prompt = vi.fn()
       .mockResolvedValueOnce({ data: { info: { structured: { invalid: true } } } })
       .mockRejectedValueOnce(new Error("provider unavailable"))
-    const v2 = {
+    const appLog = vi.fn()
+    const v1 = {
+      app: { log: appLog },
       config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
       session: {
+        messages: vi.fn(async () => ({ data: sourceMessages() })),
         create: vi.fn(async () => ({ data: { id: "audit-failure" } })),
         prompt,
       },
     }
-    const appLog = vi.fn()
-    const v1 = {
-      app: { log: appLog },
-      session: { messages: vi.fn(async () => ({ data: sourceMessages() })) },
-    }
 
     await writeMemoryOnIdle({
       client: v1,
-      v2Client: v2,
       worktree,
       directory: worktree,
       sessionId: "source-failure",

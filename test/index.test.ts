@@ -1,15 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-const { createV2Client, configGet, writeMemoryOnIdle } = vi.hoisted(() => {
-  const configGet = vi.fn()
+const { writeMemoryOnIdle } = vi.hoisted(() => {
   return {
-    configGet,
-    createV2Client: vi.fn(() => ({ config: { get: configGet } })),
     writeMemoryOnIdle: vi.fn(),
   }
 })
 
-vi.mock("../src/opencode/v2", () => ({ createV2Client }))
 vi.mock("../src/memory/writer", () => ({ writeMemoryOnIdle }))
 
 import { TokenmaxxerPlugin } from "../src/index"
@@ -22,9 +18,10 @@ beforeEach(() => {
 })
 
 describe("plugin initialization", () => {
-  it("constructs the v2 client without calling config or another endpoint", async () => {
+  it("does not call config or another endpoint during initialization", async () => {
+    const configGet = vi.fn()
     const ctx = {
-      client: { app: { log: vi.fn(), info: vi.fn() } },
+      client: { app: { log: vi.fn(), info: vi.fn() }, config: { get: configGet } },
       directory: "/workspace/project",
       worktree: "/workspace/project",
       serverUrl: new URL("http://127.0.0.1:4096"),
@@ -35,41 +32,9 @@ describe("plugin initialization", () => {
 
     await TokenmaxxerPlugin(ctx as never)
 
-    expect(createV2Client).toHaveBeenCalledWith(ctx.serverUrl, ctx.directory)
     expect(configGet).not.toHaveBeenCalled()
     expect(ctx.client.app.info).not.toHaveBeenCalled()
     expect(ctx.client.app.log).not.toHaveBeenCalled()
-  })
-
-  it("warns with a sanitized error when v2 client construction fails", async () => {
-    createV2Client.mockImplementationOnce(() => {
-      const error = new TypeError("bridge setup failed")
-      Object.assign(error, { secret: "must not be logged", stack: "sensitive stack" })
-      throw error
-    })
-    const appLog = vi.fn()
-    const ctx = {
-      client: { app: { log: appLog, info: vi.fn() } },
-      directory: "/workspace/project",
-      worktree: "/workspace/project",
-      serverUrl: new URL("http://127.0.0.1:4096"),
-      project: {},
-      experimental_workspace: { register: vi.fn() },
-      $: {},
-    }
-
-    await TokenmaxxerPlugin(ctx as never)
-
-    expect(appLog).toHaveBeenCalledWith({
-      body: {
-        service: "tokenmaxxer",
-        level: "warn",
-        message: "v2 client initialization failed",
-        extra: { error: { name: "TypeError", message: "bridge setup failed" } },
-      },
-    })
-    expect(JSON.stringify(appLog.mock.calls)).not.toContain("sensitive stack")
-    expect(JSON.stringify(appLog.mock.calls)).not.toContain("must not be logged")
   })
 
   it("skips registered extraction sessions but keeps normal idle events unchanged", async () => {

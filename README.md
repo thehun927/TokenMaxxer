@@ -48,7 +48,8 @@ The model also receives a **durable context block** — recorded observations fr
 
 On `session.idle` (when the agent finishes responding), tokenmaxxer:
 
-1. Pulls the full session transcript via the opencode SDK.
+1. Pulls the full session transcript through the host `PluginInput` v1 client
+   transport.
 2. Extracts structured facts using heuristics — current task, active files (from tool calls), decisions (from natural language), blockers, next steps.
 3. Merges with existing memory, superseding old decisions on the same topic.
 4. Prunes to stay under 8KB.
@@ -158,14 +159,23 @@ TOKENMAXXER_LLM_EXTRACT=1 opencode
 When enabled, tokenmaxxer resolves the extraction model from the user's
 OpenCode installation:
 
-1. If `small_model` is a valid `provider/model` string in `opencode.json`, it
+1. If `small_model` is a valid `provider/model` string in the host config, it
    is the explicit model override.
-2. If `small_model` is absent or malformed, tokenmaxxer inventories active,
-   enabled, tool-capable models whose declared model cost is zero, and
-   uses the first candidate in the API's release order.
+2. If `small_model` is absent or malformed, tokenmaxxer reads the host provider
+   inventory from `data.all[].models`, keeps only active, tool-callable models
+   whose declared cost is zero, and uses the first eligible candidate in the
+   host provider-list and model-map order.
 3. If no such candidate exists, it uses heuristics only. Automatic discovery
    never falls back to a paid model, including a paid Anthropic model. Provider
    and model names are not hardcoded.
+
+Extraction uses the host `PluginInput` v1 client transport; it does not create
+a separate SDK-v2 bridge. The generated client types omit JSON-schema fields
+that the existing server responses already provide, so the session prompt
+request and result each use one localized compatibility cast. Zod validates
+the structured result after the result cast. This is a bounded compatibility
+risk: a transport or validation failure is retried once and then fails safe to
+heuristic extraction rather than replacing it with an alternate bridge.
 
 Free offerings change, and providers may apply their own data-use policies.
 This selection policy makes no permanent claim about which model is best.
@@ -252,6 +262,7 @@ Memory is merged across sessions: new decisions on the same topic supersede old 
 ## Limitations
 
 - **Heuristic extraction is conservative.** It prioritizes precision over recall — it would rather produce no decisions than wrong ones. Decisions stated in unusual phrasing will be missed. v1.1 adds optional structured LLM extraction via `TOKENMAXXER_LLM_EXTRACT=1`, with heuristics retained as the fallback.
+- **Host client type compatibility.** The host `PluginInput` v1 client transport's generated types omit existing server JSON-schema fields. Two localized casts bridge only the session prompt request and result, with Zod validation, one retry, and heuristic fallback. This bounded risk is not a separate SDK-v2 bridge.
 - **No per-turn history pruning.** The plugin only intervenes at compaction time. Per-turn pruning would require the `experimental.chat.messages.transform` hook (which exists in the opencode API but is undocumented and unstable).
 - **Durable recency uses the last three recorded source sessions.** Session IDs are retained in a bounded history, while older decisions remain available through the recall tools.
 - **Event handlers are fire-and-forget.** opencode does not await async event handlers. If opencode exits while `writeMemoryOnIdle` is in flight, the write may not complete. Atomic writes (temp file + rename) prevent corruption — the worst case is a missed write, never a corrupt file.

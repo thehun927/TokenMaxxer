@@ -14,8 +14,7 @@ import { loadOptions } from "./config"
 import { buildCompactionPrompt } from "./compaction/prompt"
 import { buildDurableBlock } from "./compaction/durable"
 import { writeMemoryOnIdle } from "./memory/writer"
-import { isRetainedExtractionSession, sanitizeError } from "./memory/extract-llm"
-import { createV2Client } from "./opencode/v2"
+import { isRetainedExtractionSession } from "./memory/extract-llm"
 import { readMemory, resolveProjectPath } from "./memory/store"
 import { registerTools } from "./tools/recall"
 import { registerEfficiencyTools } from "./tools/efficiency"
@@ -26,23 +25,8 @@ import { join } from "node:path"
 import type { CompactionInput, CompactionOutput } from "./types"
 
 export const TokenmaxxerPlugin: Plugin = async (ctx) => {
-  const { client, directory, worktree, serverUrl } = ctx
+  const { client, directory, worktree } = ctx
   const options = loadOptions(ctx)
-
-  // Client construction is local only. Do not call config (or any other v2
-  // endpoint) until a session.idle event enters writeMemoryOnIdle.
-  let v2Client: unknown
-  try {
-    v2Client = createV2Client(serverUrl, directory)
-  } catch (error) {
-    // A missing/invalid bridge must not prevent the plugin from starting or
-    // the heuristic memory path from running.
-    v2Client = undefined
-    // Logging is best effort and deliberately not awaited during startup.
-    void log(client, "warn", "v2 client initialization failed", {
-      error: sanitizeError(error),
-    })
-  }
 
   const project = resolveProjectPath(worktree, directory)
   // Plugin initialization is intentionally local-only. Diagnostics and
@@ -109,7 +93,7 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
             return
           }
           if (isRetainedExtractionSession(sessionId)) return
-          await writeMemoryOnIdle({ client, v2Client, worktree, directory, sessionId })
+          await writeMemoryOnIdle({ client, worktree, directory, sessionId })
         }
       } catch (e) {
         await log(client, "error", "event handler failed", { type: event.type, error: String(e) })
