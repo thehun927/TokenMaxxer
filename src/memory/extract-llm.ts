@@ -56,11 +56,13 @@ type V2ClientLike = {
   config?: {
     get: (parameters: { directory: string }) => Promise<unknown>
   }
-  model?: {
-    list: (parameters: { location: { directory: string } }) => Promise<unknown>
-  }
-  provider?: {
-    list: (parameters: { location: { directory: string } }) => Promise<unknown>
+  v2?: {
+    model?: {
+      list: (parameters: { location: { directory: string } }) => Promise<unknown>
+    }
+    provider?: {
+      list: (parameters: { location: { directory: string } }) => Promise<unknown>
+    }
   }
   session?: {
     create: (parameters: {
@@ -146,12 +148,12 @@ async function discoverFreeSmallModel(
   client: V2ClientLike,
   directory: string,
 ): Promise<SmallModel | undefined> {
-  if (!client.model?.list || !client.provider?.list) return undefined
+  if (!client.v2?.model?.list || !client.v2?.provider?.list) return undefined
 
   try {
     const [modelsResult, providersResult] = await Promise.all([
-      client.model.list({ location: { directory } }),
-      client.provider.list({ location: { directory } }),
+      client.v2.model.list({ location: { directory } }),
+      client.v2.provider.list({ location: { directory } }),
     ])
     const models = readInventoryData(modelsResult)
     const providers = readInventoryData(providersResult)

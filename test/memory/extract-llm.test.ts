@@ -166,8 +166,7 @@ describe("SDK-v2 structured extraction", () => {
     const listProviders = vi.fn()
     await expect(getLLMConfig({
       config: { get },
-      model: { list: listModels },
-      provider: { list: listProviders },
+      v2: { model: { list: listModels }, provider: { list: listProviders } },
     }, "/worktree")).resolves.toEqual({ enabled: false })
     expect(get).not.toHaveBeenCalled()
     expect(listModels).not.toHaveBeenCalled()
@@ -179,8 +178,7 @@ describe("SDK-v2 structured extraction", () => {
     const listProviders = vi.fn()
     await expect(getLLMConfig({
       config: { get: vi.fn(async () => ({ data: { small_model: "configured/model" } })) },
-      model: { list: listModels },
-      provider: { list: listProviders },
+      v2: { model: { list: listModels }, provider: { list: listProviders } },
     }, "/worktree")).resolves.toEqual({
       enabled: true,
       model: { providerID: "configured", modelID: "model" },
@@ -207,14 +205,32 @@ describe("SDK-v2 structured extraction", () => {
 
     await expect(getLLMConfig({
       config: { get: vi.fn(async () => ({ data: {} })) },
-      model: { list: listModels },
-      provider: { list: listProviders },
+      v2: { model: { list: listModels }, provider: { list: listProviders } },
     }, "/worktree")).resolves.toEqual({
       enabled: true,
       model: { providerID: "provider-a", modelID: "released-first" },
     })
     expect(listModels).toHaveBeenCalledTimes(1)
     expect(listProviders).toHaveBeenCalledTimes(1)
+  })
+
+  it("discovers inventory from the nested v2 namespace", async () => {
+    const listModels = vi.fn(async () => inventoryResponse([
+      inventoryModel({ id: "nested-model", providerID: "nested-provider" }),
+    ]))
+    const listProviders = vi.fn(async () => inventoryResponse([
+      { id: "nested-provider" },
+    ]))
+
+    await expect(getLLMConfig({
+      config: { get: vi.fn(async () => ({ data: {} })) },
+      v2: { model: { list: listModels }, provider: { list: listProviders } },
+    }, "/worktree")).resolves.toEqual({
+      enabled: true,
+      model: { providerID: "nested-provider", modelID: "nested-model" },
+    })
+    expect(listModels).toHaveBeenCalledWith({ location: { directory: "/worktree" } })
+    expect(listProviders).toHaveBeenCalledWith({ location: { directory: "/worktree" } })
   })
 
   it("filters paid, disabled, non-tool, and inactive models", async () => {
@@ -235,8 +251,7 @@ describe("SDK-v2 structured extraction", () => {
 
     await expect(getLLMConfig({
       config: { get: vi.fn(async () => ({ data: { small_model: "not valid" } })) },
-      model: { list: listModels },
-      provider: { list: listProviders },
+      v2: { model: { list: listModels }, provider: { list: listProviders } },
     }, "/worktree")).resolves.toEqual({
       enabled: true,
       model: { providerID: "eligible-provider", modelID: "eligible" },
@@ -251,8 +266,7 @@ describe("SDK-v2 structured extraction", () => {
 
     await expect(getLLMConfig({
       config: { get: vi.fn(async () => ({ data: {} })) },
-      model: { list: listModels },
-      provider: { list: listProviders },
+      v2: { model: { list: listModels }, provider: { list: listProviders } },
     }, "/worktree")).resolves.toEqual({ enabled: false })
   })
 
@@ -262,8 +276,7 @@ describe("SDK-v2 structured extraction", () => {
 
     await expect(getLLMConfig({
       config: { get: vi.fn(async () => ({ data: {} })) },
-      model: { list: listModels },
-      provider: { list: listProviders },
+      v2: { model: { list: listModels }, provider: { list: listProviders } },
     }, "/worktree")).resolves.toEqual({ enabled: false })
   })
 })
