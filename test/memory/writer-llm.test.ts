@@ -41,7 +41,11 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
     const worktree = await makeWorktree()
     const get = vi.fn()
-    const v1 = { session: { messages: vi.fn(async () => ({ data: sourceMessages() })) } }
+    const appLog = vi.fn()
+    const v1 = {
+      app: { log: appLog },
+      session: { messages: vi.fn(async () => ({ data: sourceMessages() })) },
+    }
 
     await writeMemoryOnIdle({
       client: v1,
@@ -55,6 +59,62 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
     expect(memory?.recent_sessions).toEqual(["source-disabled"])
     expect(memory?.current_task).toContain("Implement the extraction")
     expect(get).not.toHaveBeenCalled()
+    expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.objectContaining({
+        level: "debug",
+        message: "llm extraction skipped: TOKENMAXXER_LLM_EXTRACT is disabled",
+      }),
+    }))
+  })
+
+  it("logs when the heuristic path has no v2 client", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const appLog = vi.fn()
+    const v1 = {
+      app: { log: appLog },
+      session: { messages: vi.fn(async () => ({ data: sourceMessages() })) },
+    }
+
+    await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId: "source-no-v2",
+    })
+
+    expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.objectContaining({
+        level: "debug",
+        message: "llm extraction skipped: v2 client unavailable",
+      }),
+    }))
+  })
+
+  it("logs the model-resolution fallback reason", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const appLog = vi.fn()
+    const v1 = {
+      app: { log: appLog },
+      session: { messages: vi.fn(async () => ({ data: sourceMessages() })) },
+    }
+
+    await writeMemoryOnIdle({
+      client: v1,
+      v2Client: { config: { get: vi.fn(async () => ({ data: {} })) } },
+      worktree,
+      directory: worktree,
+      sessionId: "source-no-model",
+    })
+
+    expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.objectContaining({
+        level: "info",
+        message: "llm extraction skipped: model unavailable",
+        extra: { reason: "model inventory is unavailable" },
+      }),
+    }))
   })
 
   it("persists heuristic state first, then stores validated v2 facts and cache", async () => {
@@ -78,7 +138,11 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
       config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
       session: { create, prompt },
     }
-    const v1 = { session: { messages: vi.fn(async () => ({ data: sourceMessages() })) } }
+    const appLog = vi.fn()
+    const v1 = {
+      app: { log: appLog },
+      session: { messages: vi.fn(async () => ({ data: sourceMessages() })) },
+    }
 
     await writeMemoryOnIdle({
       client: v1,
@@ -100,6 +164,14 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
     expect(memory?.recent_sessions).toEqual(["source-success"])
     expect(memory?.decisions.some((decision) => decision.topic === "transport")).toBe(true)
     expect(memory?.llm_extraction_cache).toHaveLength(1)
+    const messages = appLog.mock.calls.map(([call]) => call.body.message)
+    expect(messages).toEqual(expect.arrayContaining([
+      "llm extraction model resolved",
+      "llm extraction audit session requested",
+      "llm extraction facts merged",
+    ]))
+    expect(appLog.mock.calls.find(([call]) => call.body.message === "llm extraction model resolved")?.[0].body.extra)
+      .toEqual({ provider: "provider", model: "model" })
   })
 
   it("uses a valid cache entry without creating or prompting an audit session", async () => {
@@ -129,7 +201,11 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
       config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
       session: { create, prompt },
     }
-    const v1 = { session: { messages: vi.fn(async () => ({ data: messages })) } }
+    const appLog = vi.fn()
+    const v1 = {
+      app: { log: appLog },
+      session: { messages: vi.fn(async () => ({ data: messages })) },
+    }
 
     await writeMemoryOnIdle({
       client: v1,
@@ -143,6 +219,9 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
     expect(create).not.toHaveBeenCalled()
     expect(prompt).not.toHaveBeenCalled()
     expect(memory?.current_task).toBe("Cached task")
+    expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.objectContaining({ message: "llm extraction cache hit" }),
+    }))
   })
 
   it("retries exactly once and leaves the durable heuristic write on failure", async () => {
@@ -158,7 +237,11 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
         prompt,
       },
     }
-    const v1 = { session: { messages: vi.fn(async () => ({ data: sourceMessages() })) } }
+    const appLog = vi.fn()
+    const v1 = {
+      app: { log: appLog },
+      session: { messages: vi.fn(async () => ({ data: sourceMessages() })) },
+    }
 
     await writeMemoryOnIdle({
       client: v1,
@@ -172,5 +255,12 @@ describe("writeMemoryOnIdle SDK-v2 dispatch", () => {
     expect(prompt).toHaveBeenCalledTimes(2)
     expect(memory?.current_task).toContain("Implement the extraction")
     expect(memory?.llm_extraction_cache).toBeUndefined()
+    expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.objectContaining({
+        level: "warn",
+        message: "llm extraction returned no facts",
+      }),
+    }))
+    expect(appLog.mock.calls.some(([call]) => call.body.message === "llm extraction diagnostic")).toBe(true)
   })
 })

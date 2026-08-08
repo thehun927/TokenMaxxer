@@ -18,9 +18,33 @@ import {
   makeExtractionCacheEntry,
   readExtractionCache,
   upsertExtractionCache,
+  type LLMExtractionDiagnostic,
 } from "./extract-llm"
+import { log } from "../util/log"
 
 const TRANSCRIPT_WINDOW = 50
+const MAX_DIAGNOSTIC_VALUE = 200
+
+function boundedDiagnosticValue(value: string): string {
+  return value.length <= MAX_DIAGNOSTIC_VALUE
+    ? value
+    : `${value.slice(0, MAX_DIAGNOSTIC_VALUE - 3)}...`
+}
+
+/** Emit only bounded, non-secret extraction diagnostics through the v1 client. */
+function logLLMDiagnostic(client: unknown, diagnostic: LLMExtractionDiagnostic): void {
+  const level = diagnostic.kind === "structured-output-failed" || diagnostic.kind === "unavailable-client"
+    ? "debug"
+    : "warn"
+  const extra: Record<string, unknown> = { kind: diagnostic.kind }
+  if ("reason" in diagnostic) extra.reason = boundedDiagnosticValue(diagnostic.reason)
+  if ("attempt" in diagnostic) extra.attempt = diagnostic.attempt
+  if ("attempts" in diagnostic) extra.attempts = diagnostic.attempts
+  if ("error" in diagnostic && diagnostic.error) extra.error = diagnostic.error
+
+  // Logging must never delay or change extraction/memory behavior.
+  void log(client, level, "llm extraction diagnostic", extra)
+}
 
 // ─── writeMemoryOnIdle ───────────────────────────────────────────────────────
 
@@ -91,10 +115,28 @@ export async function writeMemoryOnIdle(opts: {
     // The feature is opt-in and the v2 client is only used after the idle
     // handler has entered this function. In particular, initialization never
     // resolves config.small_model.
-    if (!v2Client || process.env.TOKENMAXXER_LLM_EXTRACT !== "1") return
+    if (!v2Client) {
+      void log(client, "debug", "llm extraction skipped: v2 client unavailable")
+      return
+    }
+    if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
+      void log(client, "debug", "llm extraction skipped: TOKENMAXXER_LLM_EXTRACT is disabled", {
+        reason: "TOKENMAXXER_LLM_EXTRACT is disabled",
+      })
+      return
+    }
 
     const llmConfig = await getLLMConfig(v2Client, directory)
-    if (!llmConfig.enabled || !llmConfig.model) return
+    if (!llmConfig.enabled || !llmConfig.model) {
+      void log(client, "info", "llm extraction skipped: model unavailable", {
+        reason: boundedDiagnosticValue(llmConfig.reason ?? "model resolution returned no model"),
+      })
+      return
+    }
+    void log(client, "info", "llm extraction model resolved", {
+      provider: boundedDiagnosticValue(llmConfig.model.providerID),
+      model: boundedDiagnosticValue(llmConfig.model.modelID),
+    })
 
     const cacheKey = extractionCacheKey(sessionId, canonicalInput, llmConfig.model)
     const afterHeuristic = (await readMemory({ worktree, directory })) ?? pruned
@@ -103,21 +145,30 @@ export async function writeMemoryOnIdle(opts: {
     // Cache hits still merge validated facts into the latest state, but make
     // no session or prompt request.
     if (cachedFacts) {
+      void log(client, "debug", "llm extraction cache hit")
       await mergeAsyncFacts(opts, cachedFacts, gitSha, sessionId)
+      void log(client, "info", "llm extraction facts merged")
       return
     }
 
     const project = resolveProjectPath(worktree, directory)
     const projectName = basename(project) || project
+    void log(client, "debug", "llm extraction audit session requested")
     const llmFacts = await extractFactsLLM(
       canonicalInput,
       sessionId,
       projectName,
       v2Client,
       llmConfig,
-      { directory },
+      {
+        directory,
+        onDiagnostic: (diagnostic) => logLLMDiagnostic(client, diagnostic),
+      },
     )
-    if (!llmFacts) return
+    if (!llmFacts) {
+      void log(client, "warn", "llm extraction returned no facts")
+      return
+    }
 
     // Prompting is asynchronous. Re-read immediately before applying the
     // result so another memory update is not overwritten by the stale prior
@@ -142,6 +193,7 @@ export async function writeMemoryOnIdle(opts: {
     const finalMemory = pruneOld(withCache)
     await writeMemory({ worktree, directory }, finalMemory)
     await generateHeader(worktree, directory, finalMemory)
+    void log(client, "info", "llm extraction facts merged")
   } catch {
     // Never throw from event handler
   }

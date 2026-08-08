@@ -41,6 +41,37 @@ describe("plugin initialization", () => {
     expect(ctx.client.app.log).not.toHaveBeenCalled()
   })
 
+  it("warns with a sanitized error when v2 client construction fails", async () => {
+    createV2Client.mockImplementationOnce(() => {
+      const error = new TypeError("bridge setup failed")
+      Object.assign(error, { secret: "must not be logged", stack: "sensitive stack" })
+      throw error
+    })
+    const appLog = vi.fn()
+    const ctx = {
+      client: { app: { log: appLog, info: vi.fn() } },
+      directory: "/workspace/project",
+      worktree: "/workspace/project",
+      serverUrl: new URL("http://127.0.0.1:4096"),
+      project: {},
+      experimental_workspace: { register: vi.fn() },
+      $: {},
+    }
+
+    await TokenmaxxerPlugin(ctx as never)
+
+    expect(appLog).toHaveBeenCalledWith({
+      body: {
+        service: "tokenmaxxer",
+        level: "warn",
+        message: "v2 client initialization failed",
+        extra: { error: { name: "TypeError", message: "bridge setup failed" } },
+      },
+    })
+    expect(JSON.stringify(appLog.mock.calls)).not.toContain("sensitive stack")
+    expect(JSON.stringify(appLog.mock.calls)).not.toContain("must not be logged")
+  })
+
   it("skips registered extraction sessions but keeps normal idle events unchanged", async () => {
     const extractionSessionID = "registered-extraction-session"
     const input = buildCanonicalInput([], emptyMemory("/workspace/project"))

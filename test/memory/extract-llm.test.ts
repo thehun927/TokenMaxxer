@@ -144,6 +144,101 @@ describe("SDK-v2 structured extraction", () => {
     expect(invalidThenError).toHaveBeenCalledTimes(2)
   })
 
+  it("reports bounded diagnostics for unavailable clients and session failures", async () => {
+    const diagnostics: unknown[] = []
+    await expect(extractFactsLLM(
+      canonical(),
+      "source",
+      "project",
+      undefined,
+      { enabled: true, model: { providerID: "p", modelID: "m" } },
+      { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
+    )).resolves.toBeNull()
+    expect(diagnostics).toEqual([{
+      kind: "unavailable-client",
+      reason: "missing-session-endpoint",
+    }])
+
+    diagnostics.length = 0
+    await expect(extractFactsLLM(
+      canonical(),
+      "source",
+      "project",
+      {
+        session: {
+          create: vi.fn(async () => ({
+            error: { name: "RequestError", message: "bridge unavailable" },
+            secret: "must not be copied",
+          })),
+          prompt: vi.fn(),
+        },
+      },
+      { enabled: true, model: { providerID: "p", modelID: "m" } },
+      { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
+    )).resolves.toBeNull()
+    expect(diagnostics).toEqual([{
+      kind: "session-create-failed",
+      reason: "error-response",
+      error: { name: "RequestError", message: "bridge unavailable" },
+    }])
+    expect(JSON.stringify(diagnostics)).not.toContain("must not be copied")
+
+    diagnostics.length = 0
+    await expect(extractFactsLLM(
+      canonical(),
+      "source",
+      "project",
+      {
+        session: {
+          create: vi.fn(async () => ({ data: {} })),
+          prompt: vi.fn(),
+        },
+      },
+      { enabled: true, model: { providerID: "p", modelID: "m" } },
+      { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
+    )).resolves.toBeNull()
+    expect(diagnostics).toEqual([{
+      kind: "session-create-failed",
+      reason: "malformed-response",
+    }])
+  })
+
+  it("reports every failed output attempt and retry exhaustion", async () => {
+    const diagnostics: unknown[] = []
+    const prompt = vi.fn()
+      .mockResolvedValueOnce({ data: { info: { structured: { invalid: true } } } })
+      .mockRejectedValueOnce(new Error("provider unavailable"))
+
+    await expect(extractFactsLLM(
+      canonical(),
+      "source",
+      "project",
+      {
+        session: {
+          create: vi.fn(async () => ({ data: { id: "audit-diagnostics" } })),
+          prompt,
+        },
+      },
+      { enabled: true, model: { providerID: "p", modelID: "m" } },
+      { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
+    )).resolves.toBeNull()
+
+    expect(diagnostics).toEqual([
+      {
+        kind: "structured-output-failed",
+        attempt: 1,
+        reason: "invalid-structured-output",
+      },
+      {
+        kind: "structured-output-failed",
+        attempt: 2,
+        reason: "request-error",
+        error: { name: "Error", message: "provider unavailable" },
+      },
+      { kind: "retries-exhausted", attempts: 2 },
+    ])
+  })
+
   it("keeps cache entries capped at ten and upserts by identity", () => {
     let memory: MemoryFile = emptyMemory("/worktree")
     const model = { providerID: "p", modelID: "m" }
@@ -167,7 +262,10 @@ describe("SDK-v2 structured extraction", () => {
     await expect(getLLMConfig({
       config: { get },
       v2: { model: { list: listModels }, provider: { list: listProviders } },
-    }, "/worktree")).resolves.toEqual({ enabled: false })
+    }, "/worktree")).resolves.toEqual({
+      enabled: false,
+      reason: "TOKENMAXXER_LLM_EXTRACT is disabled",
+    })
     expect(get).not.toHaveBeenCalled()
     expect(listModels).not.toHaveBeenCalled()
     expect(listProviders).not.toHaveBeenCalled()
@@ -267,7 +365,10 @@ describe("SDK-v2 structured extraction", () => {
     await expect(getLLMConfig({
       config: { get: vi.fn(async () => ({ data: {} })) },
       v2: { model: { list: listModels }, provider: { list: listProviders } },
-    }, "/worktree")).resolves.toEqual({ enabled: false })
+    }, "/worktree")).resolves.toEqual({
+      enabled: false,
+      reason: "no eligible free model found",
+    })
   })
 
   it("returns the heuristic fallback when inventory discovery errors", async () => {
@@ -277,6 +378,9 @@ describe("SDK-v2 structured extraction", () => {
     await expect(getLLMConfig({
       config: { get: vi.fn(async () => ({ data: {} })) },
       v2: { model: { list: listModels }, provider: { list: listProviders } },
-    }, "/worktree")).resolves.toEqual({ enabled: false })
+    }, "/worktree")).resolves.toEqual({
+      enabled: false,
+      reason: "model inventory request failed",
+    })
   })
 })

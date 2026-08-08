@@ -26,6 +26,43 @@ export interface SmallModel {
 export interface LLMExtractionConfig {
   enabled: boolean
   model?: SmallModel
+  /** A bounded, non-secret explanation when extraction is disabled. */
+  reason?: string
+}
+
+export interface SanitizedError {
+  name: string
+  message: string
+}
+
+const MAX_DIAGNOSTIC_TEXT = 200
+
+/** Keep diagnostics bounded and limited to an error's name and message. */
+export function sanitizeError(error: unknown): SanitizedError {
+  const bounded = (value: unknown, fallback: string): string => {
+    if (typeof value !== "string" || value.length === 0) return fallback
+    return value.slice(0, MAX_DIAGNOSTIC_TEXT)
+  }
+
+  if (error instanceof Error) {
+    return {
+      name: bounded(error.name, "Error"),
+      message: bounded(error.message, "Unknown error"),
+    }
+  }
+
+  if (typeof error === "string") {
+    return { name: "Error", message: bounded(error, "Unknown error") }
+  }
+
+  if (isRecord(error)) {
+    return {
+      name: bounded(error.name, "Error"),
+      message: bounded(error.message, "Unknown error"),
+    }
+  }
+
+  return { name: "Error", message: "Unknown error" }
 }
 
 // Retained extraction sessions emit their own session.idle event. Keep their
@@ -94,6 +131,11 @@ type ModelInventoryEntry = {
   cost: unknown[]
 }
 
+type ModelDiscoveryResult = {
+  model?: SmallModel
+  reason: string
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
@@ -147,8 +189,10 @@ function hasOnlyZeroInputOutputCost(cost: unknown[]): boolean {
 async function discoverFreeSmallModel(
   client: V2ClientLike,
   directory: string,
-): Promise<SmallModel | undefined> {
-  if (!client.v2?.model?.list || !client.v2?.provider?.list) return undefined
+): Promise<ModelDiscoveryResult> {
+  if (!client.v2?.model?.list || !client.v2?.provider?.list) {
+    return { reason: "model inventory is unavailable" }
+  }
 
   try {
     const [modelsResult, providersResult] = await Promise.all([
@@ -157,7 +201,7 @@ async function discoverFreeSmallModel(
     ])
     const models = readInventoryData(modelsResult)
     const providers = readInventoryData(providersResult)
-    if (!models || !providers) return undefined
+    if (!models || !providers) return { reason: "model inventory response is malformed" }
 
     const providersByID = new Map<string, ProviderInventoryEntry>()
     for (const value of providers) {
@@ -174,14 +218,19 @@ async function discoverFreeSmallModel(
       const provider = providersByID.get(model.providerID)
       if (!provider || provider.disabled || !hasOnlyZeroInputOutputCost(model.cost)) continue
 
-      return { providerID: model.providerID, modelID: model.id }
+      return {
+        model: { providerID: model.providerID, modelID: model.id },
+        reason: "eligible model discovered",
+      }
     }
+
+    return { reason: "no eligible free model found" }
   } catch {
     // Inventory is optional. A failed or unavailable discovery request must
     // leave the durable heuristic path as the only fallback.
   }
 
-  return undefined
+  return { reason: "model inventory request failed" }
 }
 
 /** Resolve the opt-in model. This function is only called by session.idle. */
@@ -189,7 +238,9 @@ export async function getLLMConfig(
   v2Client: unknown,
   directory = "",
 ): Promise<LLMExtractionConfig> {
-  if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") return { enabled: false }
+  if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
+    return { enabled: false, reason: "TOKENMAXXER_LLM_EXTRACT is disabled" }
+  }
 
   try {
     const client = v2Client as V2ClientLike
@@ -214,18 +265,63 @@ export async function getLLMConfig(
     // need to be present in the inventory response.
     if (configuredModel) return { enabled: true, model: configuredModel }
 
-    const discoveredModel = await discoverFreeSmallModel(client, directory)
-    return discoveredModel ? { enabled: true, model: discoveredModel } : { enabled: false }
+    const discovered = await discoverFreeSmallModel(client, directory)
+    return discovered.model
+      ? { enabled: true, model: discovered.model }
+      : { enabled: false, reason: discovered.reason }
   } catch {
-    return { enabled: false }
+    return { enabled: false, reason: "model resolution failed" }
   }
 }
+
+export type LLMExtractionDiagnostic =
+  | {
+      kind: "unavailable-client"
+      reason: "missing-session-endpoint"
+    }
+  | {
+      kind: "session-create-failed"
+      reason: "request-error" | "error-response" | "malformed-response"
+      error?: SanitizedError
+    }
+  | {
+      kind: "structured-output-failed"
+      attempt: number
+      reason: "request-error" | "error-response" | "malformed-response" | "invalid-structured-output"
+      error?: SanitizedError
+    }
+  | {
+      kind: "retries-exhausted"
+      attempts: number
+    }
+
+export type LLMExtractionDiagnosticCallback = (
+  diagnostic: LLMExtractionDiagnostic,
+) => void | Promise<void>
 
 export interface ExtractFactsLLMOptions {
   /** Project directory required by every flattened v2 request. */
   directory?: string
   /** A validated cache result, checked before creating an audit session. */
   cachedFacts?: ExtractedFacts | null
+  /** Optional best-effort callback for bounded extraction diagnostics. */
+  onDiagnostic?: LLMExtractionDiagnosticCallback
+}
+
+/** Diagnostics must never change extraction behavior, even if a callback fails. */
+function emitDiagnostic(
+  callback: LLMExtractionDiagnosticCallback | undefined,
+  diagnostic: LLMExtractionDiagnostic,
+): void {
+  if (!callback) return
+
+  try {
+    Promise.resolve(callback(diagnostic)).catch(() => {
+      // Diagnostics are best effort.
+    })
+  } catch {
+    // Diagnostics are best effort.
+  }
 }
 
 /**
@@ -243,8 +339,14 @@ export async function extractFactsLLM(
   if (!config.enabled || !config.model) return null
   if (options?.cachedFacts) return options.cachedFacts
 
-  const client = v2Client as V2ClientLike
-  if (!client.session?.create || !client.session.prompt) return null
+  const client = (v2Client ?? {}) as V2ClientLike
+  if (!client.session?.create || !client.session.prompt) {
+    emitDiagnostic(options?.onDiagnostic, {
+      kind: "unavailable-client",
+      reason: "missing-session-endpoint",
+    })
+    return null
+  }
 
   let extractionSessionID: string | undefined
   try {
@@ -260,11 +362,23 @@ export async function extractFactsLLM(
     })
     const response = created as { data?: { id?: unknown }; error?: unknown } | null
     if (!response || response.error != null || typeof response.data?.id !== "string") {
+      emitDiagnostic(options?.onDiagnostic, {
+        kind: "session-create-failed",
+        reason: response?.error != null
+          ? "error-response"
+          : "malformed-response",
+        ...(response?.error != null ? { error: sanitizeError(response.error) } : {}),
+      })
       return null
     }
     extractionSessionID = response.data.id
     retainedExtractionSessionIDs.add(extractionSessionID)
-  } catch {
+  } catch (error) {
+    emitDiagnostic(options?.onDiagnostic, {
+      kind: "session-create-failed",
+      reason: "request-error",
+      error: sanitizeError(error),
+    })
     return null
   }
 
@@ -290,6 +404,13 @@ export async function extractFactsLLM(
       // v2 may return an SDK error field without throwing. It is a failed
       // attempt even if a partial data object happens to be present.
       if (!response || response.error != null || response.data?.info?.error != null) {
+        const responseError = response?.error ?? response?.data?.info?.error
+        emitDiagnostic(options?.onDiagnostic, {
+          kind: "structured-output-failed",
+          attempt: attempt + 1,
+          reason: !response ? "malformed-response" : "error-response",
+          ...(responseError != null ? { error: sanitizeError(responseError) } : {}),
+        })
         continue
       }
 
@@ -297,12 +418,26 @@ export async function extractFactsLLM(
       // particular, assistant text and free-form JSON are never fallbacks.
       const facts = validateStructuredResult(response.data?.info?.structured)
       if (facts) return facts
-    } catch {
+      emitDiagnostic(options?.onDiagnostic, {
+        kind: "structured-output-failed",
+        attempt: attempt + 1,
+        reason: response?.data?.info?.structured === undefined
+          ? "malformed-response"
+          : "invalid-structured-output",
+      })
+    } catch (error) {
+      emitDiagnostic(options?.onDiagnostic, {
+        kind: "structured-output-failed",
+        attempt: attempt + 1,
+        reason: "request-error",
+        error: sanitizeError(error),
+      })
       // Thrown request errors, including StructuredOutputError, use the same
       // one-retry budget as an SDK error field or invalid structured output.
     }
   }
 
+  emitDiagnostic(options?.onDiagnostic, { kind: "retries-exhausted", attempts: 2 })
   return null
 }
 

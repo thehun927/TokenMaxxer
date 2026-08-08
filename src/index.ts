@@ -14,7 +14,7 @@ import { loadOptions } from "./config"
 import { buildCompactionPrompt } from "./compaction/prompt"
 import { buildDurableBlock } from "./compaction/durable"
 import { writeMemoryOnIdle } from "./memory/writer"
-import { isRetainedExtractionSession } from "./memory/extract-llm"
+import { isRetainedExtractionSession, sanitizeError } from "./memory/extract-llm"
 import { createV2Client } from "./opencode/v2"
 import { readMemory, resolveProjectPath } from "./memory/store"
 import { registerTools } from "./tools/recall"
@@ -34,10 +34,14 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
   let v2Client: unknown
   try {
     v2Client = createV2Client(serverUrl, directory)
-  } catch {
+  } catch (error) {
     // A missing/invalid bridge must not prevent the plugin from starting or
     // the heuristic memory path from running.
     v2Client = undefined
+    // Logging is best effort and deliberately not awaited during startup.
+    void log(client, "warn", "v2 client initialization failed", {
+      error: sanitizeError(error),
+    })
   }
 
   const project = resolveProjectPath(worktree, directory)
