@@ -1,61 +1,117 @@
+<div align="center">
+
 # tokenmaxxer
 
-> opencode plugin for session longevity & cross-session memory.
+**Session longevity & cross-session memory for [opencode](https://opencode.ai)**
 
-Solves two problems:
-1. **Post-compaction quality drop** — when opencode's built-in compaction fires, the model loses track of state and decisions. tokenmaxxer injects a structured durable-state block and replaces the compaction prompt with a schema-constrained one.
-2. **Cross-session durable memory** — a per-project knowledge base (`STATE.json`) that survives session restarts. Written automatically on session idle, recalled on demand via tools.
+Never lose context to compaction again.
+
+[![Tests](https://img.shields.io/badge/tests-105%20passing-brightgreen)]() [![Build](https://img.shields.io/badge/build-clean-brightgreen)]() [![License: MIT](https://img.shields.io/badge/license-MIT-blue)]()
+
+</div>
+
+---
+
+## The problem
+
+opencode is an AI coding agent that works in long sessions. When the context window fills up, opencode **compacts** — it asks the model to generate a summary that replaces the entire conversation. The agent then continues from that summary.
+
+This causes two problems:
+
+1. **Post-compaction quality drop.** The model's summary is unstructured. It often loses track of which files matter, what decisions were locked in, what was already tried and rejected. The agent resumes work confused — re-reading files it already explored, re-litigating decisions that were settled, repeating approaches that failed.
+
+2. **No cross-session memory.** When you start a new session, the agent starts from scratch. It doesn't know what you were working on yesterday, which files matter, or what decisions were made in prior sessions. You have to re-explain everything.
+
+## The solution
+
+tokenmaxxer is an opencode plugin that solves both problems in two layers:
+
+### Layer 1 — Compaction-quality hook
+
+When compaction fires, tokenmaxxer intercepts it (`experimental.session.compacting` hook) and replaces the default compaction prompt with a **schema-constrained** one. The model is forced to produce a structured summary with exactly these sections:
+
+| Section | What it captures |
+|---|---|
+| **Current task** | What we're doing and why |
+| **Active files** | Which files matter and why |
+| **Locked decisions** | Settled decisions that should NOT be relitigated |
+| **Open questions** | Unresolved decisions still in play |
+| **Blockers** | What's blocking progress |
+| **Next steps** | The concrete next 1-3 actions |
+| **What NOT to redo** | Approaches already tried and rejected |
+
+The model also receives a **durable context block** — recorded observations from prior sessions (current task, active files, valid decisions, blockers, next steps). The model is instructed to treat these as useful but potentially stale, and to verify against the conversation if they conflict.
+
+**The result:** after compaction, the agent knows exactly what it was doing, which files it was working on, what decisions were locked in, and what to do next — without re-reading a single file.
+
+### Layer 2 — Per-project durable memory
+
+On `session.idle` (when the agent finishes responding), tokenmaxxer:
+
+1. Pulls the full session transcript via the opencode SDK.
+2. Extracts structured facts using heuristics — current task, active files (from tool calls), decisions (from natural language), blockers, next steps.
+3. Merges with existing memory, superseding old decisions on the same topic.
+4. Prunes to stay under 8KB.
+5. Writes `STATE.json` and regenerates `HEADER.md`.
+
+On the next session start, the model sees `HEADER.md` (loaded via opencode's `instructions` config) and can call tools to pull detailed memory:
+
+```
+Session 1: "Let's use Postgres for the database"
+  → session.idle → STATE.json: { decisions: [{ topic: "postgres", ... }] }
+
+Session 2 (new): model sees HEADER.md → calls get_project_state
+  → "You have a prior decision: use Postgres (SHA abc1234, 2026-08-08)"
+```
 
 ## Install
 
-### Option A: npm package
-
-```jsonc
-// opencode.json
-{
-  "plugin": ["tokenmaxxer"]
-}
-```
-
-### Option B: local plugin
+### One-liner (global — recommended)
 
 ```bash
-npm run build
+curl -fsSL https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/install.sh | bash
+```
+
+This installs the plugin to `~/.config/opencode/plugins/tokenmaxxer.js` and adds the `zod` dependency. **Layer 1 (compaction hook) is active immediately** for all projects. Layer 2 (memory + tools) requires per-project config (below).
+
+### Manual install
+
+```bash
+# Clone and build
+git clone https://github.com/thehun927/TokenMaxxer.git
+cd TokenMaxxer
+npm install && npm run build
+
+# Install globally (all projects)
+cp dist/index.js ~/.config/opencode/plugins/tokenmaxxer.js
+
+# Or install locally (single project)
 cp dist/index.js .opencode/plugins/tokenmaxxer.js
 ```
 
-## Required config
+### Per-project config (enables Layer 2)
 
-Add to your `opencode.json`:
+Add to your project's `opencode.json`:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["tokenmaxxer"],
-  "compaction": { "auto": true, "prune": true, "reserved": 10000 },
+  "compaction": { "auto": true, "prune": true, "reserved": 15000 },
   "instructions": ["AGENTS.md", ".opencode/memory/HEADER.md"],
   "watcher": {
     "ignore": ["node_modules/**", "dist/**", ".git/**", ".opencode/memory/**"]
-  },
-  "permission": {
-    "webfetch": "deny",
-    "websearch": "deny"
-  },
-  "provider": {
-    "anthropic": { "options": { "setCacheKey": true } }
   }
 }
 ```
 
-**Why each setting:**
-- `compaction.prune: true` — drops old tool outputs (biggest single token saver). Complements the plugin.
-- `compaction.reserved` — headroom so compaction doesn't overflow. Start at 10000; increase to 15000-20000 if post-compaction quality matters.
-- `instructions` — wires in the Layer 2 header. The plugin generates `.opencode/memory/HEADER.md` automatically on session idle; listing it here loads it into the system prompt at session start.
-- `watcher.ignore` — stops the file watcher from re-firing on the plugin's own writes to `.opencode/memory/`.
-- `permission` — disable tools you don't use (tool schemas are a fixed system-prompt cost). `permission` is the current API (the old `tools: { x: false }` is deprecated since v1.1.1).
-- `setCacheKey` — Anthropic prompt caching; reduces cost/latency.
+| Setting | Why |
+|---|---|
+| `compaction.prune: true` | Drops old tool outputs — the biggest single token saver. Complements the plugin. |
+| `compaction.reserved: 15000` | Headroom so compaction doesn't overflow. Increase to 20000 if quality matters. |
+| `instructions` | Wires in the Layer 2 header. The plugin generates `HEADER.md` automatically; listing it here loads it into the system prompt at session start. |
+| `watcher.ignore` | Stops the file watcher from re-firing on the plugin's own writes to `.opencode/memory/`. |
 
-### .gitignore recommendation
+### .gitignore
 
 Add to your project `.gitignore`:
 
@@ -65,56 +121,21 @@ Add to your project `.gitignore`:
 .opencode/memory/*.corrupt.*
 ```
 
-`STATE.json` contains session IDs, file paths, and project decisions — committing it leaks metadata. `HEADER.md` is safe to commit (it's a <1KB pointer).
-
-## How it works
-
-### Layer 1: Compaction-quality hook
-
-When opencode's compaction fires (`experimental.session.compacting` hook), tokenmaxxer:
-
-1. Reads the per-project memory file (`STATE.json`).
-2. Builds a durable-state block (current task, active files, valid decisions, blockers, next steps).
-3. Replaces the compaction prompt with a schema-constrained one that forces the model to produce a structured summary with exactly these sections:
-   - Current task
-   - Active files
-   - Locked decisions
-   - Open questions
-   - Blockers
-   - Next steps
-   - What NOT to redo
-
-The durable block is folded into the prompt as "recorded observations from prior sessions" — the model is instructed to verify against the conversation if they conflict, and to check git SHAs/timestamps before relying on a decision.
-
-### Layer 2: Per-project durable memory
-
-On `session.idle`, the plugin:
-
-1. Pulls the full session transcript via the SDK.
-2. Extracts structured facts using heuristics (current task, active files, decisions, blockers, next steps).
-3. Merges with existing memory (superseding old decisions on the same topic).
-4. Prunes to stay under 8KB.
-5. Writes `STATE.json` and regenerates `HEADER.md`.
-
-On session start, the model sees `HEADER.md` (via `instructions`) and can call tools to pull detailed memory.
-
-### Memory isolation
-
-Memory is keyed by `worktree` (the git worktree root) by default. For monorepos where you run opencode from sub-packages, set `memoryKey: "directory"` to isolate by session CWD instead. (Config option — not yet wired; tracked in journal.)
+`STATE.json` contains session IDs and project decisions — don't commit it. `HEADER.md` is safe to commit (it's a <1KB pointer).
 
 ## Tools
 
-The plugin registers 7 custom tools:
+The plugin registers 7 custom tools, available to the agent in every session:
 
-| Tool | Purpose |
-|---|---|
-| `recall_decision` | Recall prior decisions by topic. Omit query to get most recent decisions. |
-| `get_active_files` | List files being worked on and why each matters. |
-| `get_project_state` | Full project memory header — call once at session start when resuming. |
-| `recall_promote` | Mark a decision as foundational (always included in compaction context). |
-| `preview_compaction` | Preview what would survive compaction before it fires. |
-| `head_files` | Read the first N lines of files (cheaper than full `read` for exploration). |
-| `tokenmaxxer_status` | Plugin health: memory file path, size, decision count, last write. |
+| Tool | When to use | What it returns |
+|---|---|---|
+| `get_project_state` | **Call once at session start** when resuming work | Full project memory: current task, active files, valid decisions, blockers, next steps |
+| `recall_decision` | When you need to recall a prior decision | Decisions matching a topic query (or most recent if no query) |
+| `get_active_files` | When you need to know which files matter | Files being worked on and why each matters |
+| `recall_promote` | When a decision should never be forgotten | Marks a decision as foundational — always included in compaction context |
+| `preview_compaction` | When context is getting large | Previews what would survive compaction before it fires |
+| `head_files` | When exploring large files | First N lines of files — cheaper than full `read` |
+| `tokenmaxxer_status` | When debugging | Plugin health: memory file path, size, decision count, last write, last compaction |
 
 ## Kill switch
 
@@ -128,44 +149,89 @@ This skips prompt replacement but still injects the durable block via `output.co
 
 ## Debugging
 
-- **`tokenmaxxer_status` tool** — check plugin health, memory file size, decision count.
-- **`.opencode/memory/last_compaction.log`** — the exact compaction prompt injected at the last compaction. Inspect this if post-compaction quality degrades.
-- **`.opencode/memory/STATE.json`** — the raw memory file. Human-readable JSON.
-- **`.opencode/memory/*.corrupt.*`** — backups of corrupt STATE.json files (if the file ever fails validation).
+| What | Where |
+|---|---|
+| Plugin health | Call the `tokenmaxxer_status` tool |
+| Last injected compaction prompt | `.opencode/memory/last_compaction.log` |
+| Raw memory file | `.opencode/memory/STATE.json` (human-readable JSON) |
+| Corrupt file backups | `.opencode/memory/*.corrupt.*` |
+| Plugin load confirmation | opencode logs: `grep "tokenmaxxer plugin loaded" ~/.local/share/opencode/log/opencode.log` |
+| Compaction hook confirmation | opencode logs: `grep "compaction hook fired" ~/.local/share/opencode/log/opencode.log` |
 
-## Limitations (v1)
+## How memory extraction works
 
-- **Heuristic extraction is crude.** Decisions are detected via keyword matching (`decided`, `let's use`, `go with`, etc.) with negation detection. It will miss decisions stated in unusual phrasing and may produce false positives. v1.1 will add optional LLM-based extraction via `small_model`.
-- **`last_used_in_session` tracks the current session only.** The bounded durable block (M5) includes decisions referenced in the current session as "recent." True "last 3 sessions" windowing requires a session history array (planned for v1.1).
-- **No per-turn history pruning.** The plugin only intervenes at compaction time. Per-turn pruning would require the `experimental.chat.messages.transform` hook (which exists but is undocumented and unstable).
+The heuristic extractor scans the session transcript on `session.idle` and extracts:
+
+- **Current task** — first natural-language user message (skips XML, JSON, code blocks)
+- **Active files** — from `read`/`edit`/`write`/`bash` tool calls (path field `filePath`), filtered to real source files (URLs, system paths, and paths without extensions are rejected)
+- **Decisions** — from user and assistant text, using keyword matching (`let's`, `decided`, `chose`, `go with`, etc.) with:
+  - **Sentence-initial requirement** — keywords must be at the start of a sentence or after a clause boundary (prevents "The decision regex has a gap" from matching)
+  - **Pre-keyword negation** — checks 3 words before the keyword for `not`/`never`/`avoid`/`skip`/`reject`
+  - **Post-keyword negation** — checks 3 words after the keyword (catches "decided to not use X")
+  - **Code block stripping** — fenced code blocks, inline code, and JSON-like lines are removed before scanning
+  - **Quality filters** — topics must be plausible nouns (rejects common English words, code fragments, JSON artifacts)
+  - **Tool outputs excluded** — only natural language conversation is scanned, not file contents or logs
+- **Blockers** — last assistant message, lines containing `blocked`/`can't`/`fails`/`error`/`stuck`
+- **Next steps** — last assistant message, numbered lists and `next:`/`then:`/`TODO` lines
+
+Memory is merged across sessions: new decisions on the same topic supersede old ones (exact normalized topic match, not substring — "auth" does not clobber "authentication"). The file is pruned to 8KB: invalid decisions dropped first, then old active files, then decisions older than 30 days, then last-resort truncation.
+
+## Limitations
+
+- **Heuristic extraction is conservative.** It prioritizes precision over recall — it would rather produce no decisions than wrong ones. Decisions stated in unusual phrasing will be missed. v1.1 will add optional LLM-based extraction via `small_model`.
+- **No per-turn history pruning.** The plugin only intervenes at compaction time. Per-turn pruning would require the `experimental.chat.messages.transform` hook (which exists in the opencode API but is undocumented and unstable).
+- **`last_used_in_session` tracks the current session only.** The bounded durable block includes decisions referenced in the current session as "recent." True "last 3 sessions" windowing requires a session history array (planned for v1.1).
+- **Event handlers are fire-and-forget.** opencode does not await async event handlers. If opencode exits while `writeMemoryOnIdle` is in flight, the write may not complete. Atomic writes (temp file + rename) prevent corruption — the worst case is a missed write, never a corrupt file.
+- **Non-git directories.** opencode sets `worktree` to `/` in non-git directories. The plugin falls back to `directory` (session CWD) in this case.
 
 ## Architecture
 
 ```
 src/
-  index.ts                # plugin entry — wires all hooks
-  types.ts                # shared types
-  config.ts               # options + kill switch
+  index.ts                # Plugin entry — wires all hooks
+  types.ts                # Shared types (CompactionInput, TranscriptPart, etc.)
+  config.ts               # Options + kill switch (TOKENMAXXER_NO_PROMPT)
   memory/
-    schema.ts             # zod schemas (MemoryFile, Decision, ActiveFile)
-    migrate.ts            # version-aware migration (v1 = identity)
-    store.ts              # read/write STATE.json (cached, mtime-invalidated, corrupt recovery)
-    writer.ts             # extractFactsHeuristic, mergeMemory, pruneOld, generateHeader
-    reader.ts             # query helpers for tools
+    schema.ts             # Zod schemas (MemoryFile, Decision, ActiveFile)
+    migrate.ts            # Version-aware migration (v1 = identity)
+    store.ts              # Read/write STATE.json (cached, mtime-invalidated, corrupt recovery)
+    writer.ts             # Heuristic extraction, merge, prune, HEADER.md generation
+    reader.ts             # Query helpers for tools
   compaction/
-    prompt.ts             # schema-constrained compaction prompt
-    durable.ts            # builds durable-state block (M5: bounded policy)
+    prompt.ts             # Schema-constrained compaction prompt
+    durable.ts            # Builds durable-state block (bounded: foundational + recent + top-5 older)
   tools/
     recall.ts             # recall_decision, get_active_files, get_project_state, recall_promote
     efficiency.ts         # preview_compaction, head_files
     status.ts             # tokenmaxxer_status
   util/
-    git.ts                # current git SHA (Bun.$ with child_process fallback)
+    git.ts                # Current git SHA (Bun.$ with child_process fallback)
     log.ts                # client.app.log wrapper (never throws)
-    fs.ts                 # atomic write, safe read, mtime
+    fs.ts                 # Atomic write, safe read, mtime, ensureDir
 ```
 
-See `docs/PLAN.md` (design) and `docs/IMPLEMENTATION.md` (build guide) for full details.
+## Development
+
+```bash
+npm install          # Install dev deps (vitest, tsup, typescript, zod, @opencode-ai/plugin)
+npm test            # Run 105 tests
+npm run build       # Build to dist/index.js (ESM, ~41KB)
+npx tsc --noEmit    # Type check
+```
+
+## Project structure
+
+```
+docs/
+  PLAN.md            # Original 708-line design spec
+  IMPLEMENTATION.md  # Build guide with function specs, test plan, corrected milestone order
+  journal.md         # Progress journal — every change logged with findings
+test/
+  fixtures/          # Transcript fixtures for heuristic extraction tests
+  memory/            # Schema, merge, prune, writer, migrate tests
+  compaction/        # Prompt, durable, bounded policy tests
+  tools/             # Recall, efficiency, status tool tests
+```
 
 ## License
 
