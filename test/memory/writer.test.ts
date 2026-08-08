@@ -262,4 +262,108 @@ describe("extractFactsHeuristic", () => {
       expect(facts.next_steps.length).toBeLessThanOrEqual(5)
     })
   })
+
+  describe("real-world failure modes (from live STATE.json data)", () => {
+    it("does not extract /dev/null as an active file from bash redirects", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            { type: "tool", tool: "bash", state: { status: "completed", input: { command: "echo hello 2>/dev/null && cat src/index.ts > /dev/null", workdir: "/proj" } } },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      expect(facts.active_files.some((f) => f.path.includes("dev/null"))).toBe(false)
+    })
+
+    it("does not extract package import paths as active files from bash", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            { type: "tool", tool: "bash", state: { status: "completed", input: { command: "node -e \"import('@opencode-ai/sdk')\"", workdir: "/proj" } } },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      // @opencode-ai/sdk is a package, not a file
+      expect(facts.active_files.some((f) => f.path.includes("opencode-ai/sdk"))).toBe(false)
+    })
+
+    it("does not extract system paths as active files", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            { type: "tool", tool: "bash", state: { status: "completed", input: { command: "ls /usr/local/bin/node && cat /etc/hosts", workdir: "/proj" } } },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      expect(facts.active_files.some((f) => f.path.startsWith("/usr/"))).toBe(false)
+      expect(facts.active_files.some((f) => f.path.startsWith("/etc/"))).toBe(false)
+    })
+
+    it("does not extract 'decided to not use X' as a decision (post-keyword negation)", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            { type: "text", text: "Decided to not use SQLite for this project. Let's use Postgres instead." },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      const sqliteDecision = facts.decisions.find((d) => d.topic.toLowerCase().includes("sqlite"))
+      expect(sqliteDecision).toBeUndefined()
+    })
+
+    it("does not extract descriptions of decisions as decisions (noun, not verb)", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            { type: "text", text: "The decision extraction regex has a negation gap. The negation detection checks 3 words before the keyword." },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      // "The decision extraction regex has a gap" is a description, not a decision
+      expect(facts.decisions).toHaveLength(0)
+    })
+
+    it("does not extract sentences containing regex/pattern/heuristic keywords as decisions", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            { type: "text", text: "Let's fix the regex pattern for the heuristic extraction. Decided to use Postgres for the database." },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      // The first sentence contains "regex" and should be skipped
+      // The second sentence is a real decision
+      const pgDecision = facts.decisions.find((d) => d.topic.toLowerCase().includes("postgres"))
+      expect(pgDecision).toBeDefined()
+      // Should not have extracted a "regex" decision
+      expect(facts.decisions.some((d) => d.topic.toLowerCase().includes("regex"))).toBe(false)
+    })
+
+    it("does not produce duplicate decisions from the same sentence", () => {
+      const messages: TranscriptMessage[] = [
+        {
+          info: { id: "m1", role: "assistant" },
+          parts: [
+            { type: "text", text: "Let's go with Postgres for the database." },
+          ],
+        },
+      ]
+      const facts = extractFactsHeuristic(messages)
+      // "Let's go with" could match both "let's" and "go with" — should only produce one decision
+      expect(facts.decisions).toHaveLength(1)
+      expect(facts.decisions[0].topic.toLowerCase()).toContain("postgres")
+    })
+  })
 })

@@ -353,7 +353,7 @@ async function writeMemoryOnIdle(opts) {
   } catch {
   }
 }
-var DECISION_KEYWORD_RE = /(?:decision|decided|let's|we'll|we will|chose|picked|going with|go with|settle on|settled on)\s+(?!not|never|against|avoid|skip|reject)\b/i;
+var DECISION_KEYWORD_RE = /(?:^|[,;]\s+|\.+\s+)(?:decision|decided|let's|we'll|we will|chose|picked|going with|go with|settle on|settled on)\s+(?!not|never|against|avoid|skip|reject)\b/i;
 var NEGATION_WORDS_RE = /(?:not|never|don't|won't|avoid|skip|reject|against)/i;
 var FOUNDATIONAL_RE = /we (will|'ll) (always|never)|architect(?:ure)? decision|breaking change|migrat(?:e|ion|ing) to|this (?:changes|breaks) the (?:public )?api/i;
 function extractFactsHeuristic(messages) {
@@ -418,12 +418,17 @@ function extractPaths(tool4, input) {
   if (tool4 === "bash") {
     const command = input["command"];
     if (typeof command === "string") {
-      const pathMatches = command.matchAll(/(?:\.?\/)?(?:[\w-]+\/)+[\w.-]+/g);
+      const pathMatches = command.matchAll(
+        /(?:\.?\/)?(?:[\w-]+\/)+[\w.-]+\.\w+/g
+      );
       for (const m of pathMatches) {
         const p = m[0];
-        if (!p.includes("://") && !p.startsWith("node_modules")) {
-          paths.push(p);
+        if (p.includes("://") || // URLs
+        p.startsWith("node_modules") || p === "/dev/null" || p === "/dev/stdin" || p === "/dev/stdout" || p === "/dev/stderr" || p.startsWith("/usr/") || // system paths
+        p.startsWith("/bin/") || p.startsWith("/lib/") || p.startsWith("/etc/") || p.startsWith("/proc/") || p.startsWith("/sys/") || p.startsWith("/tmp/opencode")) {
+          continue;
         }
+        paths.push(p);
       }
     }
   }
@@ -472,16 +477,27 @@ function extractDecisions(messages) {
 function scanTextForDecisions(text) {
   if (!text || text.length === 0) return [];
   const decisions = [];
-  const sentences = text.split(/(?<=[.!?])\s+/);
+  const seenSentences = /* @__PURE__ */ new Set();
+  const sentences = text.split(/(?<=[.!?])\s+|\n+/);
   for (const sentence of sentences) {
-    const allMatches = [...sentence.matchAll(
-      new RegExp(DECISION_KEYWORD_RE.source, DECISION_KEYWORD_RE.flags + "g")
+    const trimmedSentence = sentence.trim();
+    if (!trimmedSentence) continue;
+    if (trimmedSentence.startsWith("`") || trimmedSentence.startsWith(">") || trimmedSentence.startsWith("*") || trimmedSentence.startsWith("-")) {
+      if (!/^(let's|we'll|we will|decision|decided|chose|picked|going with|go with|settle on|settled on)\b/i.test(trimmedSentence)) {
+        continue;
+      }
+    }
+    if (/\b(?:regex|pattern|heuristic|extraction|negation|keyword)\b/i.test(trimmedSentence)) {
+      continue;
+    }
+    const allMatches = [...trimmedSentence.matchAll(
+      new RegExp(DECISION_KEYWORD_RE.source, DECISION_KEYWORD_RE.flags.replace("i", "") + "gi")
     )];
     for (const match of allMatches) {
       const keywordIndex = match.index;
       const keywordText = match[0];
       const keywordEnd = keywordIndex + keywordText.length;
-      const beforeText = sentence.slice(0, keywordIndex).trim();
+      const beforeText = trimmedSentence.slice(0, keywordIndex).trim();
       const beforeWords = beforeText.split(/\s+/);
       const lastThreeBefore = beforeWords.slice(-3).join(" ");
       if (NEGATION_WORDS_RE.test(lastThreeBefore)) {
@@ -490,11 +506,19 @@ function scanTextForDecisions(text) {
       if (/not|never|don't|won't|avoid|skip|reject|against/i.test(keywordText)) {
         continue;
       }
-      const afterText = sentence.slice(keywordEnd).trim();
+      const afterText = trimmedSentence.slice(keywordEnd).trim();
+      const afterWords = afterText.split(/\s+/);
+      const firstThreeAfter = afterWords.slice(0, 3).join(" ");
+      if (NEGATION_WORDS_RE.test(firstThreeAfter)) {
+        continue;
+      }
       const topic = extractTopicPhrase(afterText);
       if (!topic) continue;
-      const foundational = FOUNDATIONAL_RE.test(sentence);
-      const decision = sentence.trim();
+      const foundational = FOUNDATIONAL_RE.test(trimmedSentence);
+      const decision = trimmedSentence;
+      const sentenceKey = decision.slice(0, 100);
+      if (seenSentences.has(sentenceKey)) continue;
+      seenSentences.add(sentenceKey);
       decisions.push({
         topic: topic.normalized,
         decision: decision.slice(0, 500),
@@ -510,7 +534,7 @@ function extractTopicPhrase(afterKeyword) {
   if (words.length === 0) return null;
   while (words.length > 0) {
     const first = words[0].toLowerCase();
-    if (first === "to" || first === "the" || first === "a" || first === "an" || first === "that" || first === "use" || first === "using") {
+    if (first === "to" || first === "the" || first === "a" || first === "an" || first === "that" || first === "use" || first === "using" || first === "go" || first === "with" || first === "build" || first === "set" || first === "up" || first === "start" || first === "create" || first === "implement" || first === "for" || first === "on" || first === "in" || first === "our") {
       words = words.slice(1);
     } else {
       break;

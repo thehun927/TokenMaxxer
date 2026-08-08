@@ -76,11 +76,11 @@ export async function writeMemoryOnIdle(opts: {
 
 // ─── extractFactsHeuristic ───────────────────────────────────────────────────
 
-/** Decision keyword regex — sentence-level */
+/** Decision keyword regex — must be sentence-initial or after a clause boundary */
 const DECISION_KEYWORD_RE =
-  /(?:decision|decided|let's|we'll|we will|chose|picked|going with|go with|settle on|settled on)\s+(?!not|never|against|avoid|skip|reject)\b/i
+  /(?:^|[,;]\s+|\.+\s+)(?:decision|decided|let's|we'll|we will|chose|picked|going with|go with|settle on|settled on)\s+(?!not|never|against|avoid|skip|reject)\b/i
 
-/** Negation words to check in the 3 words before a keyword */
+/** Negation words to check in the 3 words before AND after a keyword */
 const NEGATION_WORDS_RE = /(?:not|never|don't|won't|avoid|skip|reject|against)/i
 
 /** Foundational auto-detection patterns */
@@ -204,15 +204,32 @@ function extractPaths(tool: string, input: Record<string, unknown>): string[] {
   if (tool === "bash") {
     const command = input["command"]
     if (typeof command === "string") {
-      // Match paths that look like files: contain / and have a file-like extension or path structure
-      // e.g. "src/index.ts", "test/memory/writer.test.ts", "./dist/index.js"
-      const pathMatches = command.matchAll(/(?:\.?\/)?(?:[\w-]+\/)+[\w.-]+/g)
+      // Match paths that look like real source files: must have a path separator
+      // and a file extension, or start with a known source directory
+      const pathMatches = command.matchAll(
+        /(?:\.?\/)?(?:[\w-]+\/)+[\w.-]+\.\w+/g,
+      )
       for (const m of pathMatches) {
         const p = m[0]
-        // Filter out obvious non-file paths (URLs, node_modules, etc.)
-        if (!p.includes("://") && !p.startsWith("node_modules")) {
-          paths.push(p)
+        // Filter out non-file paths
+        if (
+          p.includes("://") || // URLs
+          p.startsWith("node_modules") ||
+          p === "/dev/null" ||
+          p === "/dev/stdin" ||
+          p === "/dev/stdout" ||
+          p === "/dev/stderr" ||
+          p.startsWith("/usr/") || // system paths
+          p.startsWith("/bin/") ||
+          p.startsWith("/lib/") ||
+          p.startsWith("/etc/") ||
+          p.startsWith("/proc/") ||
+          p.startsWith("/sys/") ||
+          p.startsWith("/tmp/opencode") // opencode temp paths
+        ) {
+          continue
         }
+        paths.push(p)
       }
     }
   }
@@ -284,21 +301,41 @@ function extractDecisions(messages: TranscriptMessage[]): {
 /**
  * Scan text for decision sentences with negation detection.
  * Returns array of extracted decisions.
+ * Keywords must be sentence-initial or after a clause boundary (comma/semicolon/newline)
+ * to avoid matching "The decision regex has a gap" (noun, not verb).
  */
 function scanTextForDecisions(text: string): RawDecision[] {
   if (!text || text.length === 0) return []
 
   const decisions: RawDecision[] = []
+  const seenSentences = new Set<string>()
 
-  // Split into sentences for context
-  const sentences = text.split(/(?<=[.!?])\s+/)
+  // Split into sentences for context. Also split on newlines so each line
+  // is treated as its own "sentence" for clause boundary detection.
+  const sentences = text.split(/(?<=[.!?])\s+|\n+/)
 
   for (const sentence of sentences) {
-    // Use matchAll to find ALL decision keywords in the sentence, not just the first.
-    // This handles cases like "Let's go with Postgres" where "let's" matches
-    // before "go with" — both are found and duplicates get deduped.
-    const allMatches = [...sentence.matchAll(
-      new RegExp(DECISION_KEYWORD_RE.source, DECISION_KEYWORD_RE.flags + "g"),
+    const trimmedSentence = sentence.trim()
+    if (!trimmedSentence) continue
+
+    // Skip sentences that are inside code blocks, quotes, or backticks
+    // (these are descriptions of decisions, not actual decisions)
+    if (trimmedSentence.startsWith("`") || trimmedSentence.startsWith(">") || trimmedSentence.startsWith("*") || trimmedSentence.startsWith("-")) {
+      // Allow bullet points that start with "Let's" etc, but skip code/quotes
+      if (!/^(let's|we'll|we will|decision|decided|chose|picked|going with|go with|settle on|settled on)\b/i.test(trimmedSentence)) {
+        continue
+      }
+    }
+
+    // Skip sentences containing "regex" or "pattern" — these are almost always
+    // descriptions of the extraction logic, not actual decisions
+    if (/\b(?:regex|pattern|heuristic|extraction|negation|keyword)\b/i.test(trimmedSentence)) {
+      continue
+    }
+
+    // Use matchAll to find ALL decision keywords in the sentence
+    const allMatches = [...trimmedSentence.matchAll(
+      new RegExp(DECISION_KEYWORD_RE.source, DECISION_KEYWORD_RE.flags.replace("i", "") + "gi"),
     )]
 
     for (const match of allMatches) {
@@ -306,8 +343,8 @@ function scanTextForDecisions(text: string): RawDecision[] {
       const keywordText = match[0]
       const keywordEnd = keywordIndex + keywordText.length
 
-      // Negation detection: check 3 words before the keyword
-      const beforeText = sentence.slice(0, keywordIndex).trim()
+      // Negation detection: check 3 words BEFORE the keyword
+      const beforeText = trimmedSentence.slice(0, keywordIndex).trim()
       const beforeWords = beforeText.split(/\s+/)
       const lastThreeBefore = beforeWords.slice(-3).join(" ")
 
@@ -320,16 +357,31 @@ function scanTextForDecisions(text: string): RawDecision[] {
         continue
       }
 
+      // Post-keyword negation: check 3 words AFTER the keyword
+      // This catches "decided to not use Postgres" and "let's not use X"
+      const afterText = trimmedSentence.slice(keywordEnd).trim()
+      const afterWords = afterText.split(/\s+/)
+      const firstThreeAfter = afterWords.slice(0, 3).join(" ")
+
+      if (NEGATION_WORDS_RE.test(firstThreeAfter)) {
+        continue // Skip post-keyword negated decisions
+      }
+
       // Topic extraction: first noun phrase after keyword
-      const afterText = sentence.slice(keywordEnd).trim()
       const topic = extractTopicPhrase(afterText)
       if (!topic) continue
 
       // Auto-detect foundational
-      const foundational = FOUNDATIONAL_RE.test(sentence)
+      const foundational = FOUNDATIONAL_RE.test(trimmedSentence)
 
       // Decision text: the full sentence, trimmed
-      const decision = sentence.trim()
+      const decision = trimmedSentence
+
+      // Dedup by sentence — if the same sentence produced multiple matches,
+      // keep only the first (prevents "let's go with" matching both "let's" and "go with")
+      const sentenceKey = decision.slice(0, 100)
+      if (seenSentences.has(sentenceKey)) continue
+      seenSentences.add(sentenceKey)
 
       decisions.push({
         topic: topic.normalized,
@@ -352,9 +404,12 @@ function extractTopicPhrase(afterKeyword: string): { raw: string; normalized: st
   if (words.length === 0) return null
 
   // Skip leading grammatical/filler words that commonly follow decision keywords:
-  // "decided to use Postgres" → skip "to"
+  // "decided to use Postgres" → skip "to", "use"
   // "chose the simpler approach" → skip "the"
   // "decision that MongoDB" → skip "that"
+  // "let's go with Postgres" → skip "go", "with"
+  // "let's build a REST API" → skip "build", "a"
+  // "let's set up the schema" → skip "set", "up", "the"
   while (words.length > 0) {
     const first = words[0]!.toLowerCase()
     if (
@@ -364,7 +419,19 @@ function extractTopicPhrase(afterKeyword: string): { raw: string; normalized: st
       first === "an" ||
       first === "that" ||
       first === "use" ||
-      first === "using"
+      first === "using" ||
+      first === "go" ||
+      first === "with" ||
+      first === "build" ||
+      first === "set" ||
+      first === "up" ||
+      first === "start" ||
+      first === "create" ||
+      first === "implement" ||
+      first === "for" ||
+      first === "on" ||
+      first === "in" ||
+      first === "our"
     ) {
       words = words.slice(1)
     } else {
