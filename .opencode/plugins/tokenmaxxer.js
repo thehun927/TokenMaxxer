@@ -13,6 +13,8 @@ function loadOptions(_ctx) {
 function buildCompactionPrompt(durable) {
   return `You are generating a continuation prompt for an opencode session that has run out of context window space. The summary you produce REPLACES the entire conversation history for the agent that resumes this work, so it must be self-sufficient.
 
+CRITICAL: You are ONLY generating a text summary. Do NOT make tool calls. Do NOT write files. Do NOT read files. Do NOT run commands. Output ONLY the summary text below \u2014 nothing else.
+
 Produce a summary with EXACTLY these sections, in this order, each prefixed with its header:
 
 ## Current task
@@ -365,10 +367,19 @@ function extractFactsHeuristic(messages) {
   return { current_task, active_files, decisions, blockers, next_steps };
 }
 function extractCurrentTask(messages) {
-  const firstUser = messages.find((m) => m.info.role === "user");
-  if (!firstUser) return null;
-  const text = getMessageText(firstUser);
-  return text.slice(0, 200) || null;
+  for (const msg of messages) {
+    if (msg.info.role !== "user") continue;
+    const text = getMessageText(msg);
+    if (!text) continue;
+    if (/^\s*<task|^\s*<summary|^\s*<task_result/.test(text)) continue;
+    if (/^\s*[{[]/.test(text)) continue;
+    const cleaned = stripCodeBlocks(text);
+    const firstLine = cleaned.split("\n").find((l) => l.trim().length > 10);
+    if (firstLine) {
+      return firstLine.trim().slice(0, 200);
+    }
+  }
+  return null;
 }
 function extractActiveFiles(messages) {
   const fileCounts = /* @__PURE__ */ new Map();
@@ -380,7 +391,10 @@ function extractActiveFiles(messages) {
       if (toolName === "read" || toolName === "edit" || toolName === "write" || toolName === "glob" || toolName === "grep" || toolName === "bash") {
         const paths = extractPaths(toolName, input);
         for (const p of paths) {
-          fileCounts.set(p, (fileCounts.get(p) ?? 0) + 1);
+          const normalized = normalizePath(p);
+          if (normalized) {
+            fileCounts.set(normalized, (fileCounts.get(normalized) ?? 0) + 1);
+          }
         }
       }
     }
@@ -390,6 +404,27 @@ function extractActiveFiles(messages) {
     path,
     reason: count > 1 ? `edited ${count} times` : "read once"
   }));
+}
+function normalizePath(p) {
+  let path = p.replace(/^\.\//, "");
+  if (path.includes("://")) return null;
+  if (path.includes("github.com/")) return null;
+  if (path.includes("raw.githubusercontent")) return null;
+  if (path.startsWith("/dev/") || path.startsWith("/usr/") || path.startsWith("/bin/")) return null;
+  if (path.startsWith("/lib/") || path.startsWith("/etc/") || path.startsWith("/proc/")) return null;
+  if (path.startsWith("/sys/") || path.startsWith("/tmp/opencode")) return null;
+  if (path.includes("opencode.db") || path.includes("opencode/log/")) return null;
+  if (path.includes(".local/share/opencode")) return null;
+  if (path.startsWith("node_modules")) return null;
+  if (!/\.\w+$/.test(path)) {
+    const sourcePrefixes = ["src/", "test/", "docs/", "lib/", "scripts/"];
+    if (!sourcePrefixes.some((prefix) => path.startsWith(prefix))) {
+      return null;
+    }
+  }
+  if (!path.includes("/") && !path.startsWith("/")) return null;
+  if (!path.includes("/") && !path.includes(".")) return null;
+  return path;
 }
 function extractPaths(tool4, input) {
   const paths = [];

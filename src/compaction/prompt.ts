@@ -10,6 +10,8 @@
 export function buildCompactionPrompt(durable: string): string {
   return `You are generating a continuation prompt for an opencode session that has run out of context window space. The summary you produce REPLACES the entire conversation history for the agent that resumes this work, so it must be self-sufficient.
 
+CRITICAL: You are ONLY generating a text summary. Do NOT make tool calls. Do NOT write files. Do NOT read files. Do NOT run commands. Output ONLY the summary text below — nothing else.
+
 Produce a summary with EXACTLY these sections, in this order, each prefixed with its header:
 
 ## Current task

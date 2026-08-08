@@ -121,11 +121,26 @@ export function extractFactsHeuristic(
 }
 
 function extractCurrentTask(messages: TranscriptMessage[]): string | null {
-  const firstUser = messages.find((m) => m.info.role === "user")
-  if (!firstUser) return null
+  // Find the first user message that contains natural language (not XML/task results)
+  for (const msg of messages) {
+    if (msg.info.role !== "user") continue
+    const text = getMessageText(msg)
+    if (!text) continue
 
-  const text = getMessageText(firstUser)
-  return text.slice(0, 200) || null
+    // Skip messages that are XML/task results (start with <task, <summary, etc.)
+    if (/^\s*<task|^\s*<summary|^\s*<task_result/.test(text)) continue
+
+    // Skip messages that are mostly JSON
+    if (/^\s*[{[]/.test(text)) continue
+
+    // Strip code blocks and take the first natural language line
+    const cleaned = stripCodeBlocks(text)
+    const firstLine = cleaned.split("\n").find((l) => l.trim().length > 10)
+    if (firstLine) {
+      return firstLine.trim().slice(0, 200)
+    }
+  }
+  return null
 }
 
 function extractActiveFiles(
@@ -150,7 +165,10 @@ function extractActiveFiles(
       ) {
         const paths = extractPaths(toolName, input)
         for (const p of paths) {
-          fileCounts.set(p, (fileCounts.get(p) ?? 0) + 1)
+          const normalized = normalizePath(p)
+          if (normalized) {
+            fileCounts.set(normalized, (fileCounts.get(normalized) ?? 0) + 1)
+          }
         }
       }
     }
@@ -165,6 +183,49 @@ function extractActiveFiles(
     path,
     reason: count > 1 ? `edited ${count} times` : "read once",
   }))
+}
+
+/**
+ * Normalize and validate a file path.
+ * Returns null if the path is not a plausible source file.
+ */
+function normalizePath(p: string): string | null {
+  // Strip leading ./
+  let path = p.replace(/^\.\//, "")
+
+  // Reject URLs and URL fragments
+  if (path.includes("://")) return null
+  if (path.includes("github.com/")) return null
+  if (path.includes("raw.githubusercontent")) return null
+
+  // Reject system paths
+  if (path.startsWith("/dev/") || path.startsWith("/usr/") || path.startsWith("/bin/")) return null
+  if (path.startsWith("/lib/") || path.startsWith("/etc/") || path.startsWith("/proc/")) return null
+  if (path.startsWith("/sys/") || path.startsWith("/tmp/opencode")) return null
+
+  // Reject opencode internal paths
+  if (path.includes("opencode.db") || path.includes("opencode/log/")) return null
+  if (path.includes(".local/share/opencode")) return null
+
+  // Reject node_modules
+  if (path.startsWith("node_modules")) return null
+
+  // Reject paths that don't have a file extension (directories, not files)
+  // unless they're clearly source paths (src/, test/, docs/, lib/)
+  if (!/\.\w+$/.test(path)) {
+    const sourcePrefixes = ["src/", "test/", "docs/", "lib/", "scripts/"]
+    if (!sourcePrefixes.some((prefix) => path.startsWith(prefix))) {
+      return null
+    }
+  }
+
+  // Reject paths that are just fragments (no directory separator)
+  if (!path.includes("/") && !path.startsWith("/")) return null
+
+  // Reject if path looks like a command name (single word, no extension)
+  if (!path.includes("/") && !path.includes(".")) return null
+
+  return path
 }
 
 /** Extract file paths from tool input. */
