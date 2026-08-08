@@ -48,18 +48,6 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
     // app.info may not exist — non-fatal
   }
 
-  // --- Config check: recommend prune + watcher.ignore (best effort) ---
-  try {
-    const c = client as { config?: { get?: () => Promise<{ data?: { compaction?: { prune?: boolean }; watcher?: { ignore?: string[] } } }> } }
-    const config = await c.config?.get?.()
-    const cfg = config?.data
-    if (cfg?.compaction && !cfg.compaction.prune) {
-      await log(client, "warn", "compaction.prune is not enabled — recommend setting it to true for better token efficiency")
-    }
-  } catch {
-    // config.get may not exist — non-fatal
-  }
-
   // --- First-session HEADER.md placeholder ---
   // Create the memory directory + placeholder HEADER.md on plugin init.
   // This ensures the directory exists for STATE.json writes later.

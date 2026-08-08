@@ -100,7 +100,7 @@ For better token efficiency, add to your project's `opencode.json`:
 
 | Setting | Why |
 |---|---|
-| `compaction.prune: true` | Drops old tool outputs — the biggest single token saver. The plugin logs a warning if this isn't set. |
+| `compaction.prune: true` | Drops old tool outputs — the biggest single token saver. Tokenmaxxer works without it, but compaction is less efficient. |
 | `compaction.reserved: 15000` | Headroom so compaction doesn't overflow. |
 | `watcher.ignore` | Stops the file watcher from processing the plugin's writes to `.opencode/memory/`. Harmless without it, but slightly cleaner. |
 
