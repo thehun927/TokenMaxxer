@@ -72,44 +72,43 @@ Session 2 (new): model sees HEADER.md → calls get_project_state
 curl -fsSL https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/install.sh | bash
 ```
 
-This installs the plugin to `~/.config/opencode/plugins/tokenmaxxer.js` and adds the `zod` dependency. **Layer 1 (compaction hook) is active immediately** for all projects. Layer 2 (memory + tools) requires per-project config (below).
+That's it. Both layers are active immediately in all projects — no per-project config required.
+
+- **Layer 1** (compaction hook) fires on every `/compact`
+- **Layer 2** (memory + tools) writes `STATE.json` on session idle and injects the project header into the system prompt via the `experimental.chat.system.transform` hook
+- **7 custom tools** are registered and available to the agent in every session
 
 ### Manual install
 
 ```bash
-# Clone and build
 git clone https://github.com/thehun927/TokenMaxxer.git
-cd TokenMaxxer
-npm install && npm run build
-
-# Install globally (all projects)
-cp dist/index.js ~/.config/opencode/plugins/tokenmaxxer.js
-
-# Or install locally (single project)
-cp dist/index.js .opencode/plugins/tokenmaxxer.js
+cd TokenMaxxer && npm install && npm run build
+cp dist/index.js ~/.config/opencode/plugins/tokenmaxxer.js   # global (all projects)
+# or: cp dist/index.js .opencode/plugins/tokenmaxxer.js       # local (single project)
 ```
 
-### Per-project config (enables Layer 2)
+### Optional tuning (not required)
 
-Add to your project's `opencode.json`:
+For better token efficiency, add to your project's `opencode.json`:
 
 ```jsonc
 {
-  "$schema": "https://opencode.ai/config.json",
   "compaction": { "auto": true, "prune": true, "reserved": 15000 },
-  "instructions": ["AGENTS.md", ".opencode/memory/HEADER.md"],
-  "watcher": {
-    "ignore": ["node_modules/**", "dist/**", ".git/**", ".opencode/memory/**"]
-  }
+  "watcher": { "ignore": [".opencode/memory/**"] }
 }
 ```
 
 | Setting | Why |
 |---|---|
-| `compaction.prune: true` | Drops old tool outputs — the biggest single token saver. Complements the plugin. |
-| `compaction.reserved: 15000` | Headroom so compaction doesn't overflow. Increase to 20000 if quality matters. |
-| `instructions` | Wires in the Layer 2 header. The plugin generates `HEADER.md` automatically; listing it here loads it into the system prompt at session start. |
-| `watcher.ignore` | Stops the file watcher from re-firing on the plugin's own writes to `.opencode/memory/`. |
+| `compaction.prune: true` | Drops old tool outputs — the biggest single token saver. The plugin logs a warning if this isn't set. |
+| `compaction.reserved: 15000` | Headroom so compaction doesn't overflow. |
+| `watcher.ignore` | Stops the file watcher from processing the plugin's writes to `.opencode/memory/`. Harmless without it, but slightly cleaner. |
+
+You can also add `.opencode/memory/HEADER.md` to `instructions` for redundant header injection (the `system.transform` hook already handles this, but `instructions` is the documented path):
+
+```jsonc
+"instructions": ["AGENTS.md", ".opencode/memory/HEADER.md"]
+```
 
 ### .gitignore
 

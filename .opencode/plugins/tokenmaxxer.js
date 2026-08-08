@@ -4,7 +4,6 @@ function loadOptions(_ctx) {
     // Kill switch: set TOKENMAXXER_NO_PROMPT=1 to skip prompt replacement,
     // still inject durable block via output.context
     compactionPrompt: process.env.TOKENMAXXER_NO_PROMPT !== "1",
-    headerInjection: "instructions",
     memoryKey: "worktree"
   };
 }
@@ -1162,8 +1161,16 @@ var TokenmaxxerPlugin = async (ctx) => {
   } catch {
   }
   try {
-    const project2 = resolveProjectPath(worktree, directory);
-    const headerPath = join4(project2, ".opencode", "memory", "HEADER.md");
+    const c = client;
+    const config = await c.config?.get?.();
+    const cfg = config?.data;
+    if (cfg?.compaction && !cfg.compaction.prune) {
+      await log(client, "warn", "compaction.prune is not enabled \u2014 recommend setting it to true for better token efficiency");
+    }
+  } catch {
+  }
+  try {
+    const headerPath = join4(project, ".opencode", "memory", "HEADER.md");
     if (await safeRead(headerPath) === null) {
       await atomicWrite(
         headerPath,
@@ -1189,8 +1196,7 @@ var TokenmaxxerPlugin = async (ctx) => {
           durableLength: durable.length
         });
         try {
-          const project2 = resolveProjectPath(worktree, directory);
-          const logPath = join4(project2, ".opencode", "memory", "last_compaction.log");
+          const logPath = join4(project, ".opencode", "memory", "last_compaction.log");
           const entry = `[${(/* @__PURE__ */ new Date()).toISOString()}] session=${input.sessionID}
 ${output.prompt ?? "(durable via context)"}
 ---
@@ -1212,7 +1218,6 @@ ${output.prompt ?? "(durable via context)"}
             return;
           }
           await writeMemoryOnIdle({ client, worktree, directory, sessionId });
-        } else if (event.type === "session.created") {
         }
       } catch (e) {
         await log(client, "error", "event handler failed", { type: event.type, error: String(e) });
@@ -1222,22 +1227,27 @@ ${output.prompt ?? "(durable via context)"}
     ...registerTools(ctx),
     ...registerEfficiencyTools(),
     ...registerStatusTools(),
-    // Alternative header-injection path (experimental, undocumented).
-    // Only active when options.headerInjection === "system_transform".
-    // Falls back to the documented `instructions` + HEADER.md path otherwise.
-    ...options.headerInjection === "system_transform" ? {
-      "experimental.chat.system.transform": async (_input, output) => {
-        try {
-          const mem = await readMemory({ worktree, directory });
-          if (!mem) return;
+    // Layer 2: system prompt injection (zero-config — no `instructions` needed)
+    // This experimental hook fires when the system prompt is built (every session,
+    // every step). It pushes a brief instruction + project memory header into the
+    // system prompt, so the model always knows about the tools and sees prior
+    // project state. If the hook doesn't exist in the opencode version, it's
+    // silently ignored — the tools still work, the model just won't get the hint.
+    "experimental.chat.system.transform": async (_input, output) => {
+      try {
+        output.system.push(
+          "tokenmaxxer: This project has cross-session memory. Call get_project_state at session start to load prior decisions, active files, and next steps."
+        );
+        const mem = await readMemory({ worktree, directory });
+        if (mem) {
           output.system.push(
-            `Project: ${mem.project_path} | Last: ${mem.last_updated} (SHA ${mem.last_git_sha ?? "?"}) | Task: ${mem.current_task ?? "\u2014"} | Call get_project_state for details.`
+            `Project: ${mem.project_path} | Last: ${mem.last_updated} (SHA ${mem.last_git_sha ?? "?"}) | Task: ${mem.current_task ?? "\u2014"} | Decisions: ${mem.decisions.filter((d) => d.still_valid).length} valid | Call get_project_state for details.`
           );
-        } catch (e) {
-          await log(client, "error", "system.transform failed", { error: String(e) });
         }
+      } catch (e) {
+        await log(client, "error", "system.transform failed", { error: String(e) });
       }
-    } : {}
+    }
   };
 };
 var index_default = TokenmaxxerPlugin;

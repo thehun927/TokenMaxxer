@@ -20,12 +20,10 @@ export interface ExtractedFacts {
   next_steps: string[]
 }
 
-/** Plugin options (read from env vars; future: opencode.json "tokenmaxxer" key) */
+/** Plugin options (read from env vars) */
 export interface TokenmaxxerOptions {
   /** Kill switch for compaction prompt replacement. false = inject durable block via context only. */
   compactionPrompt: boolean
-  /** Header injection mechanism: "instructions" (documented) or "system_transform" (experimental) */
-  headerInjection: "instructions" | "system_transform"
   /** Memory isolation key: "worktree" (default, single-repo) or "directory" (monorepo sub-packages) */
   memoryKey: "worktree" | "directory"
 }
