@@ -11,12 +11,13 @@
     }
   },
   "scripts": {
-    "build": "tsup src/index.ts --format esm --dts --external @opencode-ai/plugin --external zod",
+    "build": "tsup src/index.ts --format esm --dts --external @opencode-ai/plugin --external @opencode-ai/sdk --external zod",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.0.0 <2.0.0",
+    "@opencode-ai/sdk": ">=1.18.15 <2.0.0",
     "zod": ">=3.0.0"
   },
   "devDependencies": {

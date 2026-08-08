@@ -7,7 +7,18 @@ import type { ExtractedFacts, TranscriptMessage, TranscriptPart } from "../types
 import { readMemory, writeMemory, emptyMemory, resolveProjectPath } from "./store"
 import { getCurrentGitSha } from "../util/git"
 import { atomicWrite } from "../util/fs"
-import { join } from "node:path"
+import { basename, join } from "node:path"
+import {
+  buildCanonicalInput,
+} from "./extract-prompt"
+import {
+  extractFactsLLM,
+  extractionCacheKey,
+  getLLMConfig,
+  makeExtractionCacheEntry,
+  readExtractionCache,
+  upsertExtractionCache,
+} from "./extract-llm"
 
 const TRANSCRIPT_WINDOW = 50
 
@@ -20,12 +31,14 @@ const TRANSCRIPT_WINDOW = 50
  */
 export async function writeMemoryOnIdle(opts: {
   client: unknown
+  /** Lazily constructed SDK-v2 client; never the v1 plugin client. */
+  v2Client?: unknown
   worktree: string
   directory: string
   sessionId: string
 }): Promise<void> {
   try {
-    const { client, worktree, directory, sessionId } = opts
+    const { client, v2Client, worktree, directory, sessionId } = opts
 
     // Fetch session messages
     const c = client as {
@@ -42,11 +55,14 @@ export async function writeMemoryOnIdle(opts: {
     // Cap to last TRANSCRIPT_WINDOW messages
     const messages = allMessages.slice(-TRANSCRIPT_WINDOW)
 
+    // Read this snapshot before the heuristic write. It is the stable prior
+    // state used to identify the exact extraction input, and does not include
+    // facts produced by this idle event.
+    const existing = (await readMemory({ worktree, directory })) ?? emptyMemory(worktree)
+    const canonicalInput = buildCanonicalInput(messages, existing)
+
     // Get git SHA
     const gitSha = await getCurrentGitSha(worktree)
-
-    // Read existing memory or start fresh
-    const existing = (await readMemory({ worktree, directory })) ?? emptyMemory(worktree)
 
     // Extract facts from transcript
     const extracted = extractFactsHeuristic(messages)
@@ -61,17 +77,93 @@ export async function writeMemoryOnIdle(opts: {
       timestamp: new Date().toISOString(),
     })
 
+    // Record the source session once per idle write, retaining the newest ten.
+    const withRecentSession = recordRecentSession(merged, sessionId)
+
     // Prune to 8KB cap
-    const pruned = pruneOld(merged)
+    const pruned = pruneOld(withRecentSession)
 
-    // Write to disk
+    // Write to disk before doing any LLM work. This is the durable v1
+    // fallback if the process exits or the v2 request is unavailable.
     await writeMemory({ worktree, directory }, pruned)
-
-    // Generate HEADER.md
     await generateHeader(worktree, directory, pruned)
+
+    // The feature is opt-in and the v2 client is only used after the idle
+    // handler has entered this function. In particular, initialization never
+    // resolves config.small_model.
+    if (!v2Client || process.env.TOKENMAXXER_LLM_EXTRACT !== "1") return
+
+    const llmConfig = await getLLMConfig(v2Client, directory)
+    if (!llmConfig.enabled || !llmConfig.model) return
+
+    const cacheKey = extractionCacheKey(sessionId, canonicalInput, llmConfig.model)
+    const afterHeuristic = (await readMemory({ worktree, directory })) ?? pruned
+    const cachedFacts = readExtractionCache(afterHeuristic, cacheKey)
+
+    // Cache hits still merge validated facts into the latest state, but make
+    // no session or prompt request.
+    if (cachedFacts) {
+      await mergeAsyncFacts(opts, cachedFacts, gitSha, sessionId)
+      return
+    }
+
+    const project = resolveProjectPath(worktree, directory)
+    const projectName = basename(project) || project
+    const llmFacts = await extractFactsLLM(
+      canonicalInput,
+      sessionId,
+      projectName,
+      v2Client,
+      llmConfig,
+      { directory },
+    )
+    if (!llmFacts) return
+
+    // Prompting is asynchronous. Re-read immediately before applying the
+    // result so another memory update is not overwritten by the stale prior
+    // snapshot used for this extraction.
+    const latest = (await readMemory({ worktree, directory })) ?? pruned
+    const timestamp = new Date().toISOString()
+    const mergedLLM = mergeMemory(latest, llmFacts, {
+      sessionId,
+      gitSha,
+      timestamp,
+    })
+    const withCache = upsertExtractionCache(
+      recordRecentSession(mergedLLM, sessionId),
+      makeExtractionCacheEntry({
+        sourceSessionID: sessionId,
+        canonicalInput,
+        model: llmConfig.model,
+        facts: llmFacts,
+        completedAt: timestamp,
+      }),
+    )
+    const finalMemory = pruneOld(withCache)
+    await writeMemory({ worktree, directory }, finalMemory)
+    await generateHeader(worktree, directory, finalMemory)
   } catch {
     // Never throw from event handler
   }
+}
+
+/** Merge cache/LLM facts against the state that exists at merge time. */
+async function mergeAsyncFacts(
+  opts: { client: unknown; worktree: string; directory: string; sessionId: string },
+  facts: ExtractedFacts,
+  gitSha: string | null,
+  sessionId: string,
+): Promise<void> {
+  const latest = (await readMemory({ worktree: opts.worktree, directory: opts.directory }))
+    ?? emptyMemory(opts.worktree)
+  const merged = mergeMemory(latest, facts, {
+    sessionId,
+    gitSha,
+    timestamp: new Date().toISOString(),
+  })
+  const finalMemory = pruneOld(recordRecentSession(merged, sessionId))
+  await writeMemory({ worktree: opts.worktree, directory: opts.directory }, finalMemory)
+  await generateHeader(opts.worktree, opts.directory, finalMemory)
 }
 
 // ─── extractFactsHeuristic ───────────────────────────────────────────────────
@@ -786,7 +878,7 @@ export function mergeMemory(
   }
 
   return {
-    version: 1,
+    version: 2,
     project_path: existing.project_path,
     last_updated: meta.timestamp,
     last_git_sha: meta.gitSha ?? existing.last_git_sha,
@@ -796,6 +888,25 @@ export function mergeMemory(
     decisions: existingDecisions,
     blockers: extracted.blockers,
     next_steps: extracted.next_steps,
+    recent_sessions: existing.recent_sessions ?? [],
+    llm_extraction_cache: existing.llm_extraction_cache,
+  }
+}
+
+/**
+ * Record a source session in oldest-to-newest order without duplicates.
+ * The returned memory is a new object so callers can safely retain the
+ * pre-write snapshot.
+ */
+export function recordRecentSession(mem: MemoryFile, sessionId: string): MemoryFile {
+  const recentSessions = [...new Set(mem.recent_sessions ?? [])]
+  if (!recentSessions.includes(sessionId)) {
+    recentSessions.push(sessionId)
+  }
+
+  return {
+    ...mem,
+    recent_sessions: recentSessions.slice(-10),
   }
 }
 
@@ -831,6 +942,17 @@ export function pruneOld(mem: MemoryFile): MemoryFile {
     decisions: mem.decisions.map((d) => ({ ...d })),
     blockers: [...mem.blockers],
     next_steps: [...mem.next_steps],
+    recent_sessions: [...(mem.recent_sessions ?? [])],
+    llm_extraction_cache: mem.llm_extraction_cache?.map((entry) => ({
+      ...entry,
+      facts: {
+        ...entry.facts,
+        active_files: entry.facts.active_files.map((file) => ({ ...file })),
+        decisions: entry.facts.decisions.map((decision) => ({ ...decision })),
+        blockers: [...entry.facts.blockers],
+        next_steps: [...entry.facts.next_steps],
+      },
+    })),
   }
 
   // 1. Check if within cap
@@ -872,6 +994,14 @@ export function pruneOld(mem: MemoryFile): MemoryFile {
     console.warn("tokenmaxxer: pruned decisions to 10 most recent to fit 8KB cap")
     return cloned
   }
+
+  // Cache entries are disposable acceleration metadata. Remove the oldest
+  // entries before the final durable-state reductions so the existing 8KB
+  // invariant also applies after successful LLM extraction.
+  while (cloned.llm_extraction_cache?.length && jsonSize(cloned) > MAX_BYTES) {
+    cloned.llm_extraction_cache.shift()
+  }
+  if (jsonSize(cloned) <= MAX_BYTES) return cloned
 
   // 7. Last resort: keep only current_task + 5 most recent decisions
   cloned.decisions = [...cloned.decisions]

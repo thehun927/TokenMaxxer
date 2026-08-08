@@ -6,11 +6,13 @@ import { MemoryFileSchema, type MemoryFile } from "./schema"
 
 /**
  * Migration functions keyed by *from* version.
- * v1 is identity — no migration needed yet, but the pattern is established.
- * To add a v1→v2 migration: add an entry at key 1.
  */
 const migrations: Record<number, (data: Record<string, unknown>) => Record<string, unknown>> = {
-  // 1: (d) => d,  // v1 is identity — no migration needed
+  1: (data) => ({
+    ...data,
+    version: 2,
+    recent_sessions: [],
+  }),
 }
 
 /**
@@ -25,7 +27,7 @@ export function loadAndMigrate(raw: unknown): MemoryFile | null {
   const version = (typeof obj.version === "number" ? obj.version : 0) as number
 
   let data = obj
-  for (let v = version; v < 1; v++) {
+  for (let v = version; v < 2; v++) {
     const fn = migrations[v]
     if (!fn) {
       // Unknown version — can't migrate

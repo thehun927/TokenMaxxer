@@ -41,12 +41,17 @@ export async function buildDurableBlock(opts: {
 
     const valid = mem.decisions.filter((d) => d.still_valid)
     const foundational = valid.filter((d) => d.foundational)
+    // A v2 memory always has recent_sessions. The fallback keeps direct v1
+    // test fixtures and callers from throwing before they are migrated.
+    const recentSessions = mem.recent_sessions ?? [
+      ...new Set(valid.map((d) => d.last_used_in_session).filter((id): id is string => Boolean(id))),
+    ]
     const recent = valid.filter(
-      (d) => !d.foundational && isRecentSession(d, mem.last_session_id),
+      (d) => !d.foundational && isRecentSession(d, recentSessions),
     )
     const older = valid
       .filter(
-        (d) => !d.foundational && !isRecentSession(d, mem.last_session_id),
+        (d) => !d.foundational && !isRecentSession(d, recentSessions),
       )
       .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
       .slice(0, 5)
@@ -84,10 +89,10 @@ export async function buildDurableBlock(opts: {
 }
 
 /**
- * v1 approximation of the recent-session window. v1.1 can add a
- * `recent_sessions: string[]` field to MemoryFile for proper windowing.
+ * A decision is recent when it was used in one of the last three recorded
+ * source sessions.
  */
-function isRecentSession(d: Decision, lastSessionId: string | undefined): boolean {
+function isRecentSession(d: Decision, recentSessions: string[]): boolean {
   if (!d.last_used_in_session) return false
-  return d.last_used_in_session === lastSessionId
+  return recentSessions.slice(-3).includes(d.last_used_in_session)
 }

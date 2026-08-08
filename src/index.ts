@@ -14,6 +14,8 @@ import { loadOptions } from "./config"
 import { buildCompactionPrompt } from "./compaction/prompt"
 import { buildDurableBlock } from "./compaction/durable"
 import { writeMemoryOnIdle } from "./memory/writer"
+import { isRetainedExtractionSession } from "./memory/extract-llm"
+import { createV2Client } from "./opencode/v2"
 import { readMemory, resolveProjectPath } from "./memory/store"
 import { registerTools } from "./tools/recall"
 import { registerEfficiencyTools } from "./tools/efficiency"
@@ -24,29 +26,24 @@ import { join } from "node:path"
 import type { CompactionInput, CompactionOutput } from "./types"
 
 export const TokenmaxxerPlugin: Plugin = async (ctx) => {
-  const { client, directory, worktree } = ctx
+  const { client, directory, worktree, serverUrl } = ctx
   const options = loadOptions(ctx)
 
-  // --- Diagnostic: confirm plugin loaded + show resolved paths ---
-  const project = resolveProjectPath(worktree, directory)
-  await log(client, "info", "tokenmaxxer plugin loaded", {
-    worktree, directory, resolved: project,
-  })
-
-  // --- Version check (warn, don't fail) ---
+  // Client construction is local only. Do not call config (or any other v2
+  // endpoint) until a session.idle event enters writeMemoryOnIdle.
+  let v2Client: unknown
   try {
-    const c = client as { app?: { info?: () => Promise<{ data?: { version?: string } }> } }
-    const info = await c.app?.info?.()
-    const version = info?.data?.version
-    if (version) {
-      const major = parseInt(version.split(".")[0] ?? "0", 10)
-      if (major < 1) {
-        await log(client, "warn", `opencode ${version} may be unsupported (requires >=1.0.0)`)
-      }
-    }
+    v2Client = createV2Client(serverUrl, directory)
   } catch {
-    // app.info may not exist — non-fatal
+    // A missing/invalid bridge must not prevent the plugin from starting or
+    // the heuristic memory path from running.
+    v2Client = undefined
   }
+
+  const project = resolveProjectPath(worktree, directory)
+  // Plugin initialization is intentionally local-only. Diagnostics and
+  // version checks belong to event/hook paths; neither config nor a network
+  // endpoint is touched before the first session.idle event.
 
   // --- First-session HEADER.md placeholder ---
   // Create the memory directory + placeholder HEADER.md on plugin init.
@@ -107,7 +104,8 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
             await log(client, "warn", "session.idle missing sessionID")
             return
           }
-          await writeMemoryOnIdle({ client, worktree, directory, sessionId })
+          if (isRetainedExtractionSession(sessionId)) return
+          await writeMemoryOnIdle({ client, v2Client, worktree, directory, sessionId })
         }
       } catch (e) {
         await log(client, "error", "event handler failed", { type: event.type, error: String(e) })

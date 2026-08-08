@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest"
-import { extractFactsHeuristic } from "../../src/memory/writer"
+import { extractFactsHeuristic, recordRecentSession } from "../../src/memory/writer"
 import type { TranscriptMessage } from "../../src/types"
+import { emptyMemory } from "../../src/memory/schema"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 
@@ -10,6 +11,24 @@ function loadTranscript(name: string): TranscriptMessage[] {
   const raw = readFileSync(join(fixturesDir, name), "utf-8")
   return JSON.parse(raw) as TranscriptMessage[]
 }
+
+describe("recordRecentSession", () => {
+  it("dedupes a session and caps history at the newest ten", () => {
+    const mem = {
+      ...emptyMemory("/test/project"),
+      recent_sessions: Array.from({ length: 10 }, (_, index) => `session-${index}`),
+    }
+
+    const withEleven = recordRecentSession(mem, "session-10")
+    expect(withEleven.recent_sessions).toEqual(
+      Array.from({ length: 10 }, (_, index) => `session-${index + 1}`),
+    )
+
+    const deduped = recordRecentSession(withEleven, "session-10")
+    expect(deduped.recent_sessions).toEqual(withEleven.recent_sessions)
+    expect(deduped.recent_sessions.filter((id) => id === "session-10")).toHaveLength(1)
+  })
+})
 
 describe("extractFactsHeuristic", () => {
   describe("simple-decision.json", () => {

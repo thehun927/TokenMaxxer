@@ -3,6 +3,7 @@
  * Uses M4.5 fields (foundational, last_used_in_session) as additive, optional fields.
  */
 import { z } from "zod"
+import { ExtractedFactsSchema } from "./extract-schema"
 
 export const DecisionSchema = z.object({
   id: z.string(),
@@ -25,8 +26,20 @@ export const ActiveFileSchema = z.object({
 })
 export type ActiveFile = z.infer<typeof ActiveFileSchema>
 
+/** A successful structured extraction that can be reused for the same input. */
+export const LLMExtractionCacheEntrySchema = z.object({
+  cache_key: z.string(),
+  source_session_id: z.string(),
+  canonical_input_sha256: z.string(),
+  provider_id: z.string(),
+  model_id: z.string(),
+  completed_at: z.string().datetime({ offset: true }).or(z.string()),
+  facts: ExtractedFactsSchema,
+})
+export type LLMExtractionCacheEntry = z.infer<typeof LLMExtractionCacheEntrySchema>
+
 export const MemoryFileSchema = z.object({
-  version: z.literal(1),
+  version: z.literal(2),
   project_path: z.string(),
   last_updated: z.string().datetime({ offset: true }).or(z.string()), // ISO 8601
   last_git_sha: z.string().optional(),
@@ -36,6 +49,8 @@ export const MemoryFileSchema = z.object({
   decisions: z.array(DecisionSchema).default([]),
   blockers: z.array(z.string()).default([]),
   next_steps: z.array(z.string()).default([]),
+  recent_sessions: z.array(z.string()).max(10).default([]),
+  llm_extraction_cache: z.array(LLMExtractionCacheEntrySchema).max(10).optional(),
 })
 export type MemoryFile = z.infer<typeof MemoryFileSchema>
 
@@ -44,12 +59,13 @@ export type MemoryFile = z.infer<typeof MemoryFileSchema>
  */
 export function emptyMemory(worktree: string): MemoryFile {
   return {
-    version: 1,
+    version: 2,
     project_path: worktree,
     last_updated: new Date().toISOString(),
     active_files: [],
     decisions: [],
     blockers: [],
     next_steps: [],
+    recent_sessions: [],
   }
 }

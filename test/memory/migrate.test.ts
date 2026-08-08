@@ -3,12 +3,32 @@ import { loadAndMigrate } from "../../src/memory/migrate"
 import { emptyMemory } from "../../src/memory/schema"
 
 describe("loadAndMigrate", () => {
-  it("passes v1 data through (identity)", () => {
+  it("migrates valid v1 data to v2 and preserves its values", () => {
+    const v1 = {
+      version: 1,
+      project_path: "/test/project",
+      last_updated: "2026-08-08T12:00:00.000Z",
+      last_git_sha: "abc123",
+      last_session_id: "session-1",
+      current_task: "Implement migration",
+      active_files: [],
+      decisions: [],
+      blockers: ["blocked"],
+      next_steps: ["write tests"],
+    }
+    const result = loadAndMigrate(v1)
+    expect(result).not.toBeNull()
+    expect(result).toMatchObject({
+      ...v1,
+      version: 2,
+      recent_sessions: [],
+    })
+  })
+
+  it("passes v2 data through unchanged", () => {
     const mem = emptyMemory("/test/project")
     const result = loadAndMigrate(mem)
-    expect(result).not.toBeNull()
-    expect(result!.version).toBe(1)
-    expect(result!.project_path).toBe("/test/project")
+    expect(result).toEqual(mem)
   })
 
   it("returns null for null input", () => {
@@ -51,12 +71,11 @@ describe("loadAndMigrate", () => {
   })
 
   it("accepts a v1 memory with optional fields omitted", () => {
-    const mem = emptyMemory("/test/project")
     // Remove optional fields
     const minimal = {
       version: 1,
-      project_path: mem.project_path,
-      last_updated: mem.last_updated,
+      project_path: "/test/project",
+      last_updated: new Date().toISOString(),
       active_files: [],
       decisions: [],
       blockers: [],
@@ -64,13 +83,15 @@ describe("loadAndMigrate", () => {
     }
     const result = loadAndMigrate(minimal)
     expect(result).not.toBeNull()
-    expect(result!.version).toBe(1)
+    expect(result!.version).toBe(2)
+    expect(result!.recent_sessions).toEqual([])
   })
 
   it("accepts a v1 memory with full decision fields", () => {
     const mem = emptyMemory("/test/project")
     const full = {
       ...mem,
+      version: 1 as const,
       decisions: [{
         id: "d1",
         topic: "database",
@@ -85,6 +106,8 @@ describe("loadAndMigrate", () => {
     }
     const result = loadAndMigrate(full)
     expect(result).not.toBeNull()
+    expect(result!.version).toBe(2)
+    expect(result!.recent_sessions).toEqual([])
     expect(result!.decisions).toHaveLength(1)
     expect(result!.decisions[0]!.topic).toBe("database")
   })

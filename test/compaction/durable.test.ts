@@ -19,7 +19,7 @@ const mockClient = {} as unknown
 
 function makeFullMemory(overrides?: Partial<MemoryFile>): MemoryFile {
   return {
-    version: 1,
+    version: 2,
     project_path: "/home/user/my-project",
     last_updated: "2026-08-08T12:00:00.000Z",
     last_git_sha: "abc1234",
@@ -64,6 +64,7 @@ function makeFullMemory(overrides?: Partial<MemoryFile>): MemoryFile {
     ],
     blockers: ["Waiting on API key"],
     next_steps: ["Write unit tests", "Document the API"],
+    recent_sessions: ["sess-001"],
     ...overrides,
   }
 }
@@ -139,7 +140,11 @@ describe("buildDurableBlock", () => {
     }))
 
     vi.mocked(readMemory).mockResolvedValue(
-      makeFullMemory({ last_session_id: "current", decisions }),
+      makeFullMemory({
+        last_session_id: "current",
+        recent_sessions: ["current"],
+        decisions,
+      }),
     )
 
     const result = await buildDurableBlock({
@@ -166,6 +171,43 @@ describe("buildDurableBlock", () => {
         expect(result).not.toContain(`topic-${index}:`)
       }
     }
+  })
+
+  it("uses exactly the last three recent sessions for durable recency", async () => {
+    const decisions = ["session-1", "session-2", "session-3", "session-4"].map(
+      (sessionId, index) => ({
+        id: `recent-${index}`,
+        topic: `recent-topic-${index}`,
+        decision: `decision from ${sessionId}`,
+        timestamp: `2026-08-0${index + 1}T12:00:00.000Z`,
+        session_id: sessionId,
+        last_used_in_session: sessionId,
+        still_valid: true,
+        foundational: false,
+      }),
+    )
+
+    vi.mocked(readMemory).mockResolvedValue(
+      makeFullMemory({
+        recent_sessions: ["session-1", "session-2", "session-3", "session-4"],
+        decisions,
+      }),
+    )
+
+    const result = await buildDurableBlock({
+      worktree: "/home/user/my-project",
+      directory: "/home/user/my-project",
+      client: mockClient,
+    })
+
+    expect(result).toContain("Valid decisions:")
+    const validSection = result.split("Older decisions:")[0]!
+    expect(validSection).not.toContain("recent-topic-0: decision from session-1")
+    for (const index of [1, 2, 3]) {
+      expect(result).toContain(`recent-topic-${index}: decision from session-${index + 1}`)
+    }
+    expect(result).toContain("Older decisions:")
+    expect(result).toContain("recent-topic-0: decision from session-1")
   })
 
   it("caps active files at the eight most recently touched", async () => {
