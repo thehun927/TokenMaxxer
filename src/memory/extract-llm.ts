@@ -46,15 +46,21 @@ export function parseSmallModel(smallModel: string | undefined): SmallModel | un
   const separator = value.indexOf("/")
   if (separator <= 0 || separator === value.length - 1) return undefined
 
-  const providerID = value.slice(0, separator)
-  const modelID = value.slice(separator + 1)
-  if (!providerID || !modelID) return undefined
+  const providerID = value.slice(0, separator).trim()
+  const modelID = value.slice(separator + 1).trim()
+  if (!providerID || !modelID || /\s/.test(providerID) || /\s/.test(modelID)) return undefined
   return { providerID, modelID }
 }
 
 type V2ClientLike = {
   config?: {
     get: (parameters: { directory: string }) => Promise<unknown>
+  }
+  model?: {
+    list: (parameters: { location: { directory: string } }) => Promise<unknown>
+  }
+  provider?: {
+    list: (parameters: { location: { directory: string } }) => Promise<unknown>
   }
   session?: {
     create: (parameters: {
@@ -72,6 +78,110 @@ type V2ClientLike = {
   }
 }
 
+type ProviderInventoryEntry = {
+  id: string
+  disabled: boolean
+}
+
+type ModelInventoryEntry = {
+  id: string
+  providerID: string
+  enabled: boolean
+  status: string
+  tools: boolean
+  cost: unknown[]
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/** Read the response body used by the v2 inventory endpoints. */
+function readInventoryData(result: unknown): unknown[] | undefined {
+  if (!isRecord(result) || result.error != null || !isRecord(result.data)) return undefined
+  return Array.isArray(result.data.data) ? result.data.data : undefined
+}
+
+function readProviderInventoryEntry(value: unknown): ProviderInventoryEntry | undefined {
+  if (!isRecord(value) || typeof value.id !== "string" || value.id.length === 0) return undefined
+  if (value.disabled !== undefined && typeof value.disabled !== "boolean") return undefined
+  return { id: value.id, disabled: value.disabled === true }
+}
+
+function readModelInventoryEntry(value: unknown): ModelInventoryEntry | undefined {
+  if (!isRecord(value)) return undefined
+  if (typeof value.id !== "string" || value.id.length === 0) return undefined
+  if (typeof value.providerID !== "string" || value.providerID.length === 0) return undefined
+  if (value.enabled !== true || typeof value.status !== "string" || value.status !== "active") {
+    return undefined
+  }
+
+  const capabilities = value.capabilities
+  if (!isRecord(capabilities) || capabilities.tools !== true) return undefined
+  if (!Array.isArray(value.cost) || value.cost.length === 0) return undefined
+
+  return {
+    id: value.id,
+    providerID: value.providerID,
+    enabled: true,
+    status: value.status,
+    tools: true,
+    cost: value.cost,
+  }
+}
+
+function hasOnlyZeroInputOutputCost(cost: unknown[]): boolean {
+  return cost.every((tier) => (
+    isRecord(tier) &&
+    typeof tier.input === "number" && tier.input === 0 &&
+    typeof tier.output === "number" && tier.output === 0
+  ))
+}
+
+/**
+ * Find the first eligible model in the API's release-date order. The endpoint
+ * already defines that order; no local quality or provider ranking is applied.
+ */
+async function discoverFreeSmallModel(
+  client: V2ClientLike,
+  directory: string,
+): Promise<SmallModel | undefined> {
+  if (!client.model?.list || !client.provider?.list) return undefined
+
+  try {
+    const [modelsResult, providersResult] = await Promise.all([
+      client.model.list({ location: { directory } }),
+      client.provider.list({ location: { directory } }),
+    ])
+    const models = readInventoryData(modelsResult)
+    const providers = readInventoryData(providersResult)
+    if (!models || !providers) return undefined
+
+    const providersByID = new Map<string, ProviderInventoryEntry>()
+    for (const value of providers) {
+      const provider = readProviderInventoryEntry(value)
+      if (provider && !providersByID.has(provider.id)) {
+        providersByID.set(provider.id, provider)
+      }
+    }
+
+    for (const value of models) {
+      const model = readModelInventoryEntry(value)
+      if (!model) continue
+
+      const provider = providersByID.get(model.providerID)
+      if (!provider || provider.disabled || !hasOnlyZeroInputOutputCost(model.cost)) continue
+
+      return { providerID: model.providerID, modelID: model.id }
+    }
+  } catch {
+    // Inventory is optional. A failed or unavailable discovery request must
+    // leave the durable heuristic path as the only fallback.
+  }
+
+  return undefined
+}
+
 /** Resolve the opt-in model. This function is only called by session.idle. */
 export async function getLLMConfig(
   v2Client: unknown,
@@ -81,18 +191,29 @@ export async function getLLMConfig(
 
   try {
     const client = v2Client as V2ClientLike
-    if (!client.config?.get) return { enabled: false }
+    let configuredModel: SmallModel | undefined
 
-    const result = await client.config.get({ directory })
-    const response = result as { data?: { small_model?: unknown }; error?: unknown } | null
-    if (!response || response.error != null || !response.data) {
-      return { enabled: false }
+    if (client.config?.get) {
+      try {
+        const result = await client.config.get({ directory })
+        const response = result as { data?: { small_model?: unknown }; error?: unknown } | null
+        if (response && response.error == null && response.data) {
+          configuredModel = parseSmallModel(
+            typeof response.data.small_model === "string" ? response.data.small_model : undefined,
+          )
+        }
+      } catch {
+        // A config read failure is equivalent to an absent/malformed override;
+        // try the dynamic inventory before falling back to heuristics.
+      }
     }
 
-    const model = parseSmallModel(
-      typeof response.data.small_model === "string" ? response.data.small_model : undefined,
-    )
-    return model ? { enabled: true, model } : { enabled: false }
+    // A syntactically valid explicit override is authoritative and does not
+    // need to be present in the inventory response.
+    if (configuredModel) return { enabled: true, model: configuredModel }
+
+    const discoveredModel = await discoverFreeSmallModel(client, directory)
+    return discoveredModel ? { enabled: true, model: discoveredModel } : { enabled: false }
   } catch {
     return { enabled: false }
   }

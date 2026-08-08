@@ -6,7 +6,7 @@
 
 Never lose context to compaction again.
 
-[![Tests](https://img.shields.io/badge/tests-105%20passing-brightgreen)]() [![Build](https://img.shields.io/badge/build-clean-brightgreen)]() [![License: MIT](https://img.shields.io/badge/license-MIT-blue)]()
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]() [![Build](https://img.shields.io/badge/build-clean-brightgreen)]() [![License: MIT](https://img.shields.io/badge/license-MIT-blue)]()
 
 </div>
 
@@ -146,6 +146,66 @@ TOKENMAXXER_NO_PROMPT=1
 
 This skips prompt replacement but still injects the durable block via `output.context`, letting opencode use its default compaction prompt.
 
+## Optional LLM extraction (v1.1)
+
+Heuristic extraction remains the default. LLM extraction is **opt-in**. Start
+OpenCode with:
+
+```bash
+TOKENMAXXER_LLM_EXTRACT=1 opencode
+```
+
+When enabled, tokenmaxxer resolves the extraction model from the user's
+OpenCode installation:
+
+1. If `small_model` is a valid `provider/model` string in `opencode.json`, it
+   is the explicit model override.
+2. If `small_model` is absent or malformed, tokenmaxxer inventories active,
+   enabled, tool-capable models whose declared model cost is zero, and
+   uses the first candidate in the API's release order.
+3. If no such candidate exists, it uses heuristics only. Automatic discovery
+   never falls back to a paid model, including a paid Anthropic model. Provider
+   and model names are not hardcoded.
+
+Free offerings change, and providers may apply their own data-use policies.
+This selection policy makes no permanent claim about which model is best.
+
+### List and configure models
+
+List the models available to the OpenCode installation that is running the
+plugin:
+
+```bash
+opencode models
+```
+
+To select one exact model, copy its provider and model IDs into the top-level
+`small_model` setting:
+
+```jsonc
+{
+  "small_model": "provider/model"
+}
+```
+
+The value must be the exact `provider/model` identifier shown by OpenCode.
+With a valid override, tokenmaxxer does not replace it with an automatically
+discovered model. Remove it (or correct it) to use free-model discovery.
+
+### Run a real extraction test
+
+Use a fresh source session so an earlier cache entry cannot satisfy the test:
+
+```bash
+TOKENMAXXER_LLM_EXTRACT=1 opencode run "For an extraction test, make an explicit decision to keep the heuristic fallback available, state one next step, and do not edit files."
+```
+
+You can instead export the variable and use a normal interactive session.
+After the source session becomes idle, look in OpenCode's session list for the
+visible retained session titled `tokenmaxxer extract · ...`. It is a normal
+audit session and is never deleted. If discovery finds no eligible free model,
+no audit session is created because the run correctly uses heuristics only.
+
 ## Debugging
 
 | What | Where |
@@ -177,9 +237,9 @@ Memory is merged across sessions: new decisions on the same topic supersede old 
 
 ## Limitations
 
-- **Heuristic extraction is conservative.** It prioritizes precision over recall — it would rather produce no decisions than wrong ones. Decisions stated in unusual phrasing will be missed. v1.1 will add optional LLM-based extraction via `small_model`.
+- **Heuristic extraction is conservative.** It prioritizes precision over recall — it would rather produce no decisions than wrong ones. Decisions stated in unusual phrasing will be missed. v1.1 adds optional structured LLM extraction via `TOKENMAXXER_LLM_EXTRACT=1`, with heuristics retained as the fallback.
 - **No per-turn history pruning.** The plugin only intervenes at compaction time. Per-turn pruning would require the `experimental.chat.messages.transform` hook (which exists in the opencode API but is undocumented and unstable).
-- **`last_used_in_session` tracks the current session only.** The bounded durable block includes decisions referenced in the current session as "recent." True "last 3 sessions" windowing requires a session history array (planned for v1.1).
+- **Durable recency uses the last three recorded source sessions.** Session IDs are retained in a bounded history, while older decisions remain available through the recall tools.
 - **Event handlers are fire-and-forget.** opencode does not await async event handlers. If opencode exits while `writeMemoryOnIdle` is in flight, the write may not complete. Atomic writes (temp file + rename) prevent corruption — the worst case is a missed write, never a corrupt file.
 - **Non-git directories.** opencode sets `worktree` to `/` in non-git directories. The plugin falls back to `directory` (session CWD) in this case.
 
@@ -192,9 +252,11 @@ src/
   config.ts               # Options + kill switch (TOKENMAXXER_NO_PROMPT)
   memory/
     schema.ts             # Zod schemas (MemoryFile, Decision, ActiveFile)
-    migrate.ts            # Version-aware migration (v1 = identity)
+    migrate.ts            # Version-aware migration (v1 → v2)
     store.ts              # Read/write STATE.json (cached, mtime-invalidated, corrupt recovery)
-    writer.ts             # Heuristic extraction, merge, prune, HEADER.md generation
+    writer.ts             # Heuristic/LLM extraction, merge, prune, HEADER.md generation
+    extract-llm.ts        # Opt-in structured extraction, model discovery, cache
+    extract-prompt.ts     # Canonical extraction input and prompt
     reader.ts             # Query helpers for tools
   compaction/
     prompt.ts             # Schema-constrained compaction prompt
@@ -213,8 +275,8 @@ src/
 
 ```bash
 npm install          # Install dev deps (vitest, tsup, typescript, zod, @opencode-ai/plugin)
-npm test            # Run 105 tests
-npm run build       # Build to dist/index.js (ESM, ~41KB)
+npm test            # Run the test suite
+npm run build       # Build to dist/index.js (ESM)
 npx tsc --noEmit    # Type check
 ```
 
