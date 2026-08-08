@@ -1,0 +1,6 @@
+dist/
+node_modules/
+.opencode/memory/STATE.json
+.opencode/memory/last_compaction.log
+.opencode/memory/*.corrupt.*
+*.tsbuildinfo

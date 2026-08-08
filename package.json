@@ -1,0 +1,29 @@
+{
+  "name": "tokenmaxxer",
+  "version": "0.1.0",
+  "description": "opencode plugin for session longevity & cross-session memory",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --external @opencode-ai/plugin --external zod",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0 <2.0.0",
+    "zod": ">=3.0.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^2.0.0",
+    "@opencode-ai/plugin": "latest",
+    "zod": "^3.0.0"
+  }
+}

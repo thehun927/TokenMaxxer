@@ -1,0 +1,20 @@
+[
+  {
+    "info": { "id": "msg-1", "role": "user" },
+    "parts": [
+      { "type": "text", "text": "Can you refactor the auth module to use the new token format?" }
+    ]
+  },
+  {
+    "info": { "id": "msg-2", "role": "assistant" },
+    "parts": [
+      { "type": "text", "text": "Sure, let me look at the current implementation first." }
+    ]
+  },
+  {
+    "info": { "id": "msg-3", "role": "assistant" },
+    "parts": [
+      { "type": "text", "text": "I see the current auth flow. The token generation is in src/auth/tokens.ts. The verification is in src/auth/verify.ts. I'll update both files to support the new format." }
+    ]
+  }
+]

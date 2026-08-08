@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "compaction": { "auto": true, "prune": true, "reserved": 15000 },
+  "instructions": ["AGENTS.md", ".opencode/memory/HEADER.md"],
+  "watcher": {
+    "ignore": ["node_modules/**", "dist/**", ".git/**", ".opencode/memory/**"]
+  },
+  "permission": {
+    "webfetch": "deny",
+    "websearch": "deny"
+  },
+  "provider": {
+    "anthropic": { "options": { "setCacheKey": true } }
+  }
+}

@@ -1,0 +1,311 @@
+[
+  {
+    "info": { "id": "msg-1", "role": "user" },
+    "parts": [ { "type": "text", "text": "Let's build a React app with a Node backend. I think TypeScript and Express are the way to go. Let's use MongoDB for the database." } ]
+  }
+,
+  {
+    "info": { "id": "msg-2", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 2. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-3", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 3. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-4", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 4. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-5", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 5. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-6", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 6. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-7", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 7. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-8", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 8. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-9", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 9. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-10", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 10. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-11", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 11. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-12", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 12. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-13", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 13. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-14", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 14. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-15", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 15. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-16", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 16. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-17", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 17. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-18", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 18. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-19", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 19. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-20", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 20. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-21", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 21. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-22", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 22. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-23", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 23. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-24", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 24. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-25", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 25. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-26", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 26. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-27", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 27. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-28", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 28. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-29", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 29. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-30", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 30. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-31", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 31. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-32", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 32. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-33", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 33. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-34", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 34. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-35", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 35. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-36", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 36. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-37", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 37. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-38", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 38. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-39", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 39. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-40", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 40. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-41", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 41. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-42", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 42. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-43", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 43. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-44", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 44. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-45", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 45. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-46", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 46. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-47", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 47. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-48", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 48. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-49", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 49. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-50", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 50. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-51", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 51. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-52", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 52. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-53", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 53. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-54", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 54. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-55", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 55. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-56", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 56. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-57", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 57. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-58", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 58. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-59", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 59. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-60", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 60. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-61", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 61. Making progress on setting up the project structure." } ]
+  }
+,
+  {
+    "info": { "id": "msg-62", "role": "assistant" },
+    "parts": [ { "type": "text", "text": "Working on the configuration for component 62. Making progress on setting up the project structure." } ]
+  }
+]

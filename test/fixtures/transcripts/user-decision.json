@@ -1,0 +1,14 @@
+[
+  {
+    "info": { "id": "msg-1", "role": "user" },
+    "parts": [
+      { "type": "text", "text": "Let's go with Postgres for this project. I think it's the best fit for what we need." }
+    ]
+  },
+  {
+    "info": { "id": "msg-2", "role": "assistant" },
+    "parts": [
+      { "type": "text", "text": "Okay, I'll set up Postgres. Give me a moment to configure the connection." }
+    ]
+  }
+]

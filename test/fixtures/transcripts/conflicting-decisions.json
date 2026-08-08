@@ -1,0 +1,26 @@
+[
+  {
+    "info": { "id": "msg-1", "role": "user" },
+    "parts": [
+      { "type": "text", "text": "We need a database for this project, let's use Postgres." }
+    ]
+  },
+  {
+    "info": { "id": "msg-2", "role": "assistant" },
+    "parts": [
+      { "type": "text", "text": "Setting up Postgres now. I'll create the initial schema." }
+    ]
+  },
+  {
+    "info": { "id": "msg-3", "role": "user" },
+    "parts": [
+      { "type": "text", "text": "Actually, thinking more about it, we should use MySQL since the ops team is more familiar with it." }
+    ]
+  },
+  {
+    "info": { "id": "msg-4", "role": "assistant" },
+    "parts": [
+      { "type": "text", "text": "OK, actually let's use MySQL instead. I decided MySQL is the better choice here given the ops team's familiarity. I'll switch the configuration." }
+    ]
+  }
+]

@@ -1,0 +1,14 @@
+[
+  {
+    "info": { "id": "msg-1", "role": "user" },
+    "parts": [
+      { "type": "text", "text": "Let's build a REST API. We should use Postgres as our database because it has better JSON support." }
+    ]
+  },
+  {
+    "info": { "id": "msg-2", "role": "assistant" },
+    "parts": [
+      { "type": "text", "text": "Good call! I decided to use Postgres for the database. It's the right choice for this project. Let's set up the schema." }
+    ]
+  }
+]

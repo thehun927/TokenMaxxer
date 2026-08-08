@@ -1,0 +1,14 @@
+[
+  {
+    "info": { "id": "msg-1", "role": "user" },
+    "parts": [
+      { "type": "text", "text": "We need to pick a database for the project." }
+    ]
+  },
+  {
+    "info": { "id": "msg-2", "role": "assistant" },
+    "parts": [
+      { "type": "text", "text": "We decided NOT to use SQLite because it doesn't handle concurrent writes well. Instead, let's go with Postgres. But I want to be clear: we are not going with SQLite." }
+    ]
+  }
+]
