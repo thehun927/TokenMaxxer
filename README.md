@@ -6,7 +6,7 @@
 
 Never lose context to compaction again.
 
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]() [![Build](https://img.shields.io/badge/build-clean-brightgreen)]() [![License: MIT](https://img.shields.io/badge/license-MIT-blue)]()
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)]()
 
 </div>
 
@@ -76,6 +76,14 @@ The separate TUI target (`dist/tui.js`) renders only the right-side `memory`
 indicator as a non-composer status surface. It never renders composer text and
 is not required for server memory, extraction, or the core plugin.
 
+### LLM extraction status
+
+The opt-in structured extraction path is shipped and has been verified end to
+end in this environment. A connected `ollama-cloud/gpt-oss:20b` returned
+`StructuredOutput`; tokenmaxxer Zod-validated and merged the facts, persisted
+an `llm_extraction_cache` entry in `STATE.json`, and retained an audit session
+titled `tokenmaxxer extract · …`.
+
 ## Install
 
 ### One-liner (global — recommended)
@@ -121,13 +129,24 @@ ranges (the one-liner adds them without running a network install):
 Restart opencode after copying both files so the server and separate TUI
 targets, dependencies, and TUI configuration are loaded.
 
+The installer also provides a `tokenmaxxer` launcher. After installation, run
+OpenCode with extraction enabled for the child process:
+
+```bash
+tokenmaxxer opencode [args]
+```
+
+This launcher requires the tokenmaxxer plugin/launcher to be installed and a
+configured, connected, accessible small model. It only supplies the extraction
+opt-in environment; it does not provide model credentials or entitlement.
+
 ### Optional tuning (not required)
 
 For better token efficiency, add to your project's `opencode.json`:
 
 ```jsonc
 {
-  "compaction": { "auto": true, "prune": true, "reserved": 15000 },
+  "compaction": { "auto": true, "prune": true, "reserved": 25000 },
   "watcher": { "ignore": [".opencode/memory/**"] }
 }
 ```
@@ -135,7 +154,7 @@ For better token efficiency, add to your project's `opencode.json`:
 | Setting | Why |
 |---|---|
 | `compaction.prune: true` | Drops old tool outputs — the biggest single token saver. Tokenmaxxer works without it, but compaction is less efficient. |
-| `compaction.reserved: 15000` | Headroom so compaction doesn't overflow. |
+| `compaction.reserved: 25000` | Headroom so compaction doesn't overflow. |
 | `watcher.ignore` | Stops the file watcher from processing the plugin's writes to `.opencode/memory/`. Harmless without it, but slightly cleaner. |
 
 ### .gitignore
@@ -174,7 +193,7 @@ TOKENMAXXER_NO_PROMPT=1
 
 This skips prompt replacement but still injects the durable block via `output.context`, letting opencode use its default compaction prompt.
 
-## Optional LLM extraction (v1.1)
+## Optional LLM extraction
 
 Heuristic extraction remains the default. LLM extraction is **opt-in**. Start
 OpenCode with:
@@ -183,32 +202,45 @@ OpenCode with:
 TOKENMAXXER_LLM_EXTRACT=1 opencode
 ```
 
+Alternatively, the installer-provided launcher enables the same environment for
+its child process:
+
+```bash
+tokenmaxxer opencode [args]
+```
+
+The launcher is available only after plugin/launcher installation and still
+requires an accessible configured/connected small model. Heuristic extraction remains the
+durable fallback when the opt-in path is disabled, the model cannot be used, or
+the structured result is invalid.
+
 When enabled, tokenmaxxer resolves the extraction model from the user's
 OpenCode installation:
 
 1. If `small_model` is a valid `provider/model` string in the host config, it
-   is the explicit model override. The current recommended explicit
-   structured-extraction example is `opencode/north-mini-code-free` when the
-   host lists it; this is not a permanent availability or quality claim.
+   is the explicit model override. The verified example for this environment is
+   `ollama-cloud/gpt-oss:20b`; it is not a permanent or universal recommendation.
 2. If `small_model` is absent or malformed, tokenmaxxer reads the host provider
    inventory from connected providers in `data.all[].models`, keeps only active,
-   tool-callable models whose declared cost is zero and that provide an explicit
-   `none` reasoning variant, and uses the first eligible candidate in the host
-   provider-list and model-map order.
-3. If no such candidate works, it uses heuristics only. Automatic discovery
-   never falls back to a paid model, including a paid Anthropic model. Provider
-   and model names are not hardcoded.
+   zero-cost, tool-callable models, and prefers candidates that advertise an
+   explicit `none` reasoning variant. A `none` variant is not required: if no
+   preferred candidate has one, another eligible candidate may be selected in
+   host provider-list and model-map order.
+3. Automatic discovery never falls back to a paid model, including a paid
+   Anthropic model. Provider and model names are not hardcoded.
 
-Structured extraction uses the selected available model's explicit `none`
-reasoning variant. Dynamic discovery therefore prefers eligible zero-cost,
-tool-callable models that provide that variant. This avoids providers that
-reject forced tool choice while thinking mode is active. If no eligible model
-with a working `none` variant exists, the fallback remains heuristic-only.
+Structured extraction uses `variant: none` when the selected model advertises
+that variant. If it does not, extraction uses the selected model without
+forcing an unavailable variant. The verified explicit
+`ollama-cloud/gpt-oss:20b` example has no `none` variant and remains a valid
+explicit choice. Heuristics remain the fallback when the selected model cannot
+be used or its structured result is invalid.
 
-An OpenCode model listing is not an unauthenticated-use promise. Listed
-OpenCode Zen/free models still require an available, connected provider
-credential. If a model request returns `401`, authenticate and verify the
-provider before enabling extraction:
+An OpenCode model listing is inventory only. It does not guarantee
+authentication, entitlement, thinking/tool-choice compatibility, or adherence
+to the structured-result contract. The selected model still needs to be
+available through a connected provider. If a model request returns `401`,
+authenticate and verify the provider before enabling extraction:
 
 ```bash
 opencode auth login
@@ -221,8 +253,9 @@ opencode auth list
 ```
 
 Auto-discovery selects models only from connected providers. An explicit
-`small_model` that is listed but unavailable or not authenticated falls back to
-heuristic extraction rather than being replaced with another model.
+`small_model` that is listed but unavailable, not entitled, not authenticated,
+or incompatible falls back to heuristic extraction rather than being replaced
+with another model.
 
 Extraction uses the host `PluginInput` v1 client transport; it does not create
 a separate SDK-v2 bridge. The generated client types omit JSON-schema fields
@@ -238,27 +271,32 @@ This selection policy makes no permanent claim about which model is best.
 ### List and configure models
 
 List the models available to the OpenCode installation that is running the
-plugin. The list describes inventory; it does not prove that a free model is
-unauthenticated or currently usable:
+plugin. The list describes inventory; it does not prove that a model is
+authenticated, entitled, compatible, or currently usable:
 
 ```bash
 opencode models
 ```
 
 To select one exact model, copy its provider and model IDs into the top-level
-`small_model` setting:
+`small_model` setting. The value must use the `provider/model` form:
 
 ```jsonc
 {
-  "small_model": "opencode/north-mini-code-free"
+  "small_model": "ollama-cloud/gpt-oss:20b"
 }
 ```
 
-The value must be the exact `provider/model` identifier shown by OpenCode. The
-North Mini value is an example for the current host inventory, not a promise
-that the model will remain available or provide a permanent quality advantage.
+Use the exact provider and model identifiers shown by OpenCode. The verified
+Ollama Cloud value above is an environment-specific example, not a promise
+that the model will remain available, entitled, compatible, or preferable.
 With a valid override, tokenmaxxer does not replace it with an automatically
-discovered model. Remove it (or correct it) to use free-model discovery.
+discovered model. Remove it (or correct it) to use eligible-model discovery.
+
+The extraction prompt has a strict structured-output contract. In particular,
+every `active_files` object requires both `path` and `reason`, and every
+`decisions` object requires both `topic` and `decision`. Assistant prose,
+free-form JSON, and code fences do not satisfy the contract.
 
 ### Run a real extraction test
 
@@ -268,10 +306,15 @@ the fire-and-forget `session.idle` handlers finish. It can therefore create the
 source session without persisting memory or the retained audit extraction
 session.
 
-1. In the target project, start an interactive OpenCode process:
+1. In the target project, start an interactive OpenCode process, either
+   directly or through the installed launcher:
 
    ```bash
    TOKENMAXXER_LLM_EXTRACT=1 opencode
+   ```
+
+   ```bash
+   tokenmaxxer opencode
    ```
 
 2. Send a prompt with an explicit decision and next step, for example: “For an
@@ -280,12 +323,19 @@ session.
 3. Keep the process open after the response until the source session is idle and
    its detached idle work has completed.
 4. Confirm that `.opencode/memory/STATE.json` has a newer timestamp than before
-   the test and contains a new `llm_extraction_cache` entry.
+   the test and contains an `llm_extraction_cache` entry. Its key includes the
+   source session, canonical input, and selected provider/model.
 5. Run `opencode session list` and confirm it includes a visible retained
    session titled `tokenmaxxer extract · ...`.
 
+The verified run used the connected `ollama-cloud/gpt-oss:20b` model: the host
+returned `StructuredOutput`, tokenmaxxer Zod-validated and merged the facts,
+and the cache and retained audit session were both present. A model listing
+alone is not a successful extraction test; authentication, entitlement,
+thinking/tool-choice behavior, and structured-result adherence must work.
+
 The retained session is a normal audit record and is never deleted. If
-discovery finds no eligible free model, no cache entry or audit session is
+discovery finds no eligible connected model, no cache entry or audit session is
 created because the opt-in path correctly uses heuristics only.
 
 ## Debugging
@@ -319,7 +369,7 @@ Memory is merged across sessions: new decisions on the same topic supersede old 
 
 ## Limitations
 
-- **Heuristic extraction is conservative.** It prioritizes precision over recall — it would rather produce no decisions than wrong ones. Decisions stated in unusual phrasing will be missed. v1.1 adds optional structured LLM extraction via `TOKENMAXXER_LLM_EXTRACT=1`, with heuristics retained as the fallback.
+- **Heuristic extraction is conservative.** It prioritizes precision over recall — it would rather produce no decisions than wrong ones. Decisions stated in unusual phrasing will be missed. Optional structured LLM extraction is available through `TOKENMAXXER_LLM_EXTRACT=1`, with heuristics retained as the durable fallback.
 - **Host client type compatibility.** The host `PluginInput` v1 client transport's generated types omit existing server JSON-schema fields. Two localized casts bridge only the session prompt request and result, with Zod validation, one retry, and heuristic fallback. This bounded risk is not a separate SDK-v2 bridge.
 - **No per-turn history pruning.** The plugin only intervenes at compaction time. Per-turn pruning would require the `experimental.chat.messages.transform` hook (which exists in the opencode API but is undocumented and unstable).
 - **Durable recency uses the last three recorded source sessions.** Session IDs are retained in a bounded history, while older decisions remain available through the recall tools.

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  printf 'Usage: tokenmaxxer opencode [args...]\n' >&2
+}
+
+if [ "${1-}" != "opencode" ]; then
+  usage
+  exit 2
+fi
+
+shift
+export TOKENMAXXER_LLM_EXTRACT=1
+exec opencode "$@"

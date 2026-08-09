@@ -1,8 +1,14 @@
-# tokenmaxxer — Implementation Guide
+# tokenmaxxer — Implementation Guide (historical)
 
 > Companion to `PLAN.md`. Read both. This guide fills the execution-level gaps the plan leaves open, corrects the build order, and adds what an engineer needs to ship without making mid-build design decisions.
 >
-> **Status of the plan:** architecture is sound. Both critical API hinges are verified verbatim against opencode docs (§0.2). The gaps are in error handling, concurrency, testing, function specifications, and build order — all addressed below.
+> **Status:** the server plugin and opt-in LLM extraction flow are shipped. The
+> server memory target is silent; it does not inject current-task or project
+> memory text into the composer. A separate TUI target may show only a
+> right-side indicator.
+>
+> The remaining proposal snippets are preserved as historical diagnosis, not
+> as instructions to add a header injector or a system-transform hook.
 
 ---
 
@@ -19,11 +25,13 @@
 
 **Critical confirmations:**
 - `output.prompt` set in compaction hook → `output.context` is ignored (verbatim from docs). Layer 1 design is sound.
-- `client.session.prompt({ body: { noReply: true, parts: [...] } })` is the documented "inject context without triggering AI response" path. Fallback for stale HEADER.md is real.
+- The host also exposes `client.session.prompt({ body: { noReply: true, parts: [...] } })`, but the shipped server target does not use it for memory injection.
 
 **Corrections needed:**
 - `session.message({ path: { id } })` requires **both** `id` AND `messageID`: `{ path: { id, messageID } }`. The plan's signature would 404.
-- `small_model` is documented for **title/slug generation only**, not compaction. The plan's §6 hedge is correct; don't assume small_model offloads compaction.
+- OpenCode's own `small_model` setting has documented title/slug semantics;
+  tokenmaxxer additionally uses the exact value as its opt-in extraction
+  `provider/model` override. It is not a compaction offload setting.
 - Top-level `tools: { webfetch: false }` is **deprecated since v1.1.1**. Use `permission: { webfetch: "deny" }` instead.
 - `$` (Bun shell) in plugin ctx **can be undefined** when running outside Bun. `util/git.ts` using `Bun.$` needs a fallback path.
 - Plugin ctx has two additional fields not in the plan: `experimental_workspace`, `serverUrl`.
@@ -47,7 +55,7 @@
 - `recall_promote` tool mentioned but never defined.
 - No kill switch for compaction prompt replacement.
 - No observability (status tool, compaction dump).
-- First-session HEADER.md gap: `instructions` references a file that doesn't exist until first `session.idle`.
+- First-session HEADER.md gap: superseded; the shipped server target does not generate or reference a memory header.
 - Schema migration mentioned but never specified.
 - M4 milestone listed twice (copy-paste error in plan).
 - Version skew: no pin or version check.
@@ -57,22 +65,18 @@
 - `summarize_files` is blind truncation, not summarization.
 - `.gitignore` recommendation for STATE.json.
 
-### 0.3 The "no-fork" premise is partially wrong
+### 0.3 Final transport and composer boundary
 
-The plan claims no hooks exist for per-turn history shaping, system-prompt modification, or pre-send interception. **The shipped plugin API (not the docs) exposes three experimental hooks:**
+The shipped server target does not use `experimental.chat.system.transform`,
+`client.tui.appendPrompt`, or a generated `HEADER.md` to inject memory. Server
+memory work is silent and does not place project or current-task text in the
+composer. A separate TUI target may render only a right-side `memory`
+indicator; it is not part of the server transport and is not required for
+extraction.
 
-| Hook | What it does | Trigger site |
-|---|---|---|
-| `experimental.chat.messages.transform` | Per-turn history shaping — modify the message array before send | `session/prompt.ts` before model conversion |
-| `experimental.chat.system.transform` | System-prompt modification — modify the system prompt array | `agent/agent.ts` when system prompt is built |
-| `chat.params` | Pre-LLM-send request-parameter interception | declared in Hooks type; trigger site unverified |
-
-**Implications for this build:**
-- `experimental.chat.system.transform` is a **better session-start injection path** than the `instructions` + HEADER.md approach. It modifies the system prompt directly, fresh on every session, with no file staleness. It eliminates open question #2 (instructions refresh timing) entirely.
-- `experimental.chat.messages.transform` could enable per-turn pruning, which the plan explicitly says is out of scope. This is a v2+ consideration.
-- **Caveat:** these are `experimental.*` — undocumented, may change or be removed without notice. Using them couples the plugin to unstable internals. The plan's conservative documented-API approach is defensible for v1.
-
-**Recommendation:** Build v1 on documented APIs as the plan specifies. Add `experimental.chat.system.transform` as an **alternative header-injection path** behind a config flag (`tokenmaxxer.header_injection: "instructions" | "system_transform"`), defaulting to `"instructions"`. If the M3 empirical test shows instructions caching is stale, flip to `system_transform` without redesigning. See §4 for wiring.
+The historical API review identified experimental hooks that could modify
+messages or system prompts. Those findings are diagnosis only, not an
+implementation recommendation for tokenmaxxer.
 
 ---
 
@@ -121,9 +125,12 @@ Start opencode, do a few turns, force compaction (long task), start a new sessio
 | Event handler async | Does opencode await long-running async event handlers? | Confirm no timeout/cutoff |
 | Tool key name | Is it `"tool"` or `"tools"` in the hooks map? | `"tool"` (singular) |
 
-### 1.3 Test instructions refresh timing
+### 1.3 Final memory-injection check
 
-Add `"instructions": [".opencode/memory/HEADER.md"]` to `opencode.json`. Create HEADER.md with a unique marker string. Start a session. Ask the model "do you see the marker X in your instructions?" Then modify HEADER.md, start a new session, ask again. If the second session sees the old content, instructions are cached at startup → use `system.transform` or `session.prompt({noReply:true})` instead.
+Do not add a generated `HEADER.md` to `opencode.json` `instructions` and do
+not use `experimental.chat.system.transform` for server memory. Confirm that
+idle memory writes are silent and that any installed TUI indicator is confined
+to the right side of the TUI.
 
 ### 1.4 Clean up
 
@@ -157,8 +164,6 @@ tokenmaxxer/
       recall.ts
       efficiency.ts
       status.ts
-    inject/
-      header.ts
     util/
       git.ts
       log.ts
@@ -252,7 +257,7 @@ node_modules/
 *.tsbuildinfo
 ```
 
-> **Recommend users add to their project .gitignore:** `.opencode/memory/STATE.json` — contains session IDs, file paths, and project decisions. Committing it leaks metadata. HEADER.md can be committed (it's a <1KB pointer).
+> **Recommend users add to their project .gitignore:** `.opencode/memory/STATE.json` — contains session IDs, file paths, and project decisions. Committing it leaks metadata.
 
 ---
 
@@ -265,9 +270,8 @@ Follow PLAN.md §6 with these corrections:
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "compaction": { "auto": true, "prune": true, "reserved": 10000 },
-  "small_model": "<cheapest model from your provider>",
-  "instructions": ["AGENTS.md", ".opencode/memory/HEADER.md"],
+  "compaction": { "auto": true, "prune": true, "reserved": 25000 },
+  "small_model": "ollama-cloud/gpt-oss:20b",
   "permission": {
     "webfetch": "deny",    // was "tools": { "webfetch": false } — deprecated since v1.1.1
     "websearch": "deny"
@@ -283,7 +287,11 @@ Follow PLAN.md §6 with these corrections:
 
 **Changes from plan:**
 - `tools: { webfetch: false }` → `permission: { webfetch: "deny" }` (deprecated API replaced).
-- `small_model` note: docs confirm it's for **title/slug generation only**, not compaction. Don't assume it offloads compaction cost. Set `reserved` more aggressively (15000–20000) if post-compaction quality matters.
+- `small_model` is tokenmaxxer's exact `provider/model` override for opt-in
+  extraction. `ollama-cloud/gpt-oss:20b` is a verified example for this
+  environment, not a universal recommendation. Model listings do not
+  guarantee authentication, entitlement, thinking/tool-choice compatibility,
+  or structured-result adherence.
 
 ### 3.2 M0 measurement (resolve the chicken-and-egg)
 
@@ -343,7 +351,6 @@ export interface ExtractedFacts {
 // Plugin options (read from opencode.json "tokenmaxxer" key, or env)
 export interface TokenmaxxerOptions {
   compactionPrompt: boolean     // kill switch, default true
-  headerInjection: "instructions" | "system_transform"  // default "instructions"
   memoryKey: "worktree" | "directory"  // default "worktree"
 }
 ```
@@ -355,7 +362,6 @@ import type { TokenmaxxerOptions } from "./types"
 export function loadOptions(ctx: any): TokenmaxxerOptions {
   return {
     compactionPrompt: process.env.TOKENMAXXER_NO_PROMPT !== "1",
-    headerInjection: "instructions",
     memoryKey: "worktree",
   }
 }
@@ -776,7 +782,7 @@ Follow PLAN.md §5.5 tests 1-4 (isolation, conflict resolution). All should pass
 
 ---
 
-## 6. Milestone M3 — Recall tools + header injection (~1 day)
+## 6. Milestone M3 — Recall tools + silent memory (shipped)
 
 ### 6.1 Recall tools (`src/tools/recall.ts`)
 
@@ -808,64 +814,53 @@ Use PLAN.md §5.3 with these corrections:
    }),
    ```
 
-### 6.2 Header injection (`src/inject/header.ts`)
+### 6.2 Silent server memory and separate TUI status
 
-Generate HEADER.md inside `writeMemoryOnIdle` (not a separate handler — avoids race on the same directory):
+The shipped server target writes `STATE.json` silently. It does not generate a
+`HEADER.md`, add memory to OpenCode `instructions`, use
+`experimental.chat.system.transform`, or inject current-task/project text into
+the composer. A separate TUI target may render only a right-side `memory`
+indicator; it is not required for memory or extraction.
 
-```ts
-// In writer.ts, after writeMemory:
-export async function generateHeader(worktree: string, mem: MemoryFile): Promise<void> {
-  const headerPath = join(worktree, ".opencode", "memory", "HEADER.md")
-  const content = `<!-- tokenmaxxer project memory header — auto-generated, do not edit -->
-# Project: ${mem.project_path}
-Last session: ${mem.last_updated} (git SHA ${mem.last_git_sha ?? "unknown"})
-Current task: ${mem.current_task ?? "—"}
-This project has accumulated memory. Call the \`get_project_state\` tool to load prior decisions, active files, and next steps before assuming continuity.
-`
-  await atomicWrite(headerPath, content)
-}
-```
+### 6.3 M3 acceptance tests
 
-### 6.3 First-session HEADER.md gap
-
-On plugin init, if HEADER.md doesn't exist, create a placeholder:
-```ts
-// In index.ts, during plugin init:
-const headerPath = join(worktree, ".opencode", "memory", "HEADER.md")
-if (await safeRead(headerPath) === null) {
-  await atomicWrite(headerPath,
-    "<!-- tokenmaxxer: no prior memory yet. This file will be populated after your first session. -->\n")
-}
-```
-
-This prevents `instructions` referencing a missing file on the first session.
-
-### 6.4 Alternative: system.transform injection
-
-If Phase 0 §1.3 confirmed instructions are cached at startup, add this hook alongside the instructions path:
-
-```ts
-"experimental.chat.system.transform": async (input, output) => {
-  if (options.headerInjection !== "system_transform") return
-  try {
-    const mem = await readMemory({ worktree, directory })
-    if (!mem) return
-    output.system.push(`Project: ${mem.project_path} | Last: ${mem.last_updated} (SHA ${mem.last_git_sha ?? "?"}) | Task: ${mem.current_task ?? "—"} | Call get_project_state for details.`)
-  } catch (e) {
-    await log(client, "error", "system.transform failed", { error: String(e) })
-  }
-},
-```
-
-> **Caveat:** `experimental.*` hooks are undocumented and may break on opencode updates. Only enable if the documented `instructions` path is confirmed stale. Pin opencode version in peerDependencies when using this.
-
-### 6.5 M3 acceptance tests
-
-Follow PLAN.md §5.5 with the corrected test 2 (non-deterministic fix from the plan's own CORRECTED note):
-1. Run `opencode debug config` → confirm `instructions` includes `.opencode/memory/HEADER.md`.
+Follow PLAN.md §5.5 with the shipped silent-memory boundary:
+1. Confirm idle memory work does not write project/current-task text to the
+   composer.
 2. Call `get_project_state` → confirm it returns prior task/decisions.
 3. Project B isolation → `get_project_state` returns "No project memory."
 4. Conflicting decision → old decision `still_valid: false`, `recall_decision("database")` returns new.
+
+### 6.4 Shipped opt-in LLM extraction
+
+The LLM path is not a future milestone. Heuristics remain the default and
+durable fallback. Enable extraction directly with:
+
+```bash
+TOKENMAXXER_LLM_EXTRACT=1 opencode
+```
+
+After installation, `tokenmaxxer opencode [args]` enables the same environment
+for its child process. The launcher requires an accessible configured and
+connected small model; it does not provide credentials or entitlement.
+
+Use an exact `provider/model` value for `small_model`. The verified example for
+this environment is `ollama-cloud/gpt-oss:20b`, not a universal recommendation;
+it has no `none` variant and remains a valid explicit choice. Model listings do
+not guarantee authentication, entitlement, thinking/tool-choice compatibility,
+or structured-result adherence.
+
+Automatic discovery selects active, connected, zero-cost, tool-callable models.
+It prefers candidates advertising `none`, but does not require that variant and
+may select another eligible candidate. A selected model uses `variant: none`
+only when that variant exists; otherwise it is requested without forcing it.
+
+The structured contract requires `active_files` objects with `path` and
+`reason`, and `decisions` objects with `topic` and `decision`. A verified run
+returned `StructuredOutput`; tokenmaxxer Zod-validated and merged the facts,
+persisted an `llm_extraction_cache` entry in `STATE.json`, and retained the
+visible `tokenmaxxer extract · …` audit session. The cache key includes the
+source session, canonical input, and selected provider/model.
 
 ---
 
@@ -1039,7 +1034,8 @@ Include:
 - `.gitignore` recommendation: `.opencode/memory/STATE.json`
 - Kill switch: `TOKENMAXXER_NO_PROMPT=1`
 - Troubleshooting: `tokenmaxxer_status` tool, `last_compaction.log`
-- Limitations: heuristic extraction is v1, may miss decisions; v1.1 will add LLM extraction
+- Limitations: heuristic extraction is conservative; optional shipped LLM
+  extraction can improve recall but still falls back to heuristics.
 
 ### 9.3 Distribution decision
 
@@ -1190,16 +1186,14 @@ function pruneOld(mem: MemoryFile): MemoryFile
 See §8.1 above. The `isRecentSession` helper:
 
 ```ts
-function isRecentSession(d: Decision, lastSessionId: string | undefined, window: number): boolean {
+function isRecentSession(d: Decision, recentSessions: string[], window: number): boolean {
   if (!d.last_used_in_session) return false
-  // "Last 3 sessions" — we only have the current session ID, so
-  // any decision with last_used_in_session set is "recently used"
-  // (true session-counting would require a session history array; deferred to v1.1)
-  return d.last_used_in_session === lastSessionId
+  return recentSessions.slice(0, window).includes(d.last_used_in_session)
 }
 ```
 
-> **Note:** True "last 3 sessions" tracking requires storing a session history array. For v1, `last_used_in_session === current session` is a sufficient approximation — any decision referenced in the current session is included. v1.1 can add a `recent_sessions: string[]` array to MemoryFile for proper windowing.
+> **Final behavior:** `recent_sessions: string[]` is stored as bounded session
+> history, so durable recency uses the last three recorded source sessions.
 
 ---
 
@@ -1244,7 +1238,7 @@ export function createMockClient(overrides?: Partial<any>) {
 |---|---|---|
 | M1 | §4.4 | Post-compaction recall without re-reading files |
 | M2 | §5.5 (1-4) | STATE.json exists; isolation; conflict resolution |
-| M3 | §5.5 (corrected) | instructions includes HEADER.md; get_project_state returns data |
+| M3 | §5.5 (final) | silent memory; get_project_state returns data |
 | M4 | M3.5 test | preview_compaction returns same shape as compaction prompt |
 | M5 | M4.5 test | 50 decisions → block < 2KB; correct tiering |
 
@@ -1258,7 +1252,7 @@ export function createMockClient(overrides?: Partial<any>) {
 | M0 | Config tuning | 1 hr | Phase 0 |
 | M1 | Compaction hook (Layer 1) | 1 day | M0 |
 | M2 | Memory store + writer (Layer 2) | 1-2 days | M1 |
-| M3 | Recall tools + header injection | 1 day | M2 |
+| M3 | Recall tools + silent memory | 1 day | M2 |
 | M4 | Efficiency tools + status | 0.5 day | M3 |
 | M5 | Bounded durable block | 0.5 day | M4 |
 | M6 | Package & polish | 0.5 day | M5 |

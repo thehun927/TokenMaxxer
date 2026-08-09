@@ -1,5 +1,10 @@
 # tokenmaxxer — opencode plugin for session longevity & cross-session memory
 
+> **Historical design plan.** The implementation described here shipped, but
+> some proposal sections below predate the final silent-memory boundary and the
+> opt-in LLM extraction flow. For current behavior, use `README.md` and
+> `docs/v1.1-plan.md`; do not treat superseded alternatives as requirements.
+>
 > A build plan for an opencode plugin. Self-contained: another LLM (or human) can execute this from prompt 1.
 > Target: opencode plugin (no fork). TypeScript. Single npm package, also usable as a local plugin.
 
@@ -13,14 +18,27 @@
 
 **Architecture (two layers, both pure plugin):**
 1. **Compaction-quality hook** — `experimental.session.compacting` injects structured durable state + replaces the compaction prompt with a schema-constrained one. Targets the actual pain.
-2. **Per-project durable memory** — written on `session.idle`, read by pull-based custom tools (`recall_*`) and injected as a small header at session start. Keyed by project `worktree`/`directory` for multi-project isolation. Optional vector index behind `search_kb` as a v2 if the structured memory exceeds ~4KB.
+2. **Per-project durable memory** — written on `session.idle` and read by pull-based custom tools (`recall_*`). Server memory work is silent: it is not injected into the composer or system prompt. Keyed by project `worktree`/`directory` for multi-project isolation. Optional vector index behind `search_kb` as a v2 if the structured memory exceeds ~4KB.
 
 **Success criteria:**
 - After compaction fires, the model can correctly answer "what were we doing, which files, what decisions are locked in?" without re-reading files.
-- A brand-new session on a previously-worked project boots with <1KB of injected header and can pull prior decisions via a tool call.
+- A brand-new session on a previously-worked project can pull prior decisions via a tool call; no automatic memory header is injected.
 - Zero forks. Works as a local plugin (`.opencode/plugins/`) or npm package.
 
 **Non-goals:** per-turn history rewriting (requires a hook opencode doesn't expose — would need forking), general-purpose RAG over arbitrary corpora, UI changes.
+
+**Shipped extraction boundary:** heuristic extraction is the default and durable
+fallback. LLM extraction is opt-in via `TOKENMAXXER_LLM_EXTRACT=1` or the
+installed plugin/launcher `tokenmaxxer opencode [args]`. A `small_model` override uses
+the exact `provider/model` form; the verified environment example is
+`ollama-cloud/gpt-oss:20b`, which has no `none` variant and is not a universal
+recommendation. Automatic discovery selects active, connected, zero-cost,
+tool-callable models, preferring candidates that advertise `none` but not
+requiring it; a selected model uses `variant: none` only when that variant
+exists. The structured contract requires `active_files` entries to have `path`
+and `reason`, and `decisions` entries to have `topic` and `decision`. A verified
+run returned `StructuredOutput`, passed Zod validation, merged facts, persisted
+`llm_extraction_cache`, and retained `tokenmaxxer extract · …` for audit.
 
 ---
 
@@ -46,12 +64,13 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
 |---|---|---|
 | `experimental.session.compacting` | before LLM generates the continuation summary | **Layer 1.** Inject durable-state block; optionally replace compaction prompt. |
 | `event` with `event.type === "session.idle"` | when a session finishes responding | **Layer 2.** Trigger memory-writer. |
-| `event` with `event.type === "session.created"` | new session | **Layer 2.** Inject small memory header. |
+| `event` with `event.type === "session.created"` | new session | Not used for server-memory injection. |
 | `tool` (plugin sub-object) | always (registers tools) | **Layer 2.** Register `recall_*` custom tools. |
 
 Other available events (not used v1, listed for awareness): `session.compacted`, `session.updated`, `message.updated`, `message.part.updated/removed`, `tui.prompt.append`, `tool.execute.before/after`.
 
-> **CORRECTED:** `tui.prompt.append` is an *event* (subscribed via the `event` hook when `event.type === "tui.prompt.append"`) — **not** a hook key. The §5.4 (B) fallback path was correctly using it as an event, but the wording in this section was ambiguous. See also bug note 5 below.
+> **Historical note:** `tui.prompt.append` is an event, not a hook key, but the
+> shipped server target does not use it for memory or composer injection.
 
 ### SDK client (verified — critical capability)
 The `client` passed to plugins exposes full on-demand transcript access:
@@ -72,7 +91,7 @@ const { data } = await client.session.get({ path: { id: sessionId } })
 Other relevant client methods:
 - `client.session.list()` — all sessions (use to find recent sessions for a project).
 - `client.app.log({ body: { service, level, message, extra } })` — structured logging (use this, not `console.log`).
-- `client.tui.appendPrompt({ body: { text } })` — append to prompt buffer (alternative to `tui.prompt.append` event for session-start injection; pick one — see §5).
+- A separate TUI target may render a right-side memory indicator; it does not write composer text and is not required by the server plugin.
 - `client.file.read({ query: { path } })`, `client.find.*` — file access if needed.
 
 ### Custom tools
@@ -105,16 +124,15 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
 Users add to their `opencode.json`:
 ```jsonc
 {
-  "compaction": { "auto": true, "prune": true, "reserved": 10000 },
-  "instructions": ["AGENTS.md", ".opencode/memory/HEADER.md"]
+  "compaction": { "auto": true, "prune": true, "reserved": 25000 },
 }
 ```
 - `compaction.prune: true` — drops old tool outputs (the bulk of tokens). Complements, doesn't replace, our compaction hook.
-- `instructions` glob — loads static files into the system prompt. We can generate `HEADER.md` per-project (the <1KB index pointer). Alternative to `tui.appendPrompt` for session-start injection; see §5 for the decision.
+- The server plugin intentionally does not require a generated memory file in `instructions`; memory is available through explicit tools and compaction.
 
 ### Constraints / what we cannot do (no fork)
 - **No per-turn "rewrite outgoing history before send" hook.** The only history-shaping hook is `experimental.session.compacting`, which fires *only when compaction triggers*, not every turn. We do not attempt per-turn pruning.
-- **No hook to read/modify the raw system prompt at session start** (the compaction hook only affects the compaction prompt; `instructions` files are the documented lever for system-prompt augmentation, applied at startup).
+- **No automatic session-start memory injection.** Server memory remains silent; a separate TUI target may show only a right-side indicator.
 - **No documented hook for "session is about to send to LLM".** If we later need per-turn intervention, that's fork territory — out of scope v1.
 
 ---
@@ -133,14 +151,12 @@ tokenmaxxer/
       store.ts              # per-project memory store (read/write/append) — keyed by worktree
       schema.ts             # MemoryFile schema (zod) + types
       writer.ts             # builds MemoryFile from a session transcript
-      reader.ts             # queries memory for recall_* tools + header generation
+      reader.ts             # queries memory for recall_* tools
     compaction/
       prompt.ts             # the schema-constrained compaction prompt (Layer 1)
       durable.ts            # builds the durable-state block pushed into compaction
     tools/
       recall.ts             # recall_decision, get_active_files tools (Layer 2)
-    inject/
-      header.ts             # generates the <1KB HEADER.md per project; session-start injection
     util/
       git.ts                # get current git SHA for staleness tagging
       log.ts                # wraps client.app.log
@@ -148,7 +164,10 @@ tokenmaxxer/
   README.md
 ```
 
-**Why this split:** `memory/`, `compaction/`, `tools/`, `inject/` map 1:1 to the four mechanisms in the design. Each is independently testable. `index.ts` is thin wiring.
+**Why this split:** `memory/`, `compaction/`, and `tools/` map to the
+shipped server mechanisms. The historical `inject/` proposal is not part of
+the shipped server target. Each shipped area is independently testable and
+`index.ts` is thin wiring.
 
 ---
 
@@ -354,11 +373,9 @@ export async function writeMemoryOnIdle({ client, worktree, directory, event }) 
 
   const gitSha = await getCurrentGitSha(worktree)  // util/git.ts via Bun.$ git rev-parse HEAD
   const existing = await readMemory({ worktree, directory }) ?? emptyMemory(worktree)
-
-  // Extract structured facts from the transcript using a *cheap* model call
-  // OR a heuristic pass. Decision: use heuristic pass for v1 (no extra LLM cost,
-  // no dependency on a second model). Promote to LLM extraction in v1.1 if heuristics miss too much.
-  const extracted = extractFactsHeuristic(messages)  // { current_task, active_files, decisions, blockers, next_steps }
+   // Persist heuristic facts first. When explicitly enabled, the shipped
+   // structured LLM pass then validates and merges additional facts.
+   const extracted = extractFactsHeuristic(messages)  // { current_task, active_files, decisions, blockers, next_steps }
 
   const updated: MemoryFile = mergeMemory(existing, extracted, {
     sessionId, gitSha, timestamp: new Date().toISOString(),
@@ -368,18 +385,22 @@ export async function writeMemoryOnIdle({ client, worktree, directory, event }) 
 }
 ```
 
-**Heuristic extraction (`extractFactsHeuristic`)** — v1 approach, no LLM cost:
+**Heuristic extraction (`extractFactsHeuristic`)** — durable fallback:
 - `active_files`: collect all paths from tool calls to `read`/`edit`/`write`/`bash` (parse tool args); rank by frequency; keep top 5 with `reason` = "edited" / "read N times".
 - `decisions`: scan assistant text for sentences matching `/^(decision|decided|let's|we'll (use|go with)|chose|picked)\b/i`; dedupe by topic keyword; flag `still_valid`.
 
-> **CORRECTED — heuristic extraction scope is too narrow.** Decisions are frequently stated in user text (e.g. "let's use Postgres") or in tool outputs (build output confirming a config, test output confirming a library version). The original heuristic only scans assistant text. Add two more sources: (a) the first user message of the session (often contains the task decision), and (b) `ToolPart` outputs with `state.status === "completed"` where the output text contains decision-keywords. The v1.1 LLM-extraction upgrade is still the right long-term move; this just makes v1 less anemic.
+> **Historical correction:** heuristic extraction also scans user text and
+> completed tool output. It remains the durable fallback when the opt-in LLM
+> request is disabled, unavailable, or invalid.
 
 - `current_task`: first user message text, truncated to 200 chars.
 - `blockers` / `next_steps`: scan for "blocked", "TODO", "next", "then" in the last assistant message.
-- This is crude. That's intentional — v1 proves the loop. If it misses real decisions, upgrade to a `small_model` LLM extraction pass in v1.1 (configurable via plugin options).
+- This is intentionally conservative. Optional structured LLM extraction can
+  improve recall, but heuristics remain the safe fallback.
 
 **`mergeMemory` rules:**
-- New decisions with a topic matching an existing one (case-insensitive substring) flip the old one's `still_valid` to false and append the new one.
+- New decisions with an exactly matching normalized topic (not a substring) flip
+  the old one's `still_valid` to false and append the new one.
 - `active_files` replaces the list (latest wins), but preserves `reason` for files still present.
 - `current_task` always overwrites.
 - `blockers`/`next_steps` overwrite.
@@ -442,32 +463,32 @@ export function registerTools(ctx): { tool: Record<string, ReturnType<typeof too
 > 2. `recall_decision` uses substring match on `topic` only — too narrow for 30+ decisions where the model can't guess the exact topic. Add an `args.limit` (default 10) and allow `args.query` to be empty to return the **most recent N valid decisions** sorted by `timestamp` desc. This is what the model actually needs on a fresh session boot.
 ```
 
-### 5.4 Session-start injection (`src/inject/header.ts`)
-Two mechanisms available; pick one:
+### 5.4 Silent server memory and separate TUI status
+The shipped server target has no session-start memory injection:
 
-- **(A) `instructions` glob + generated `HEADER.md`** — write `<worktree>/.opencode/memory/HEADER.md` (a <1KB pointer: "Project X, last session Y, call `get_project_state` for details"). List it in `opencode.json` `"instructions"`. Pro: loaded into system prompt automatically at startup, no hook needed. Con: static file; regenerating it on `session.idle` means the *next* session sees it. Con: `instructions` may be cached at startup — verify timing.
-- **(B) `session.created` event → `client.tui.appendPrompt`** — inject the header text into the prompt buffer on every new session. Pro: always fresh. Con: goes into the user prompt buffer, not the system prompt; may require user to submit. Less clean.
+- Server memory work writes `STATE.json` silently and never injects project or
+  current-task text into the composer.
 
-**Decision for v1:** use (A). It's the documented system-prompt augmentation path, it's what `instructions` is for, and the staleness lag (one session) is acceptable. Fallback to (B) if startup caching makes (A) stale.
+An optional separate TUI target may render only a right-side `memory`
+indicator. It is not composer text and is not required for server memory or
+LLM extraction.
 
-> **CORRECTED — (B) is not a real fallback, and there's a better one.** `client.tui.appendPrompt` puts text in the *user* prompt buffer, which won't be visible to the model until the user submits — strictly worse than (A) for session-start injection. If (A) turns out to cache stale at startup, the correct runtime injection path is **`client.session.prompt({ path: { id: sessionId }, body: { noReply: true, parts: [{ type: "text", text: header }] } })`** — confirmed in the SDK docs as "Inject context without triggering AI response (useful for plugins)". This appends to the system context immediately without a round-trip. Use it from a `session.created` handler with `event.properties.info.id` (NOT `.sessionID` — the field is on `info`, verified in `EventSessionCreated` type).
-
-`HEADER.md` template (generated on `session.idle`):
-```markdown
-<!-- tokenmaxxer project memory header — auto-generated, do not edit -->
-# Project: <name>
-Last session: <date> (git SHA <sha>)
-Current task: <one line>
-This project has accumulated memory. Call the `get_project_state` tool to load prior decisions, active files, and next steps before assuming continuity.
-```
+The historical header-injection alternatives are retained only as diagnosis;
+they are not shipped behavior. In particular, the server does not use
+`experimental.chat.system.transform`, `client.tui.appendPrompt`, or a generated
+`HEADER.md` for memory.
 
 ### 5.5 Acceptance tests for Layer 2
 1. Work on project A (worktree `/proj-a`). Confirm `STATE.json` exists at `/proj-a/.opencode/memory/STATE.json` after `session.idle`.
-2. Start a new session in `/proj-a`. Confirm `HEADER.md` is in scope (check the model references it) and that calling `get_project_state` returns the prior task/decisions.
+2. Start a new session in `/proj-a`. Confirm no memory text is injected into
+   the composer, then call `get_project_state` and confirm it returns the prior
+   task/decisions.
 3. Start a session in project B (`/proj-b`). Confirm `get_project_state` returns "No project memory" — isolation works, no cross-project leakage.
 4. Make a conflicting decision in project A's new session ("actually use MySQL"). Confirm the old Postgres decision is now `still_valid: false` and `recall_decision("database")` returns MySQL.
 
-> **CORRECTED — test 2 is non-deterministic.** "Check the model references it" is not a verifiable assertion. The test should instead: (a) run `opencode debug config` and confirm the `instructions` list includes `.opencode/memory/HEADER.md`, and (b) call `get_project_state` and confirm it returns the expected data. Do not assert on model text.
+> **Final behavior:** the server-memory check is a silent-composer check, not
+> an `instructions` or generated-header check. The optional TUI indicator is
+> right-side only.
 
 ---
 
@@ -478,8 +499,8 @@ Before writing any plugin code, set in `opencode.json`:
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "compaction": { "auto": true, "prune": true, "reserved": 10000 },
-  "small_model": "<cheapest model from your provider>",
+  "compaction": { "auto": true, "prune": true, "reserved": 25000 },
+  "small_model": "ollama-cloud/gpt-oss:20b",
   "agent": {
     "build": {
       "permission": { "webfetch": "deny", "websearch": "deny" }  // disable any tool you don't use
@@ -488,17 +509,24 @@ Before writing any plugin code, set in `opencode.json`:
   "provider": {
     "anthropic": { "options": { "setCacheKey": true } }  // Anthropic only; cuts cost/latency, not tokens
   },
-  "instructions": ["AGENTS.md", ".opencode/memory/HEADER.md"]
 }
 ```
 
 Rationale:
 - `compaction.prune: true` — biggest single token saver; drops old tool outputs. Independent of our plugin; complementary.
-- `compaction.reserved` — leave headroom so compaction doesn't overflow. 10000 is a starting point; tune. **Set proportional to the durable-block max size** — if durable can be 4KB, `reserved` should be `4KB + model headroom for the summary itself`, not a flat guess.
-- `small_model` — offloads title/summary generation from the main model. **Note:** the docs only explicitly state `small_model` is used for *title* generation. Whether it is also used for the built-in `compaction` summary is not documented; if it is not, set `compaction.reserved` more aggressively (e.g. 20000) so the main model has room to write a quality summary.
+- `compaction.reserved` — leave headroom so compaction doesn't overflow. The
+  current recommended example is `25000`; tune it if needed. **Set proportional
+  to the durable-block max size** — if durable can be 4KB, `reserved` should be
+  `4KB + model headroom for the summary itself`, not a flat guess.
+- `small_model` — tokenmaxxer uses this as an exact `provider/model` override
+  for opt-in extraction. `ollama-cloud/gpt-oss:20b` is a verified example for
+  this environment, not a universal recommendation. OpenCode model listings
+  do not guarantee authentication, entitlement, thinking/tool-choice
+  compatibility, or structured-result adherence.
 - Disable unused tools per-agent — tool schemas are a large fixed system-prompt cost.
 - `setCacheKey` — Anthropic prompt caching; doesn't reduce tokens but reduces cost/latency, extending the practical session budget.
-- `instructions` — wires in the Layer 2 header (once implemented).
+- Memory is not wired into `instructions`; server memory remains silent and the
+  optional TUI indicator is right-side only.
 
 **Additional prompt-efficiency wins not in the original list (verified against opencode docs):**
 - `"tools": { "webfetch": false, "websearch": false }` at the **top level** (not per-agent) — disables for every agent in one line. Cheaper than the per-agent version if you never use these.
@@ -512,37 +540,45 @@ Rationale:
 
 ---
 
-## 7. Build order & milestones
+## 7. Historical build order and shipped state
 
-**M0 — Config tuning (no code, 1 hour):** Apply §6 config. Validate the pain persists after `prune: true`. Gate: if compaction quality is fine after config, stop here.
+The milestone list below is retained as project history. All implementation
+milestones through package polish are complete; the header-injection proposal
+was superseded by the silent server-memory boundary. LLM extraction is shipped
+as an opt-in path, not a future milestone.
 
-**M1 — Layer 1 compaction hook (the real first build, ~1 day):**
+**M0 — Config tuning:** complete. `prune` and `reserved` remain optional
+OpenCode tuning rather than a tokenmaxxer startup requirement.
+
+**M1 — Layer 1 compaction hook:** complete.
 - `src/compaction/prompt.ts`, `src/compaction/durable.ts`
 - Stub `readMemory` returning null (durable block = "(no prior memory)")
 - `src/index.ts` wiring the `experimental.session.compacting` hook only
 - Run the §4.4 acceptance test
 - Gate: the post-compaction recall test passes
 
-**M2 — Layer 2 memory store + writer (~1-2 days):**
+**M2 — Layer 2 memory store + writer:** complete.
 - `src/memory/schema.ts`, `src/memory/store.ts`, `src/memory/writer.ts`
 - `src/util/git.ts`, `src/util/log.ts`
 - Wire `session.idle` → `writeMemoryOnIdle`
 - Confirm `STATE.json` appears and looks sane after a real session
-- Heuristic extraction only (no LLM extraction yet)
+- Heuristic extraction remains the fallback; opt-in structured LLM extraction
+  also validates and merges facts, persists `llm_extraction_cache`, and keeps a
+  visible `tokenmaxxer extract · …` audit session.
 - Gate: §5.5 tests 1-4 pass (isolation, conflict resolution)
 
-**M3 — Recall tools + header injection (~1 day):**
+**M3 — Recall tools + silent memory:** complete.
 - `src/tools/recall.ts` (three tools)
-- `src/inject/header.ts` generating `HEADER.md` on `session.idle`
-- User adds `.opencode/memory/HEADER.md` to `instructions`
-- Gate: new session on prior project boots with <1KB header and `get_project_state` returns real data
+- Server memory writes `STATE.json` silently; it does not inject current-task
+  or project-memory text into the composer.
 
-**M4 — Package & polish (~0.5 day):**
+**M4 — Package & polish:** complete.
 - `package.json`, `tsconfig.json`, build to `dist/index.js`
 - README with install + config instructions
 - Decide npm publish vs. local-plugin distribution
 
-**M3.5 — Prompt-efficiency tools (~0.5 day, ship with M3):**
+**M3.5 — Prompt-efficiency tools (historical proposal names; shipped as
+`preview_compaction` and `head_files`):**
 
 These tools directly address the user's "make prompting in opencode more efficient" goal. They are cheap, mechanical, and ride on the same `registerTools` machinery as the recall tools.
 
@@ -591,12 +627,13 @@ compact_now: tool({
 
 **Test for M3.5:** in a long session that hasn't yet triggered compaction, call `compact_now` and confirm it returns the same `## Current task / Active files / Locked decisions` shape that the post-compaction summary would have. Pass = identical schema; Fail = format drift between the tool output and the compaction prompt.
 
-**M4 — Package & polish (~0.5 day):**
+**M4 — Package & polish (historical duplicate):** complete; see the earlier
+M4 entry.
 - `package.json`, `tsconfig.json`, build to `dist/index.js`
 - README with install + config instructions
 - Decide npm publish vs. local-plugin distribution
 
-**M4.5 — Bounded durable block on every compaction (~0.5 day, ship with M4):**
+**M4.5 — Bounded durable block on every compaction (shipped):**
 
 The current `buildDurableBlock` (4.3) re-includes *all* valid decisions, every time compaction fires. For long-lived projects this grows unbounded — 8KB of decisions injected at every compaction, even when 90% are settled and irrelevant to the current task. This makes the compaction prompt itself a slow leak.
 
@@ -650,9 +687,9 @@ The model can also call a new `recall_promote(topic)` tool (added to `recall.ts`
 | Risk | Likelihood | Mitigation |
 |---|---|---|
 | Compaction prompt schema is worse than default | Medium | M1 acceptance test catches it; iterate the prompt, not the code. |
-| Heuristic extraction misses real decisions | High (v1) | Expected. Design `extractFactsHeuristic` to be swapped for an LLM pass in v1.1 without touching the store. |
+| Heuristic extraction misses real decisions | Ongoing | The shipped opt-in structured LLM path can improve recall; heuristics remain the durable fallback. |
 | `session.idle` event payload shape differs from assumption | Medium | Confirm `event.properties` shape at M2 start against actual events; the docs don't fully specify it. |
-| `instructions` glob caches `HEADER.md` at startup → stale | Medium | M3 tests this; fallback to `tui.appendPrompt` mechanism (B). |
+| Memory text could leak into the composer | Resolved | Server memory writes silently; the separate TUI indicator is right-side only. |
 | Memory file grows unbounded | Low | 8KB cap + `pruneOld` in writer. |
 | Hallucinated continuity on stale memory | Medium | git-SHA + timestamp in every entry; compaction prompt instructs model to verify SHA before trusting. |
 | Plugin `client` SDK not available in all plugin contexts | Low | Docs show `client` in the plugin ctx signature; if missing, plugin init should no-op gracefully with a log line. |
@@ -660,12 +697,17 @@ The model can also call a new `recall_promote(topic)` tool (added to `recall.ts`
 
 ---
 
-## 9. Open questions to resolve at build time (not blocking the plan)
+## 9. Historical open questions and resolutions
 
-1. **Exact `session.idle` event payload** — does it carry `sessionID` directly, or nested? Confirm at M2 start by logging the event. Docs list the event but not its full payload.
-2. **`instructions` file refresh timing** — is `HEADER.md` re-read per session or cached at opencode startup? Determines M3 mechanism choice (A vs B). Test empirically.
-3. **Plugin `client` availability** — is it always non-null, or can it be null in some load contexts? Add a guard in `index.ts`.
-4. **`small_model` for extraction** — if heuristic extraction is too crude, which model to use for the extraction pass? Likely the configured `small_model`; need to confirm the plugin can read it from config via `client.config.get()`.
+1. **`session.idle` event payload** — resolved: `event.properties.sessionID` is
+   flat and the client is available.
+2. **Automatic header injection** — resolved by removal: server memory is
+   silent; no `HEADER.md`, `instructions`, composer injection, or
+   `experimental.chat.system.transform` is used for memory.
+3. **LLM extraction model** — resolved: opt-in only; use an exact
+   `provider/model` `small_model` override or eligible connected-provider
+   discovery. The verified example is `ollama-cloud/gpt-oss:20b` for this
+   environment, not a universal recommendation.
 
 ---
 
@@ -685,15 +727,11 @@ Tool execute ctx:        { agent, sessionID, messageID, directory, worktree }
 Read transcript:         const { data } = await client.session.messages({ path: { id } })
 Get session:             await client.session.get({ path: { id } })
 List sessions:           await client.session.list()
-Inject context (fallback for stale HEADER.md): await client.session.prompt({
-                           path: { id: sessionId },
-                           body: { noReply: true, parts: [{ type: "text", text }] }
-                         })
 Get current project:     await client.project.current()   // defensive fallback if ctx.worktree is missing
-Get config:              await client.config.get()        // for reading small_model at runtime
+Get config:              await client.config.get()        // read small_model override on idle
 Log:                     await client.app.log({ body: { service, level, message, extra } })
 File find/read:          client.find.text / .files / .symbols; client.file.read({ query: { path } })
-Config (user):           compaction.{auto,prune,reserved}, instructions[], small_model,
+Config (user):           compaction.{auto,prune,reserved}, small_model,
                          agent.<x>.permission.{edit,bash,webfetch,websearch,todowrite,...},
                          provider.<id>.options.{setCacheKey,timeout,chunkTimeout},
                          tools.<name> (top-level disable), watcher.ignore[],
@@ -702,7 +740,8 @@ Config (user):           compaction.{auto,prune,reserved}, instructions[], small
 
 > **Deliberately not used (for awareness, in case a future reader wonders):**
 > - `experimental.hook.file_edited` and `experimental.hook.session_completed` — these are *config-level* shell-hook arrays (run a command when a file is edited or a session completes), not plugin hooks. They could replace our `session.idle` writer with a shell script, but the plugin has access to the SDK transcript which a shell hook doesn't. Not worth the trade.
-> - `tui.prompt.append` *event* — superseded by `client.session.prompt({ noReply: true })` for header injection (see §5.4 bug note 5).
+> - `tui.prompt.append` *event* — not used by the shipped server target; memory
+>   remains silent and the optional TUI indicator is right-side only.
 > - `message.updated` / `message.part.updated/removed` — would only matter if we needed real-time streaming aggregation, which we don't (writer pulls full transcript on idle).
 
 Docs: https://opencode.ai/docs/plugins/ , https://opencode.ai/docs/sdk/ , https://opencode.ai/docs/config/

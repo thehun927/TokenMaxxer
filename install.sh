@@ -7,10 +7,13 @@ set -euo pipefail
 PLUGINS_DIR="${HOME}/.config/opencode/plugins"
 PACKAGE_JSON="${HOME}/.config/opencode/package.json"
 TUI_CONFIG_JSON="${HOME}/.config/opencode/tui.json"
+BIN_DIR="${HOME}/.local/bin"
 PLUGIN_URL="https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/dist/index.js"
 PLUGIN_FILE="${PLUGINS_DIR}/tokenmaxxer.js"
 TUI_PLUGIN_URL="https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/dist/tui.js"
 TUI_PLUGIN_FILE="${PLUGINS_DIR}/tokenmaxxer-tui.js"
+LAUNCHER_URL="https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/bin/tokenmaxxer"
+LAUNCHER_FILE="${BIN_DIR}/tokenmaxxer"
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                    tokenmaxxer installer                     ║"
@@ -18,11 +21,35 @@ echo "║         session longevity & cross-session memory             ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
-# 1. Create plugins directory
+# 1. Install the user launcher
+mkdir -p "$BIN_DIR"
+echo "  ↓ Downloading tokenmaxxer launcher..."
+if command -v curl &>/dev/null; then
+  curl -fsSL "$LAUNCHER_URL" -o "$LAUNCHER_FILE"
+elif command -v wget &>/dev/null; then
+  wget -q "$LAUNCHER_URL" -O "$LAUNCHER_FILE"
+else
+  echo "  ✗ Need curl or wget to download."
+  exit 1
+fi
+chmod +x "$LAUNCHER_FILE"
+echo "  ✓ Launcher installed: $LAUNCHER_FILE"
+
+case ":${PATH:-}:" in
+  *":${BIN_DIR}:"*)
+    ;;
+  *)
+    echo "  ⚠ ~/.local/bin is not on your PATH."
+    echo "    Add this line to your shell profile:"
+    echo '    export PATH="$HOME/.local/bin:$PATH"'
+    ;;
+esac
+
+# 2. Create plugins directory
 mkdir -p "$PLUGINS_DIR"
 echo "  ✓ Plugins directory: $PLUGINS_DIR"
 
-# 2. Download the plugin
+# 3. Download the plugin
 echo "  ↓ Downloading plugin..."
 if command -v curl &>/dev/null; then
   curl -fsSL "$PLUGIN_URL" -o "$PLUGIN_FILE"
@@ -34,7 +61,7 @@ else
 fi
 echo "  ✓ Plugin installed: $PLUGIN_FILE"
 
-# 3. Download the separate TUI plugin target
+# 4. Download the separate TUI plugin target
 echo "  ↓ Downloading TUI plugin..."
 if command -v curl &>/dev/null; then
   curl -fsSL "$TUI_PLUGIN_URL" -o "$TUI_PLUGIN_FILE"
@@ -46,7 +73,7 @@ else
 fi
 echo "  ✓ TUI plugin installed: $TUI_PLUGIN_FILE"
 
-# 4. Ensure the server and TUI dependencies are in the global package.json
+# 5. Ensure the server and TUI dependencies are in the global package.json
 if [ -f "$PACKAGE_JSON" ]; then
   if command -v node &>/dev/null; then
     if PACKAGE_JSON="$PACKAGE_JSON" node <<'NODE'
@@ -85,7 +112,7 @@ else
   echo "    opencode will create it on next start and run bun install."
 fi
 
-# 5. Add the TUI plugin to tui.json without removing or duplicating entries
+# 6. Add the TUI plugin to tui.json without removing or duplicating entries
 if command -v node &>/dev/null; then
   if TUI_CONFIG_JSON="$TUI_CONFIG_JSON" node <<'NODE'
 const fs = require('fs');
@@ -122,7 +149,7 @@ else
   echo "    Manually add \"./plugins/tokenmaxxer-tui.js\" once to its plugin array, keeping existing entries."
 fi
 
-# 6. Print success
+# 7. Print success
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║  ✓ Installation complete!                                    ║"

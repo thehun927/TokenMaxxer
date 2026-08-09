@@ -4,6 +4,9 @@
   "description": "opencode plugin for session longevity & cross-session memory",
   "type": "module",
   "main": "./dist/index.js",
+  "bin": {
+    "tokenmaxxer": "./bin/tokenmaxxer"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
