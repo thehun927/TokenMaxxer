@@ -158,8 +158,7 @@ scope without inventing another memory format.
 
 - **Severity:** Medium / configuration consistency.
 - **Evidence:** `install.sh` prints a `reserved: 15000` example; root
-  `opencode.json`, `README.md`, and the current setup guidance use 25,000;
-  `docs/journal.md` records 15,000 as historical and 25,000 as current.
+  `opencode.json`, `README.md`, and the current setup guidance use 25,000.
 - **Impact:** A fresh install can cause users to copy a lower headroom value than
   the maintained recommendation, producing inconsistent compaction behavior
   and support reports that are difficult to compare.
@@ -200,9 +199,8 @@ scope without inventing another memory format.
 - **Severity:** Low / diagnostics contract.
 - **Evidence:** `src/index.ts` writes `.opencode/memory/last_compaction.log`
   through an atomic replacement after the compaction hook; `src/tools/status.ts`
-  exposes a process-local `lastCompactionTimestamp`; `README.md` and
-  `docs/journal.md` call the file a last-compaction diagnostic but do not state
-  whether it is a history or a snapshot.
+  exposes a process-local `lastCompactionTimestamp`; public documentation did
+  not state whether the file is a history or a snapshot.
 - **Impact:** Operators may expect an append-only audit history, or interpret a
   missing/empty file after a restart or a different project as proof that the
   hook did not run. Unbounded logging would also create avoidable repository and

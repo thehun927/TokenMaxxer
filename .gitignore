@@ -7,3 +7,4 @@ node_modules/
 .opencode/.tokenmaxxer-memory-activity
 *.tsbuildinfo
 .slim/deepwork/
+docs/journal.md

@@ -431,7 +431,6 @@ npx tsc --noEmit    # Type check
 docs/
   PLAN.md            # Original 708-line design spec
   IMPLEMENTATION.md  # Build guide with function specs, test plan, corrected milestone order
-  journal.md         # Progress journal — every change logged with findings
 test/
   fixtures/          # Transcript fixtures for heuristic extraction tests
   memory/            # Schema, merge, prune, writer, migrate tests
