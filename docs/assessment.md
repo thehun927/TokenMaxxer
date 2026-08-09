@@ -1,989 +1,1293 @@
-# tokenmaxxer — Revised Codebase Assessment & Implementation Plan
+# tokenmaxxer — Independent Codebase Assessment & Implementation Plan
 
 > **Revised:** 2026-08-09
 > **Repository:** `thehun927/TokenMaxxer`
 > **Reviewed branch:** `main`
-> **Assessment baseline commit:** `9c618f36db458537984140c0989d74d5d850bcd4`
-> **Verified baseline:** GitHub Actions CI passed; 202/202 tests across 21 files passed; `npx tsc --noEmit` passed; distribution build and bundle checks passed.
+> **Source baseline:** current `main` after the first assessment revision
+> **Prior assessment baseline:** `9c618f36db458537984140c0989d74d5d850bcd4`
+> **Prior assessment revision:** `dc08bf0101016cca4a5b8077f81bc41e5c8a7102`
+> **Verified pre-review CI baseline:** 202/202 tests across 21 files passed; `npx tsc --noEmit` passed; build, bundle verification, and installer syntax checks passed.
 >
-> This revision validates the original agentic assessment against the actual repository and current OpenCode host contract. It keeps the useful findings, adjusts severity where appropriate, rejects several brittle or unsafe proposed fixes, removes stale/false findings, and adds missing host-compatibility and storage-path issues.
+> This document combines validation of the original agentic assessment with a separate, independent source review. The independent pass did not assume the earlier finding list was complete. It traced storage, queueing, decision merge semantics, promotion, pruning, LLM evidence/caching, host compatibility, diagnostics, tests, installer behavior, and low-level filesystem primitives.
 
 ---
 
 ## Executive summary
 
-The original assessment was directionally strong: it understood the architecture well and found several real correctness bugs. It should **not**, however, be implemented verbatim.
+The codebase has a strong safety-oriented architecture for an early release: heuristic-first persistence, structured LLM output, provenance, atomic rename, bounded memory size, corruption backup, explicit recall tools, and a substantial test suite are all good design choices.
 
-The highest-value confirmed issues are:
+The independent review nevertheless found several **core memory-integrity problems that are more important than many of the original assessment findings**.
 
-1. **C1 — global fallback memory is not read back correctly.** This is a durability bug and should be fixed first.
-2. **G3 — `head_files` depends on a `client` field that is not part of `ToolContext`.** The diagnosis is correct, but the original proposal to replace the host file API with raw `fs.readFile` should be rejected.
-3. **G5 — `markReferencedDecisions` marks every valid decision as recently used after any `recall_decision` call.** This directly damages compaction relevance.
-4. **C2 — unexpected pre-persistence failures are reported as `heuristic-only`.** This makes successful fallback indistinguishable from a failed idle transaction.
-5. **G4 — the compaction durable block has no explicit output budget.** It relies indirectly on the STATE.json storage cap instead of directly bounding the injected context.
+### Highest-priority findings
 
-The original assessment also contains several quality-control problems:
+1. **I1 — cross-process read/modify/write races can silently lose durable memory.** The project queue is explicitly process-local. Atomic rename prevents malformed files, not lost updates when two OpenCode processes use the same project.
+2. **C1/I8 — the storage abstraction does not correctly distinguish local/global state or “missing” from “unreadable.”** A global fallback write is not read today; a stale local file can outrank newer global data under a naive fix; and a read error is currently treated like no memory.
+3. **I2 — the decision merge algorithm can leave two conflicting decisions simultaneously valid.** An agreeing LLM corroboration creates a duplicate valid decision; a later supersession may invalidate only the duplicate and leave the old heuristic decision valid.
+4. **I3/I4 — `recall_promote` can promote a stale invalid decision and can label a model-triggered action as `human-reviewed` without explicit human confirmation.** This undermines the provenance trust model.
+5. **I5 — “foundational / never forgotten” decisions can be silently deleted by normal pruning.** Age pruning and last-resort decision caps do not prioritize foundational state.
+6. **I6 — evidence enforcement covers LLM decisions, but not every durable LLM fact.** Active files, blockers, next steps, and some current-task updates can be durably accepted without fact-specific evidence while still receiving corroborated-looking provenance.
+7. **I7 — the LLM cache key can self-invalidates after a successful write.** The canonical input includes durable state that the same source session mutates, so a later identical idle event can miss the prior cache and prompt again.
+8. **G3/N1 — the OpenCode host boundary is inconsistent.** `head_files` expects `context.client` even though current custom `ToolContext` does not provide it; the peer range also claims support for versions older than the code's own minimum host assumptions.
+9. **C2 — idle outcomes can report failure as `heuristic-only`.** The broad catch makes observability materially less trustworthy.
+10. **G4/I12 — both injection budgeting and storage pruning need stronger contracts.** The compaction block has no explicit total output budget, and `pruneOld()` can return a value that is still over the hard 8 KB write limit.
 
-- Its headline finding counts do not match its own tables.
-- It states that no CI workflow exists even though `.github/workflows/ci.yml` already exists and passed on the assessment commit.
-- It overstates the severity of several diagnostic or presentation issues.
-- It proposes brittle output-regex parsing for G5 even though structured tool input is already retained in transcript parts.
-- It proposes raw filesystem access for G3, unnecessarily creating a second file-access implementation outside the OpenCode client boundary.
-- It proposes adding a new durable compaction timestamp field even though `last_compaction.log` already persists that information per project.
+### Severity/status matrix
 
-### Revised finding status
-
-| Code | Status | Revised severity | Summary |
+| Code | Status | Severity | Summary |
 |---|---|---:|---|
-| **C1** | CONFIRMED — fix design revised | **Critical / High** | Global fallback writes can become unreadable or stale relative to a local file. |
-| **C2** | CONFIRMED — severity adjusted | **High** | Pre-heuristic exceptions are mislabeled `heuristic-only`; post-persist LLM exceptions also need distinct semantics. |
-| **G3** | CONFIRMED — proposed fix rejected | **High** | `ToolContext` has no `client`; close over the plugin client rather than switching to raw fs. |
-| **G4** | CONFIRMED — reframed | **High** | Durable block lacks an explicit injected-context budget; STATE.json's 8 KB cap is only an indirect bound. |
-| **G5** | CONFIRMED — proposed fix rejected | **High** | Any recall marks all valid decisions as recent. Re-run `queryDecisions` from structured tool input instead of parsing output text. |
-| **G6** | CONFIRMED — impact overstated | **Medium** | Audit/health persistence failures are not surfaced, but these paths are intentionally best-effort. |
-| **G7** | CONFIRMED — severity adjusted | **Medium** | Read/search activity is mislabeled as editing. |
-| **H1** | CONFIRMED — severity adjusted | **Low** | Nullable test/reset mismatch in `setLastCompaction`. |
-| **G8** | CONFIRMED — proposed fix simplified | **Medium** | Process-global last-compaction state is wrong, but existing `last_compaction.log` can be the durable source. |
-| **N1** | NEW | **High** | `@opencode-ai/plugin >=1.0.0 <2.0.0` claims support for 1.0.x, whose `ToolContext` did not expose `directory`/`worktree`. |
-| **N2** | NEW, coupled to C1 | **Medium** | `tokenmaxxer_status` reconstructs the local STATE path and size, so it will misreport memory stored in the global fallback. |
-| **N3** | NEW | **Medium** | Unit mocks do not enforce the real host `ToolContext` contract; G3 is evidence of mock-fidelity failure. |
-| **N4** | NEW | **Medium** | `dist/` is committed/published but CI does not fail if committed build artifacts are stale relative to source. |
-| **N5** | NEW / separate review | **Medium** | Current CI's `npm ci` reports dependency audit findings; investigate separately rather than using `npm audit fix --force`. |
+| **I1** | **NEW — independently confirmed** | **Critical** | Process-local queue cannot prevent cross-process lost updates to STATE.json. |
+| **C1** | Confirmed, design expanded | **Critical / High** | Global fallback writes are not read; local/global freshness requires a real resolver. |
+| **I8** | **NEW — independently confirmed** | **High** | `safeRead()` maps every read error to `null`, so unreadable state is treated as absent. |
+| **I2** | **NEW — independently confirmed** | **High** | Decision merge can retain stale and replacement decisions as simultaneously valid. |
+| **I3** | **NEW — independently confirmed** | **High** | `recall_promote` selects by topic without filtering validity and may promote a stale decision. |
+| **I4** | **NEW — independently confirmed** | **High** | A model-callable promotion tool directly writes `human-reviewed` provenance without human confirmation. |
+| **I5** | **NEW — independently confirmed** | **High** | Foundational decisions are deleted by 30-day/10/5 decision pruning under pressure. |
+| **I6** | **NEW — independently confirmed** | **High** | LLM evidence validation is decision-specific; other durable LLM facts are not equivalently corroborated. |
+| **I7** | **NEW — independently confirmed** | **High** | Cache identity includes mutable same-source durable state and can miss on sequential duplicate idle events. |
+| **G3** | Confirmed — original remediation rejected | **High** | `ToolContext.client` does not exist; close over plugin client instead of bypassing host file semantics. |
+| **N1** | Confirmed/expanded | **High** | Peer range starts at 1.0.0 while code assumes newer ToolContext/host contracts; health gate can fail open when health is absent. |
+| **G5** | Confirmed — original remediation rejected | **High** | Any recall marks all valid decisions recent; use structured tool input/query semantics. |
+| **C2** | Confirmed — severity adjusted | **High** | Pre-persistence failures can be mislabeled `heuristic-only`. |
+| **G4** | Confirmed/reframed | **High** | Durable compaction block lacks its own hard output budget. |
+| **I9** | **NEW** | **Medium** | Non-git memory can be stored in the right directory but record `project_path: "/"`. |
+| **I10** | **NEW** | **Medium** | Successful global fallback can be followed by local HEADER write failure that aborts later idle work. |
+| **I11** | **NEW** | **Medium** | `atomicWrite()` temp names use only PID; same-process writes to one artifact can collide. |
+| **I12** | **NEW** | **Medium** | `pruneOld()` may return an over-budget state that `writeMemory()` must reject. |
+| **I13** | **NEW** | **Medium** | Installer fetches mutable `main` artifacts independently without a release pin or integrity manifest. |
+| **G6** | Confirmed — impact overstated originally | **Medium** | Audit/health write failures are swallowed as best-effort diagnostics. |
+| **G7** | Confirmed — severity adjusted | **Medium** | Read/search/shell references are mislabeled as editing activity. |
+| **G8** | Confirmed — remediation corrected again | **Medium** | Last compaction is process-global; local-only `last_compaction.log` is insufficient for read-only projects. |
+| **N2** | Confirmed, coupled to C1 | **Medium** | Status reconstructs local STATE path and can report the wrong path/size. |
+| **N3** | Confirmed | **Medium** | Tool mocks can invent host fields and hide runtime contract bugs. |
+| **N4** | Confirmed | **Medium** | Committed/published `dist/` parity is not enforced after build. |
+| **N5** | Triage item | **Medium** | Dependency audit findings need package/exploitability analysis, not blind force upgrades. |
+| **H1** | Confirmed | **Low** | Nullable compaction setter mismatch; disappears when G8 removes module-global state. |
 | CI missing | **FALSE / STALE** | — | `.github/workflows/ci.yml` exists and passes. |
 
 ---
 
-## 1. Project context and architecture
+# 1. Architecture assessment
 
-TokenMaxxer is an OpenCode plugin providing two durable context layers:
+TokenMaxxer has two principal layers:
 
-- **Layer 1 — compaction quality:** replaces or augments the compaction prompt with a durable project-state block.
-- **Layer 2 — cross-session memory:** writes a per-project `STATE.json` on `session.idle`, exposes explicit recall/status tools, and optionally corroborates heuristic facts using an LLM.
+- **Compaction layer:** renders durable state and substitutes/augments OpenCode's compaction prompt.
+- **Memory layer:** extracts session facts at `session.idle`, writes per-project durable memory, optionally corroborates via an LLM, and exposes explicit recall/status tools.
 
-The overall architecture is sensible:
+The code is sensibly decomposed into `memory/`, `compaction/`, `tools/`, and small utility modules. The important weakness is that several modules individually implement only part of a larger invariant:
 
 ```text
-src/
-├── index.ts                    plugin wiring / hooks
-├── config.ts                   environment-driven options
-├── types.ts                    shared host/transcript types
-├── tui.tsx                     right-side activity indicator
-├── util/
-│   ├── fs.ts                   atomic read/write primitives
-│   ├── git.ts                  current SHA lookup
-│   └── log.ts                  bounded host logging
-├── compaction/
-│   ├── prompt.ts               compaction prompt
-│   └── durable.ts              durable-state renderer
-├── memory/
-│   ├── schema.ts               v3 durable schema
-│   ├── migrate.ts              v1 -> v2 -> v3 migration
-│   ├── store.ts                STATE.json storage/cache
-│   ├── writer.ts               idle extraction + merge + prune
-│   ├── extract-llm.ts          optional LLM extraction
-│   ├── extract-prompt.ts       canonical extraction input
-│   ├── extract-schema.ts       structured extraction schema
-│   ├── llm-adapter.ts          host client compatibility boundary
-│   ├── provider-inventory.ts   automatic model discovery
-│   ├── reader.ts               memory queries
-│   ├── lock.ts                 per-project serialization
-│   ├── activity-state.ts       TUI activity state
-│   └── memory-size.ts          byte accounting
-└── tools/
-    ├── recall.ts               recall/project-state/promotion tools
-    ├── efficiency.ts           preview_compaction + head_files
-    └── status.ts               tokenmaxxer_status
+storage location       -> store.ts
+process queue          -> lock.ts
+atomic replacement     -> util/fs.ts
+memory semantics       -> writer.ts
+promotion semantics    -> tools/recall.ts
+injection semantics    -> compaction/durable.ts
+host compatibility     -> tools + llm-adapter.ts
 ```
 
-### What is already strong
+Each piece looks reasonable in isolation, but correctness failures appear at their boundaries. The most important examples are:
 
-These parts should be preserved while fixing the defects below:
+- atomic writes without cross-process transaction isolation;
+- global fallback writes without global fallback reads;
+- human-reviewed provenance without a human-confirmation boundary;
+- foundational injection semantics without foundational retention semantics;
+- evidence-backed decisions without evidence-backed non-decision LLM facts;
+- cache identity derived partly from state that the cache-producing transaction itself mutates.
 
-- Atomic temp-file + rename persistence.
-- Corrupt-file backup and migration rather than blind overwrite.
-- 8 KB hard STATE.json storage invariant.
-- Explicit provenance and evidence digests rather than persisted source text.
-- Opt-in LLM extraction with heuristic persistence first.
-- One retry budget for structured LLM extraction.
-- Per-project queue serialization and tail-poisoning protection.
-- Strict runtime schema validation at persistence boundaries.
-- Localized host compatibility code in `llm-adapter.ts` instead of SDK casts spread throughout the memory layer.
-- Explicit pull tools instead of unconditional memory injection into the composer.
-- CI that runs tests, type checking, build verification, bundle self-containment checks, and installer syntax checks.
+## What should be preserved
 
-Two files remain oversized for comfortable maintenance:
+- Heuristic persistence before optional LLM work.
+- Structured-result-only LLM acceptance.
+- One bounded retry for LLM extraction.
+- Evidence references/digests rather than persisted source excerpts.
+- Atomic replacement rather than direct overwrite.
+- Corrupt-file backup.
+- Hard 8 KB write rejection as a final guard.
+- Per-project in-process serialization as a useful first layer.
+- Retained audit sessions and durable audit IDs.
+- Model health/cooldown behavior as optional metadata rather than a prerequisite for heuristic memory.
+- Explicit pull-based memory tools.
+- CI with tests, typecheck, build, bundle, and installer syntax checks.
+
+Two files remain too large for comfortable reasoning:
 
 | File | Approx. size | Recommendation |
 |---|---:|---|
-| `src/memory/writer.ts` | ~1,600 LoC | Split only after correctness fixes land. |
-| `src/memory/extract-llm.ts` | ~1,100 LoC | Split by model selection, request lifecycle, evidence/cache, and health after behavior is stable. |
+| `src/memory/writer.ts` | ~1,600 LoC | Refactor after transaction/merge invariants are fixed. |
+| `src/memory/extract-llm.ts` | ~1,100 LoC | Split after evidence/cache contracts stabilize. |
 
-This refactor is useful but should not compete with the correctness work below.
+Do not start with those refactors. The current behavior needs tests around its invariants first.
 
 ---
 
-## 2. Confirmed correctness findings
+# 2. Independent critical findings
 
-## 2.1 C1 — global fallback storage is not a complete read/write abstraction
+## 2.1 I1 — cross-process lost updates are possible
 
-**Severity:** Critical / High  
-**Files:** `src/memory/store.ts`, `src/tools/status.ts`
+**Severity: Critical**  
+**Files:** `src/memory/lock.ts`, `src/memory/store.ts`, `src/memory/writer.ts`, `src/tools/recall.ts`
 
-### Current behavior
+`lock.ts` explicitly says its serialization is **process-local**:
 
-`writeMemory()`:
+```ts
+const queues = new Map<string, ProjectQueueState>()
+```
 
-1. attempts `<project>/.opencode/memory/STATE.json`;
-2. if that write fails, writes `~/.config/opencode/memory/<project-hash>/STATE.json`;
-3. returns success if the global write succeeds.
+This protects two idle jobs inside one OpenCode process, but not two OpenCode processes using the same project.
 
-`readMemory()` only reads the project-local path.
+`STATE.json` writes are atomic replacements, but atomic replacement only guarantees that readers do not observe a half-written JSON file. It does **not** make this transaction atomic:
 
-Therefore a successful fallback write is currently not durable from the reader's perspective.
+```text
+read current state
+merge session A
+write full replacement state
+```
 
-### Additional stale-local scenario missed by the original assessment
+### Lost-update sequence
 
-The original proposed fix was:
+```text
+STATE = X
 
-> use global only when the project-local file does not exist; if both exist, project-local wins.
+Process A reads X
+Process B reads X
 
-That is insufficient.
+A merges session A -> XA
+B merges session B -> XB
 
-Example:
+A atomically writes XA
+B atomically writes XB
 
-1. Local STATE exists at T1.
-2. The worktree later becomes read-only.
-3. A new idle transaction successfully writes global STATE at T2.
-4. Local T1 and global T2 now both exist.
-5. A reader that always prefers local will return stale T1 forever.
+Final STATE = XB
+Session A's update is silently lost.
+```
 
-The storage layer therefore needs **candidate resolution**, not merely a one-way fallback.
+The mtime cache does not solve this. It can tell the next read that the file changed, but both processes have already made decisions from stale snapshots.
+
+This also affects read/modify/write tools such as `recall_promote`.
+
+### Why this is Critical
+
+Durable cross-session memory is the product's core purpose. Silent loss of a valid committed update is therefore a core correctness failure, even though the JSON file remains syntactically valid.
+
+The repository already contains explicit multi-instance cache invalidation logic, so multiple processes/instances are not an unreasonable edge case.
 
 ### Recommended design
 
-Introduce a single internal resolver that is used by both memory reads and diagnostics:
+Add a **cross-process project transaction lock** for read/modify/write operations.
+
+The lock location should not depend on the worktree being writable. A safe place is the same project-hashed user-level storage namespace used for fallback memory.
+
+Do not hold a filesystem lock across a two-minute LLM request. Use short durable transactions:
+
+```text
+A. acquire project lock
+   read newest state
+   merge/write heuristic state
+   release lock
+
+B. perform LLM request outside lock
+
+C. acquire project lock
+   re-read newest state
+   merge LLM/cache/audit/health outcome
+   write
+   release lock
+```
+
+`recall_promote` and any other state mutation must use the same transaction primitive.
+
+Implementation options include a well-maintained lockfile primitive or atomic lock-directory creation with owner/timestamp/stale-lock recovery. Avoid a naive “create a file and hope” lock without crash recovery.
+
+### Required tests
+
+Use child processes, not two promises in one Vitest process:
+
+1. Two processes update different source sessions concurrently; both facts survive.
+2. One process promotes while another idle writer commits; both changes survive.
+3. A process dies while holding a lock; stale recovery works without deleting a live lock.
+4. Different projects do not block one another.
+5. Global-fallback projects use the same transaction key as local storage.
+
+The existing same-process queue tests are useful but do not prove this invariant.
+
+---
+
+## 2.2 C1 + I8 — storage needs a real state-location and read-error model
+
+**Severity: Critical / High**  
+**Files:** `src/memory/store.ts`, `src/util/fs.ts`, `src/tools/status.ts`
+
+### C1: successful global writes are not readable today
+
+`writeMemory()` tries:
+
+1. `<project>/.opencode/memory/STATE.json`
+2. user-level global fallback if local write fails
+
+`readMemory()` only reads the first path.
+
+A successful fallback write therefore does not satisfy the durable-read contract.
+
+### A simple “global only when local missing” fix is still wrong
+
+Suppose:
+
+```text
+local STATE T1 exists
+project becomes read-only
+global STATE T2 is successfully written
+T2 > T1
+```
+
+Both files now exist. If local always wins, the reader permanently returns stale T1.
+
+The store needs a candidate resolver that can compare both locations and choose the current state.
+
+### I8: “unreadable” is currently indistinguishable from “missing”
+
+`safeRead()` does this:
 
 ```ts
-interface MemoryLocationCandidate {
+try {
+  return await readFile(path, "utf-8")
+} catch {
+  return null
+}
+```
+
+`readMemory()` interprets `null` as “there is no memory.”
+
+That means `EACCES`, `EIO`, transient filesystem errors, and `ENOENT` all become the same state.
+
+Potential failure:
+
+```text
+STATE exists but is temporarily unreadable
+readMemory() -> null
+idle writer creates emptyMemory(...)
+writer later obtains write access
+new full-state replacement overwrites the old STATE
+```
+
+The null cache can also remain valid if permissions are repaired without changing the file's mtime.
+
+### Recommended storage API
+
+Use typed filesystem results:
+
+```ts
+type FileReadResult =
+  | { kind: "ok"; content: string; mtime: number }
+  | { kind: "missing" }
+  | { kind: "error"; code?: string }
+```
+
+Only `ENOENT` should mean missing.
+
+A storage read error should produce “memory unavailable” and must **not authorize initialization from empty state**.
+
+Then resolve both local/global candidates:
+
+```ts
+type MemoryCandidate = {
   kind: "project" | "global"
   path: string
-  mtime: number | null
-}
-
-interface ResolvedMemoryLocation {
-  selected: MemoryLocationCandidate | null
-  project: MemoryLocationCandidate
-  global: MemoryLocationCandidate
+  status: "present" | "missing" | "error"
+  mtime?: number
 }
 ```
 
-Resolution policy:
+Suggested policy:
 
-1. Stat both candidates.
-2. If neither exists: no memory.
-3. If exactly one exists: use it.
-4. If both exist: use the candidate with the newer file mtime.
-5. On an exact mtime tie: prefer project-local deterministically.
-6. Parse/migrate the selected candidate as today.
+1. Explicitly inspect both candidates.
+2. If one valid present candidate exists, use it unless the other candidate has an unresolved error that makes freshness unknowable and policy requires fail-closed behavior.
+3. If both valid candidates exist, choose newer mtime; deterministic local tie-break.
+4. Never cache permission/I/O failure as “no memory.”
+5. Keep selected source/path/size metadata with the read result.
 
-The cache must include enough identity to notice when the other candidate becomes newer. Caching only `{ selectedPath, selectedMtime }` is not sufficient if the selected local file is unchanged but a newer global file appears.
+Longer term, a monotonic `revision` inside memory is stronger than mtime ordering and would also help cross-process compare-and-swap logic.
 
-For example:
+### N2: status must consume the resolved source
 
-```ts
-interface MemoryCacheEntry {
-  mem: MemoryFile | null
-  selectedPath: string | null
-  projectMtime: number | null
-  globalMtime: number | null
-}
-```
+`tokenmaxxer_status` currently reconstructs the local path independently and reads it again for byte size. That can display the right logical memory with the wrong file path/size after C1 is fixed.
 
-A cache hit is valid only when both current candidate mtimes still match the cached pair.
-
-### Status coupling — N2
-
-`tokenmaxxer_status` currently reconstructs:
-
-```text
-<project>/.opencode/memory/STATE.json
-```
-
-and `safeRead()`s it separately for byte size.
-
-After C1 is fixed, status would still report the wrong path/size whenever the selected state lives globally.
-
-Do not make status rediscover storage rules. Expose metadata from the store, for example:
-
-```ts
-interface MemoryReadResult {
-  memory: MemoryFile | null
-  source: "project" | "global" | null
-  path: string | null
-  sizeBytes: number
-}
-```
-
-`readMemory()` can remain as a compatibility wrapper if desired, while a richer internal `readMemoryState()` feeds status.
+Expose one rich store read result and make diagnostics use it.
 
 ### Required tests
 
-Add real-fs tests using temporary directories:
-
-1. Global-only state is readable.
-2. Local-only state is readable.
-3. If both exist and global is newer, global wins.
-4. If both exist and local is newer, local wins.
-5. Equal mtimes deterministically prefer local.
-6. Cache invalidates when global appears after a cached local read.
-7. Cache invalidates when local becomes newer than previously selected global.
-8. Corrupt global candidate is backed up when it is selected.
-9. `tokenmaxxer_status` reports the selected path and selected file size.
-10. Simulated local write failure -> global write success -> next read returns the new state.
-
-Do **not** encode "project always wins when both exist" as a test; that is the stale-state bug described above.
+- local only
+- global only
+- local newer
+- global newer
+- equal timestamps
+- local unreadable + global valid
+- local unreadable + no global: fail closed, do not initialize empty
+- permission restored without mtime change
+- selected source changes after cache fill
+- status path/size match selected source
+- global write -> subsequent read round trip
 
 ---
 
-## 2.2 C2 — idle failures are semantically collapsed into `heuristic-only`
+## 2.3 I2 — decision merge can violate the “one current decision per topic” invariant
 
-**Severity:** High  
+**Severity: High**  
 **File:** `src/memory/writer.ts`
 
-`writeMemoryOnIdleSerialized()` has a broad outer catch that returns `"heuristic-only"`.
-
-This collapses two materially different outcomes:
-
-```text
-Heuristic memory persisted; LLM intentionally disabled/unavailable
-    -> heuristic-only
-
-Unexpected throw before heuristic memory was persisted
-    -> heuristic-only   (incorrect)
-```
-
-The original assessment correctly found this but rated it Critical. High is a better fit: it hides a failed transaction and breaks observability, but does not by itself overwrite or corrupt existing durable state.
-
-### Recommended outcome semantics
-
-Retain the current outcome vocabulary but make stages explicit:
-
-```text
-no transcript / missing endpoint        -> no-messages
-heuristic write returned false          -> write-failed
-unexpected throw before heuristic write -> error
-LLM deliberately disabled/unavailable   -> heuristic-only
-valid LLM cache reused                   -> cache-hit
-LLM completed successfully              -> llm-success
-LLM attempted and failed/threw           -> llm-failed
-project queue failed                     -> queue-failed
-```
-
-Track whether heuristic persistence completed:
+The decision merge builds this map:
 
 ```ts
-let heuristicPersisted = false
+const existingTopicMap = new Map<string, number>()
+for (let i = 0; i < existingDecisions.length; i++) {
+  existingTopicMap.set(normalizedFact(existingDecisions[i].topic), i)
+}
 ```
 
-and log bounded error metadata in the catch.
+Only one index survives for each topic: the **last** matching decision.
 
-Do not automatically map every post-persistence exception to `heuristic-only`. If LLM work was actually attempted and then threw, `llm-failed` is the more truthful outcome while preserving the guarantee that heuristic memory is durable.
+The LLM corroboration path can intentionally keep the original heuristic decision valid while appending another valid, equivalent LLM decision.
+
+That creates the following sequence:
+
+```text
+1. Heuristic:
+   database = Postgres        H1 valid
+
+2. LLM agrees:
+   database = Postgres        H1 valid
+   database = Postgres        L1 valid
+
+3. Later heuristic changes decision:
+   database = MySQL
+```
+
+On step 3, the topic map points at L1. L1 is invalidated and the MySQL decision is appended, but H1 can remain valid.
+
+Result:
+
+```text
+Postgres H1   valid   <-- stale
+Postgres L1   invalid
+MySQL H2      valid   <-- current
+```
+
+Recall and compaction can now see two conflicting “valid” decisions for the same exact normalized topic.
+
+### Recommended invariant
+
+Make this explicit and testable:
+
+> For a canonical normalized topic, at most one authoritative decision may have `still_valid=true`.
+
+Corroboration should not need a second authoritative decision row.
+
+Preferred design:
+
+- preserve the existing authoritative decision ID;
+- attach corroboration/audit provenance to it or a separate observation history;
+- on actual supersession, invalidate **all** prior valid rows for that normalized topic before making the replacement authoritative.
+
+If preserving multiple historical observations is valuable, separate “observation/audit record” from “current decision authority.” Do not overload `still_valid` for both.
 
 ### Required tests
 
-- `session.messages` throws before persistence -> `error`.
-- extraction/merge throws before persistence -> `error`.
-- `writeMemory` returns false -> `write-failed`.
-- LLM disabled -> `heuristic-only`.
-- LLM unavailable without an attempted request -> `heuristic-only`.
-- LLM request path throws after heuristic persistence -> `llm-failed`.
-- status/queue records the exact final outcome.
-- error logs include session ID + whether heuristic persistence completed, but not transcript content.
+1. Heuristic X + agreeing LLM -> one valid authoritative decision.
+2. Heuristic X + agreeing LLM + later heuristic Y -> only Y valid.
+3. Preexisting duplicate-valid rows are normalized deterministically on next merge/migration.
+4. Human foundational status is not lost during corroboration.
+5. Recall with an exact topic does not return contradictory simultaneously-valid rows.
 
 ---
 
-## 2.3 G3 — `head_files` depends on a nonexistent `ToolContext.client`
+## 2.4 I3 — `recall_promote` can promote the wrong historical decision
 
-**Severity:** High  
-**Files:** `src/tools/efficiency.ts`, `src/index.ts`
+**Severity: High**  
+**File:** `src/tools/recall.ts`
 
-### Diagnosis
-
-The inner helper expects:
+Promotion currently selects:
 
 ```ts
-context.client.file.read(...)
+const d = mem.decisions.find(
+  (d) => d.topic.toLowerCase() === args.topic.toLowerCase(),
+)
 ```
 
-and the tool wrapper creates that property with:
+It does not require `still_valid`.
 
-```ts
-client: (context as any).client
-```
+Because historical superseded decisions are intentionally retained, the first matching topic can be an old invalid decision.
 
-The cast suppresses the TypeScript error, but `client` is not part of the plugin `ToolContext` contract.
-
-Current OpenCode custom-tool registration explicitly constructs tool context from the runtime tool context and adds `directory` and `worktree`; it does not inject the plugin SDK client. The plugin initialization object, however, does contain `client`.
-
-Relevant upstream references:
-
-- Current custom tool bridge: `https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/registry.ts`
-- Plugin initialization context: `https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/plugin/index.ts`
-
-### Reject the original raw-fs fix
-
-The original assessment proposed replacing `client.file.read()` with direct `node:fs/promises.readFile()` and even accepting absolute paths.
-
-Do **not** make that change unless there is a deliberate security/design decision to create an independent filesystem access layer.
-
-Reasons:
-
-- It duplicates host file-access behavior.
-- It introduces separate path traversal / external-directory / symlink decisions.
-- It changes binary/error behavior.
-- It creates a second model-callable path to local files outside the OpenCode client boundary.
-- It expands the amount of code TokenMaxxer must secure and maintain.
+The tool then sets that stale row `foundational=true` and reports success. The durable block later filters invalid decisions, so the user/model can be told a decision was promoted even though it will not be automatically retained in compaction context.
 
 ### Recommended fix
 
-Close over the legitimate plugin client:
+Promotion should use a stable decision identifier, not topic text.
 
-```ts
-export function registerEfficiencyTools(client: unknown) {
-  return {
-    tool: {
-      head_files: tool({
-        // ...
-        async execute(args, context) {
-          return _headFiles(args, {
-            worktree: context.worktree,
-            directory: context.directory,
-            client,
-          })
-        },
-      }),
-    },
-  }
-}
+Preferred tool contract:
+
+```text
+recall_decision -> exposes decision ID with each result
+recall_promote({ decision_id })
 ```
 
-and in `src/index.ts`:
+At minimum, a topic-based compatibility path must:
 
-```ts
-...registerEfficiencyTools(client)
-```
+- filter `still_valid=true`;
+- reject ambiguity if multiple valid rows exist;
+- select the newest canonical row only when unambiguous.
 
-Keep `_headFiles()` using the host client file endpoint.
-
-Also remove every `(context as any).client` cast from tool wrappers.
+Fix I2 before relying on topic uniqueness.
 
 ### Required tests
 
-1. Register the actual tool wrapper with a client supplied through the registration closure.
-2. Construct execution context using only the real `ToolContext` fields required by the installed plugin version.
-3. Assert `head_files` succeeds without a `context.client` property.
-4. Assert `preview_compaction` receives the closed-over plugin client for logging.
-5. Add bounds for `paths` and `lines` at the tool schema boundary.
-
-This should be a **host-contract test**, not another mock that invents fields the runtime does not provide.
+- invalid old + valid new same topic -> valid new is selected
+- multiple valid same topic -> promotion refuses ambiguity
+- invalid ID -> no write
+- promoted ID is the ID shown by recall
 
 ---
 
-## 2.4 G4 — durable compaction output lacks an explicit budget
+## 2.5 I4 — `human-reviewed` provenance is currently model-forgeable
 
-**Severity:** High  
-**Files:** `src/compaction/durable.ts`, `src/memory/schema.ts`, `src/memory/writer.ts`
+**Severity: High**  
+**Files:** `src/tools/recall.ts`, `docs/reliability-plan.md`
 
-The original assessment described the durable block as "partially unbounded." That is directionally correct but imprecise.
+`recall_promote` is a normal model-callable custom tool. Calling it directly performs:
 
-STATE.json has an 8 KB hard storage limit and `pruneOld()` progressively reduces durable data when that limit is exceeded. Therefore the durable block is not mathematically unbounded by disk state.
+```ts
+d.foundational = true
+d.provenance = {
+  ...,
+  extractor: "human",
+  confidence: "human-reviewed",
+}
+```
 
-The real problem is:
+There is no explicit human-confirmation step in that function.
 
-> **The compaction block has no explicit output budget of its own and relies indirectly on the storage budget.**
+This conflicts with the reliability plan, which states that promotion is a human review path requiring explicit confirmation.
 
-That is weaker than the project's stated goal of controlling context consumption.
+A model choosing to call a tool is **not evidence that a human reviewed the fact**.
+
+### Why this matters
+
+The provenance layer is one of the strongest parts of TokenMaxxer. `confidence: "human-reviewed"` should be the strongest trust label. If a model can mint that label autonomously, every downstream distinction between heuristic, LLM-corroborated, and human-reviewed becomes weaker.
 
 ### Recommended design
 
-Define an injected-context budget directly in the compaction layer:
+A model-callable action may **request** promotion but should not itself assert human review.
 
-```ts
-export const DURABLE_BLOCK_MAX_BYTES = ...
+Possible design:
+
+```text
+model tool call -> foundational_requested = true
+explicit user confirmation -> foundational = true + human-reviewed provenance
 ```
 
-or a conservative character/token proxy if byte count is not the desired metric.
+Current OpenCode custom `ToolContext` includes an `ask` capability in the current host bridge, so a host-mediated confirmation path may be possible. Verify the exact supported permission/question semantics for the pinned minimum host before coupling the design to it.
 
-Render by priority until the budget is exhausted:
+Upstream references:
 
-1. Project identity / last update.
-2. Current task.
-3. Blockers.
-4. Next steps.
-5. Active files.
-6. Foundational decisions.
-7. Recently referenced decisions.
-8. Older fallback decisions.
+- `https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/registry.ts`
+- `https://github.com/anomalyco/opencode/issues/10477`
 
-Use per-section caps as defense in depth, not as the primary definition of "bounded."
+If an in-tool confirmation cannot reliably distinguish explicit user approval, use a separate human-only CLI/config/manual editing workflow instead.
+
+### Required tests
+
+- model invocation without affirmative confirmation cannot set `human-reviewed`
+- rejection leaves the decision unchanged
+- explicit confirmation records human provenance
+- promotion request remains visible until resolved
+
+---
+
+## 2.6 I5 — foundational decisions are not actually “never forgotten”
+
+**Severity: High**  
+**Files:** `src/memory/writer.ts`, `src/compaction/durable.ts`, `README.md`
+
+The tool description/README describes foundational decisions as architecture-level state that should not be forgotten and is always included in compaction.
+
+`buildDurableBlock()` does prioritize all valid foundational decisions that still exist.
+
+But `pruneOld()` can delete them:
+
+1. all decisions older than 30 days are removed without checking `foundational`;
+2. later only the 10 most recent decisions are retained;
+3. last resort retains only the 5 most recent decisions;
+4. none of those stages prefer human-reviewed foundational decisions.
+
+A human can therefore explicitly promote a decision, then lose it simply because the state file is under pressure and the decision is old.
+
+### Correct separation of budgets
+
+There are two different policies:
+
+- **retention:** what remains durable/recallable;
+- **injection:** what is automatically placed into compaction context.
+
+Do not solve compaction bloat by deleting durable foundational memory prematurely.
+
+Recommended retention order under pressure:
+
+1. disposable audit/cache/health metadata
+2. invalid decisions
+3. stale non-foundational active state
+4. old non-foundational decisions
+5. verbose rationale/reason text
+6. non-foundational recent decisions beyond retention target
+7. human-reviewed foundational decisions **last**
+
+If foundational data itself can exceed the 8 KB file, define an explicit overflow/archive strategy or a documented final degradation policy. Silent age-based deletion is not consistent with “never forgotten.”
+
+### Required tests
+
+- 31-day foundational survives when non-foundational data can be pruned instead
+- 10/5 last-resort stages retain foundational first
+- human-reviewed foundational remains recallable after high-pressure prune
+- compaction injection can remain bounded without deleting non-injected foundational records
+
+---
+
+## 2.7 I6 — LLM evidence enforcement is incomplete for durable non-decision facts
+
+**Severity: High**  
+**Files:** `src/memory/extract-schema.ts`, `src/memory/extract-llm.ts`, `src/memory/writer.ts`, `docs/reliability-plan.md`
+
+The reliability plan says, in substance:
+
+> add provenance on every accepted extracted fact; LLM facts require a source audit session and at least one evidence reference.
+
+The current runtime contract enforces `evidence_refs` on **decisions**.
+
+It does not require equivalent fact-specific evidence for:
+
+- `current_task`
+- `active_files`
+- `blockers`
+- `next_steps`
+
+`corroborateLLMFacts()` iterates the decisions array. If there are no decisions, it returns the other structured facts without evidence corroboration.
+
+### Provenance mismatch
+
+`mergeMemory()` can assign an LLM current task or active file a provenance object based on a generic `firstCandidateEvidence(...)` fallback.
+
+That candidate is not necessarily evidence for the fact being labeled.
+
+Blockers and next steps are overwritten from `extracted.blockers` / `extracted.next_steps` and do not have field-level provenance at all.
+
+Therefore an LLM can plausibly produce:
+
+```text
+active file that was never touched
+blocker not stated in the session
+next step not stated in the session
+current task inferred incorrectly
+```
+
+and those values can become durable even though the project describes the LLM layer as evidence-backed.
+
+### Recommended design
+
+Choose one of two explicit contracts:
+
+**Option A — evidence-backed every durable LLM fact**
+
+- current task carries evidence refs
+- each active file carries evidence refs and path must match a tool-derived file candidate
+- each blocker carries evidence refs
+- each next step carries evidence refs
+- validate each fact against the exact referenced source candidate before merge
+- persist provenance for every durable field
+
+**Option B — only decisions may be LLM-durable**
+
+- keep current task/files/blockers/next steps heuristic-authoritative
+- ignore LLM updates for those fields
+- use LLM solely to corroborate/augment decisions
+
+Either is stronger than the current hybrid state.
+
+Do not label a fact `llm-corroborated` using arbitrary first-candidate evidence.
+
+### Required tests
+
+- hallucinated active file not in source/tool candidates is rejected
+- blocker unsupported by cited transcript is rejected
+- next step unsupported by cited transcript is rejected
+- current task unsupported by cited transcript is rejected
+- every persisted `llm-corroborated` fact can identify the evidence actually used to validate that fact
+
+---
+
+## 2.8 I7 — cache identity can change because the same source session wrote memory
+
+**Severity: High for opt-in LLM reliability**  
+**Files:** `src/memory/writer.ts`, `src/memory/extract-prompt.ts`, `src/memory/extract-llm.ts`
+
+The cache key is conceptually:
+
+```text
+source session ID
++ canonical input hash
++ provider/model
+```
+
+That is good in principle.
+
+The problem is that the canonical input includes a capped prior STATE snapshot, and that prior state includes durable fields the same source-session transaction modifies:
+
+- last_updated
+- last_session_id
+- recent_sessions
+- current task
+- decisions
+- active files
+- blockers
+- next steps
+
+The first successful processing of source session S therefore changes the input used to calculate S's next cache key.
+
+### Sequence
+
+```text
+Run 1:
+  prior state = X
+  key = hash(S + X)
+  heuristic/LLM writes X+S
+  cache row stored under hash(S + X)
+
+Run 2, same source transcript:
+  prior state = X+S
+  key = hash(S + X+S)
+  prior cache row does not match
+```
+
+The process-local in-flight map handles simultaneous duplicate calls, but it does not prove sequential/reload idempotency.
+
+The existing cache-hit test pre-seeds a cache against an unchanged prior snapshot; it does not execute a real successful idle transaction twice and prove the second run produces no prompt.
+
+This conflicts with the reliability plan's intended repeated-source idempotency behavior.
+
+### Recommended identity
+
+Base source idempotency on **immutable source inputs**, not state mutated by processing that source.
+
+One practical design:
+
+```text
+source_session_id
+source_transcript/tool-input digest
+provider/model
+extractor contract/schema version
+```
+
+Persist a bounded `processed_sources`/extraction record mapping source ID + source digest + model to completion/cache identity.
+
+If prior project context is required to improve extraction, it can remain prompt input without being part of the “has this exact source already been processed?” identity, or the pre-source revision can be recorded once and reused for duplicate events.
+
+### Required test that is currently missing
+
+1. Run `writeMemoryOnIdle` and reach `llm-success`.
+2. Let it fully finish.
+3. Run the same source session/transcript again.
+4. Assert no second `session.create` and no second prompt.
+5. Simulate process reload and repeat; still no prompt.
+6. Append a new message to the source transcript; a new extraction is allowed.
+
+---
+
+# 3. Previously identified findings — validated and refined
+
+## 3.1 C2 — idle outcomes are not stage-accurate
+
+**Severity: High**
+
+The outer `writeMemoryOnIdleSerialized()` catch returns `heuristic-only` regardless of whether heuristic persistence happened.
+
+Recommended semantics:
+
+```text
+no transcript / missing message endpoint -> no-messages
+heuristic write returned false           -> write-failed
+unexpected pre-persist exception         -> error
+LLM intentionally disabled/unavailable   -> heuristic-only
+cache reused                              -> cache-hit
+LLM success                              -> llm-success
+LLM attempted and failed                 -> llm-failed
+queue failure                            -> queue-failed
+```
+
+Track transaction stage explicitly. Do not map an actual LLM attempt failure to `heuristic-only` merely because heuristics survived.
+
+This becomes especially important after I10, because derivative HEADER failure currently falls into the same catch and produces a misleading result.
+
+---
+
+## 3.2 G3 — `head_files` uses a client that ToolContext does not provide
+
+**Severity: High**
+
+The diagnosis remains correct.
+
+Current OpenCode's plugin bridge constructs custom tool context with the runtime fields plus `ask`, `directory`, and `worktree`; it does not attach the initialization SDK client.
+
+Upstream current source:
+
+`https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/registry.ts`
+
+Historical 1.0.x context gap:
+
+`https://github.com/anomalyco/opencode/issues/10477`
+
+### Correct fix
+
+Capture the legitimate initialization `client`:
+
+```ts
+registerEfficiencyTools(client)
+```
+
+and close over it inside the registered tool.
+
+Keep `head_files` on the host client file API rather than replacing it with unrestricted raw `fs.readFile`.
+
+Current OpenCode built-in read handling includes project/external-directory and permission semantics. A TokenMaxxer raw-fs implementation would create another model-callable file access path with different policy.
+
+Upstream read implementation:
+
+`https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/read.ts`
+
+---
+
+## 3.3 G4 — compaction durable block needs its own explicit output budget
+
+**Severity: High**
+
+STATE.json is hard-limited to 8 KB, so the durable block is indirectly bounded by stored state. That is not the same as explicitly budgeting injected context.
+
+Add a total rendered budget and render sections in priority order.
+
+Recommended priority:
+
+1. project/last update
+2. current task
+3. blockers
+4. next steps
+5. active files
+6. foundational decisions
+7. recently referenced decisions
+8. older fallback decisions
+
+Per-section caps are defense in depth; the final total budget is the contract.
+
+Do not delete foundational storage just because only a subset can be injected. See I5.
+
+---
+
+## 3.4 G5 — recall usage over-marks all decisions
+
+**Severity: High**
+
+`markReferencedDecisions()` currently checks only whether any `recall_decision` tool part exists, then marks all valid decisions used in the session.
+
+Do not parse human-readable tool output with a regex.
+
+Transcript tool parts already preserve structured input. Re-run the canonical `queryDecisions(mem, query, limit)` against the appropriate pre-merge snapshot and mark the returned IDs.
+
+After I2, decision authority should make this selection more deterministic.
+
+---
+
+## 3.5 G6 — audit/health persistence return values are ignored
+
+**Severity: Medium**
+
+`persistTerminal` and `onHealthOutcome` discard the boolean result of `writeMemory()`.
+
+Log bounded warnings for false persistence, but keep these callbacks best-effort so metadata failures do not destroy heuristic fallback.
+
+The original “every reload burns tokens forever” characterization was too strong; retained audit IDs and stale-pending handling reduce that risk.
+
+---
+
+## 3.6 G7 — active-file reason conflates operation categories
+
+**Severity: Medium**
+
+Read/edit/write/glob/grep/bash-derived paths all feed one counter; multiple references render as “edited N times.”
+
+Track at least:
+
+```ts
+reads
+edits
+writes
+searches
+shellRefs
+```
+
+Do not assume `bash` means read. A shell command can read, modify, rename, delete, or simply mention a path.
+
+---
+
+## 3.7 G8 — last compaction state is process-global; local log alone is not a complete fix
+
+**Severity: Medium**
+
+The module-global `lastCompactionTimestamp` is wrong for multi-project processes and disappears on reload.
+
+The previous revision recommended using the existing project-local `last_compaction.log` as the sole source. The independent pass found that recommendation is incomplete.
+
+The exact projects that require global STATE fallback can also fail the local `last_compaction.log` write because `index.ts` writes it only under the project `.opencode/memory` directory and swallows failure.
+
+### Revised fix
+
+Remove module-global timestamp state and create a **per-project diagnostic artifact resolver** with the same local/global storage policy as the memory store.
 
 For example:
 
 ```text
-current task: bounded length
-blocker item: bounded length + bounded count
-next step item: bounded length + bounded count
-active files: existing count cap
-foundational injected: bounded count
-recent injected: bounded count
-older injected: existing top-N behavior
-final rendered block: hard total budget
+project .opencode/memory/last_compaction.log
+or
+~/.config/opencode/memory/<project-hash>/last_compaction.log
 ```
 
-### Do not delete durable foundational decisions solely because injection is capped
+Read the current/newest candidate with the same location rules used by status.
 
-The original proposal adds pruning that would discard foundational decisions once more than 20 exist.
-
-That conflates two independent budgets:
-
-- **what remains durable and recallable**;
-- **what is automatically injected at compaction**.
-
-Prefer limiting the number automatically rendered while retaining older foundational decisions for explicit recall until the existing STATE.json byte budget actually requires pruning.
-
-### Migration
-
-If schema-level item limits are added, migration should truncate legacy over-limit fields rather than reject the whole file and trigger corrupt recovery.
-
-Any normalization should be deterministic and tested.
-
-### Required tests
-
-- The final rendered durable block never exceeds its declared output budget.
-- High-priority sections survive before lower-priority sections.
-- Large blockers/next steps cannot monopolize the block.
-- Hundreds of foundational decisions do not create hundreds of injected lines.
-- Non-injected foundational decisions remain in STATE.json and are recallable.
-- Migration safely normalizes legacy over-limit values without resetting the memory file.
+This avoids an extra STATE.json write during compaction while still supporting read-only worktrees.
 
 ---
 
-## 2.5 G5 — recall marks all decisions as recently referenced
+# 4. Additional independent medium findings
 
-**Severity:** High  
-**Files:** `src/memory/writer.ts`, `src/memory/reader.ts`
+## 4.1 I9 — non-git projects record the wrong project identity
 
-Current behavior:
+**Severity: Medium**
 
-```text
-if any transcript part is tool=recall_decision
-    mark every still-valid decision.last_used_in_session = current session
-```
+`resolveProjectPath("/", directory)` correctly returns `directory` for non-git sessions.
 
-That destroys the signal used by the durable block to distinguish decisions actually reused in a recent session from unrelated older decisions.
-
-### Reject the original output-regex parser
-
-The original proposal parses the formatted model-visible output:
-
-```text
-topic: decision (SHA ..., timestamp)
-```
-
-with a regex and then matches `(topic, timestamp)`.
-
-That is unnecessarily brittle because transcript tool parts already retain structured `state.input`, and `recall_decision` already uses the canonical `queryDecisions(mem, query, limit)` helper.
-
-### Recommended fix
-
-For each completed `recall_decision` transcript part:
-
-1. Read `part.state.input.query` and `part.state.input.limit`.
-2. Re-run `queryDecisions()` against the same pre-merge memory snapshot.
-3. Collect the returned decision IDs.
-4. Mark only those IDs as `last_used_in_session = sessionId`.
-5. Return a new memory/decision array rather than mutating unrelated decisions in place.
-
-Sketch:
+But the idle writer initializes absent state with:
 
 ```ts
-function recalledDecisionIds(
-  mem: MemoryFile,
-  messages: TranscriptMessage[],
-): Set<string> {
-  const ids = new Set<string>()
-
-  for (const msg of messages) {
-    for (const part of msg.parts) {
-      if (part.type !== "tool" || part.tool !== "recall_decision") continue
-      if (part.state?.status && part.state.status !== "completed") continue
-
-      const input = part.state?.input ?? {}
-      const query = typeof input.query === "string" ? input.query : undefined
-      const limit = typeof input.limit === "number" ? input.limit : 10
-
-      for (const decision of queryDecisions(mem, query, limit)) {
-        ids.add(decision.id)
-      }
-    }
-  }
-
-  return ids
-}
+emptyMemory(worktree)
 ```
 
-This keeps recall semantics tied to the actual selection implementation instead of a presentation format.
+and `mergeAsyncFacts` does the same.
 
-### Caveat
+When OpenCode reports `worktree: "/"`, the STATE file is stored under the correct session directory while the state records:
 
-Re-running the query assumes the memory snapshot at idle is equivalent to the memory used when recall executed. In the current serialized project flow this is a better and more deterministic contract than parsing formatted output. If exact historical result identity becomes necessary, add structured non-display metadata to the tool result rather than coupling to human-readable text.
+```json
+"project_path": "/"
+```
 
-### Required tests
+`mergeMemory()` preserves that project path, so status, recall, compaction context, and HEADER can continue identifying the project as `/`.
 
-- One recall returning 2 of 5 decisions marks exactly those 2.
-- Multiple recalls union their selected IDs.
-- Failed/incomplete recall tool parts mark none.
-- Same topic with different decision IDs does not over-mark.
-- Output formatting can change without breaking marking.
-- Decisions not selected retain object/value identity where practical.
+Fix by computing the resolved project once and consistently using it for empty-memory initialization and project identity.
+
+Test at least two different non-git directories with `worktree="/"` to prove they retain distinct identities.
 
 ---
 
-## 3. Confirmed medium/low findings
+## 4.2 I10 — derivative HEADER write can turn successful fallback persistence into an apparent failure
 
-## 3.1 G6 — audit and health persistence failures are not surfaced
+**Severity: Medium**
 
-**Revised severity:** Medium
-
-`persistTerminal` and `onHealthOutcome` await `writeMemory()` but ignore its boolean return.
-
-This is worth diagnosing, but the original impact statement is too strong. These are intentionally best-effort operational metadata paths, and extraction callbacks are designed not to poison heuristic fallback.
-
-Add warning diagnostics when persistence returns `false`, but do not describe a warning log itself as full recovery.
-
-Also correct the original statement that a pending audit necessarily causes "every reload" to re-enter and burn tokens. Persisted audit IDs are used to suppress processing retained extraction sessions, and stale pending audits are reclassified during pruning.
-
-Recommended behavior:
-
-```text
-persist false -> bounded warn log
-persist true  -> no warning
-extraction result semantics unchanged
-```
-
-A more advanced retry/escalation policy can be considered later if real-world failures justify it.
-
----
-
-## 3.2 G7 — active-file reason mislabels reads as edits
-
-**Revised severity:** Medium
-
-`extractActiveFiles()` combines `read`, `edit`, `write`, `glob`, `grep`, and shell-derived paths into one count and renders counts >1 as `edited N times`.
-
-This is incorrect user/model-facing state.
-
-Track operation categories separately. Prefer at least:
+After heuristic `writeMemory()` succeeds, the writer immediately calls:
 
 ```ts
-type FileActivity = {
-  reads: number
-  edits: number
-  writes: number
-  searches: number
-  shellRefs: number
-}
+await generateHeader(...)
 ```
 
-Suggested rendering:
+`generateHeader()` writes only to the local project `.opencode/memory/HEADER.md` and does not catch its own filesystem failure.
+
+In the read-only worktree case:
 
 ```text
-edited 2x, written 1x, read 3x, searched 4x, shell-referenced 1x
+local STATE write fails
+global STATE write succeeds
+generateHeader local write fails
+outer writer catch fires
+LLM flow is skipped / outcome becomes misleading
 ```
 
-Do not classify all `bash` references as reads. A shell reference may represent a read, write, rename, delete, build input, or simply a textual path argument. Label it as a shell reference unless command semantics are deliberately parsed.
+`mergeAsyncFacts` has the same derivative-header behavior after a successful memory write.
+
+HEADER generation must be best-effort and must not change whether the primary memory transaction succeeded.
+
+A broader artifact-storage policy can decide whether HEADER should have a global counterpart or remain local-only.
 
 ---
 
-## 3.3 H1 — `setLastCompaction` type/reset mismatch
+## 4.3 I11 — `atomicWrite` temp file names are not unique per invocation
 
-**Revised severity:** Low
+**Severity: Medium**  
+**File:** `src/util/fs.ts`
 
-The module state is `string | null` while `setLastCompaction` accepts only `string`, forcing an awkward test cast.
+Current temp path:
 
-If G8 is implemented as recommended below, remove this process-global state entirely and H1 disappears with it. Do not ship a standalone PR for this unless G8 is deferred.
+```ts
+const tmp = `${path}.tmp.${process.pid}`
+```
 
----
+Two same-process writes to the same path use the exact same temp filename.
 
-## 3.4 G8 — last compaction is process-global
+The STATE queue prevents most same-process STATE races, but other artifacts and future callers do not universally share that queue. Overlapping writes can race on the shared temp and one rename can remove the file the other invocation expected.
 
-**Revised severity:** Medium
-
-`lastCompactionTimestamp` is module-level state:
-
-- it is shared across projects in one process;
-- it resets on plugin/module reload.
-
-The original assessment proposes adding `last_compaction_at` to `MemoryFile` and performing another STATE write inside the compaction hook.
-
-That works, but it is unnecessary.
-
-### Preferred solution: use the existing per-project `last_compaction.log`
-
-`src/index.ts` already atomically writes:
+Use a unique suffix per invocation, e.g. cryptographic random ID or a safely-created temporary file in the same directory:
 
 ```text
-<project>/.opencode/memory/last_compaction.log
+STATE.json.tmp.<pid>.<random>
 ```
 
-after each compaction.
+Keep the temp on the same filesystem so rename remains atomic.
 
-Make this existing file the status source of truth:
-
-- remove module-level `lastCompactionTimestamp`;
-- remove `setLastCompaction`;
-- parse or stat `last_compaction.log` in `tokenmaxxer_status`;
-- report `none` if absent.
-
-Benefits:
-
-- already per-project;
-- survives reload;
-- no schema migration;
-- no extra STATE write;
-- no new queue contention during compaction;
-- no duplicate representation of the same fact.
-
-If a structured timestamp becomes useful to other memory consumers later, adding it to STATE can be reconsidered then.
+Also consider whether the project's use of “durable” requires file/directory `fsync`; rename atomicity and crash durability are not identical guarantees.
 
 ---
 
-## 4. New findings missed by the original assessment
+## 4.4 I12 — `pruneOld` does not guarantee a writable result
 
-## 4.1 N1 — declared OpenCode plugin compatibility is too broad
+**Severity: Medium**
 
-**Severity:** High until the minimum compatible version is established  
-**File:** `package.json`
+At the final pruning step, the function can log that the state is **still** above 8 KB and return it anyway.
 
-Current peer range:
+`writeMemory()` then correctly rejects it.
+
+That means the function named/used as the path to fit the storage budget does not actually guarantee its postcondition.
+
+This is easier to trigger because decision topic/decision/rationale lengths and counts are not comprehensively bounded at every input boundary.
+
+Recommended contract:
+
+```ts
+type PruneResult =
+  | { ok: true; memory: MemoryFile }
+  | { ok: false; reason: "unrepresentable" }
+```
+
+or make `pruneToBudget()` deterministically guarantee `memorySizeBytes(memory) <= MEMORY_MAX_BYTES`.
+
+Add input bounds and final truncation rules that preserve I5's foundational priority.
+
+The existing last-resort test checks decision count/error logging but should also assert final byte size and that `writeMemory()` can actually persist the result.
+
+---
+
+## 4.5 I13 — installer is mutable-main, multi-download, and unverified
+
+**Severity: Medium release/supply-chain risk**  
+**File:** `install.sh`
+
+The one-line installer downloads these independently from `main`:
+
+- launcher
+- `dist/index.js`
+- `dist/tui.js`
+
+There is no immutable release/tag/commit pin and no integrity manifest/checksum validation.
+
+Consequences:
+
+- `main` can move between downloads, producing a mixed-revision installation;
+- any compromise/mistake on `main` is immediately executable by new installers;
+- users cannot easily prove which source revision produced installed artifacts.
+
+Recommended release flow:
+
+1. installer resolves one immutable version/tag/commit;
+2. all artifacts come from that same release;
+3. publish a checksum manifest and verify it before replacement;
+4. perform config edits via temp + atomic rename and keep a backup;
+5. print installed version/commit.
+
+This is not evidence of an active compromise. It is a release-hardening issue.
+
+---
+
+# 5. Host compatibility and testing findings
+
+## 5.1 N1 — peer range overstates compatibility and host gate can fail open
+
+**Severity: High**
+
+`package.json` declares:
 
 ```json
 "@opencode-ai/plugin": ">=1.0.0 <2.0.0"
 ```
 
-TokenMaxxer relies on custom `ToolContext.directory` and `ToolContext.worktree`.
+The code itself defines:
 
-OpenCode issue #10477 documents that 1.0.x custom tool context did **not** expose those fields. Current OpenCode source does add them when bridging plugin tools.
+```ts
+MINIMUM_HOST_CONTRACT = "1.18"
+VERIFIED_HOST_CONTRACT_VERSION = "1.18.15"
+```
 
-Reference:
+Historical OpenCode 1.0.x custom ToolContext lacked `directory`/`worktree`, while TokenMaxxer tools rely on them.
 
-`https://github.com/anomalyco/opencode/issues/10477`
+Further, the structured-contract gate allows extraction when the host health surface is missing:
 
-Therefore TokenMaxxer appears to claim support for host versions that cannot satisfy its runtime contract.
+```text
+source = pinned-compatibility
+allowed = true
+reason = health-surface-unavailable
+```
+
+That assumption is only safe if the runtime is independently known to be the pinned compatible contract. The broad peer range makes that inference unsafe.
 
 ### Recommended fix
 
-Determine the **oldest actually compatible** OpenCode/plugin release and make that the lower peer bound.
+- Set peer lower bound to the **oldest actually verified compatible release**.
+- Test that version explicitly.
+- If runtime version cannot be established, fail closed for optional LLM extraction unless the installed host/plugin contract is independently proven compatible.
+- Heuristic memory can continue when the optional structured path is gated off.
 
-Do not assume the devDependency version (`1.18.15`) is necessarily the exact minimum unless tested. A safe short-term choice is to set the minimum to the oldest version explicitly verified by CI/manual host testing.
+CI should exercise at least:
 
-Add a compatibility CI matrix for:
+```text
+oldest supported 1.x
+normal pinned/tested 1.x
+```
 
-- oldest supported 1.x;
-- the currently pinned/tested version;
-- optionally latest compatible 1.x on a non-blocking or scheduled job if upstream churn is high.
+Current upstream references:
 
-This is especially important because G3 shows that local unit mocks can pass while the host API contract is wrong.
-
----
-
-## 4.2 N2 — status must report the effective memory location
-
-**Severity:** Medium  
-**Files:** `src/tools/status.ts`, `src/memory/store.ts`
-
-This is part of the C1 design, but it deserves an explicit finding because fixing `readMemory()` alone leaves diagnostics wrong.
-
-`tokenmaxxer_status` currently:
-
-1. calls `readMemory()`;
-2. separately constructs the project-local path;
-3. separately reads it for byte size.
-
-If the store selects global memory, status can simultaneously display the correct memory contents and the wrong file path/size.
-
-Fix this by moving storage-location metadata behind the store abstraction and consuming that metadata in status.
+- `https://github.com/anomalyco/opencode/issues/10477`
+- `https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/registry.ts`
 
 ---
 
-## 4.3 N3 — tool tests do not enforce host-context fidelity
+## 5.2 N3 — host mocks do not enforce the real ToolContext shape
 
-**Severity:** Medium  
-**Files:** `test/tools/*`
+**Severity: Medium**
 
-The test suite is broad, but G3 survived because the `_headFiles` test double supplied a `client` field that the actual tool context does not provide.
+G3 survived a large test suite because an inner-helper test supplied a `client` property the host context does not provide.
 
-Add at least one test at the registered-tool boundary using the real installed `ToolContext` type shape.
+Add registered-tool boundary tests whose mock is type-checked as the installed `ToolContext`.
 
-Policy recommendation:
+Policy:
 
-> Do not add fields to host context mocks that are not in the installed host type. Any compatibility escape hatch should be isolated at a named adapter boundary, not hidden behind `(context as any)` in a tool wrapper.
+> Do not add fields to host mocks that do not exist in the supported host type. Compatibility exceptions belong at explicit adapters/closures.
 
-A release smoke test in a real OpenCode process should also be added for all exported tools.
+Add a real OpenCode release smoke test for all seven registered tools.
 
 ---
 
-## 4.4 N4 — committed distribution parity is not enforced
+## 5.3 N4 — committed `dist/` parity is not enforced
 
-**Severity:** Medium  
-**Files:** `.github/workflows/ci.yml`, `dist/`
+**Severity: Medium**
 
-`package.json` publishes `dist/index.js` / `dist/tui.js`, and `dist/` is committed.
-
-CI builds the distribution and checks that bundles are non-empty/self-contained, which is good, but it does not currently fail when the freshly built output differs from committed `dist/`.
-
-If committed `dist/` remains part of the repository, add after `npm run build`:
+CI builds and validates self-contained bundles, but if `dist/` is committed/published it should also prove committed output equals fresh build output:
 
 ```bash
+npm run build
 git diff --exit-code -- dist/
 ```
 
-Otherwise stop committing `dist/` and build it only for package/release publication. Pick one source-of-truth strategy and enforce it.
+Alternative: stop committing `dist/` and produce it only in release/package jobs.
+
+Pick one source-of-truth strategy.
 
 ---
 
-## 4.5 N5 — dependency/security audit deserves a separate pass
+## 5.4 N5 — dependency findings need explicit triage
 
-**Severity:** Medium triage item, not yet a code vulnerability finding
+**Severity: Medium triage item**
 
-The latest CI run for the assessment commit completed successfully but `npm ci` reported dependency audit findings, including high/critical severities.
+The previously inspected CI installation reported dependency audit findings, including high/critical labels. That console output alone is not enough to call TokenMaxxer exploitable.
 
-This assessment did not inspect the vulnerable package graph or exploitability, so do not turn that console summary directly into a TokenMaxxer vulnerability claim.
+Run and retain structured audit output, then determine:
 
-Recommended follow-up:
+- direct vs transitive
+- runtime vs dev-only
+- whether vulnerable code ships in `dist`
+- whether the vulnerable path is reachable
 
-1. Run `npm audit --json` locally/CI.
-2. Identify direct vs transitive packages.
-3. Determine whether vulnerable code ships in `dist` or is dev-only.
-4. Upgrade targeted packages where safe.
-5. Do **not** blindly run `npm audit fix --force`.
-
-Also revise the old scope language that described the plugin as having "no network surface." TokenMaxxer is local-first, but optional extraction calls the OpenCode client/model/session APIs and model-callable file tools cross a meaningful trust boundary.
+Do not use `npm audit fix --force` blindly.
 
 ---
 
-## 5. Medium maintainability findings retained from the original review
+# 6. LLM and provenance design observations
 
-The following are useful cleanup findings but should follow the correctness work:
+The LLM subsystem is one of the better-designed parts of the project, but its trust vocabulary should be made stricter.
 
-| Item | Assessment |
-|---|---|
-| Repeated construction of decision regex | Minor optimization/readability. Hoist if it improves clarity. |
-| `COMMON_WORDS` Set allocated per call | Minor optimization. Hoist to module scope. |
-| `stripCodeBlocks` misses indented code blocks | Real heuristic-quality issue; add fixtures before changing behavior. |
-| Duplicated file-path extraction/normalization | Worth consolidating after G7 so one canonical implementation remains. |
-| `evidence_refs` optional in TS but required by runtime refinement | Real type/runtime mismatch; clean up after the extraction compatibility path is understood. |
-| LLM cache construction type uses legacy facts type | Same type-boundary cleanup as above. |
-| Cached host-health gate lifetime | Needs behavior-focused test before changing; not proven production bug from static inspection alone. |
-| Multiple `pruneOld()` deep clones per LLM flow | Performance/readability issue; optimize only with benchmarks or clear simplification. |
-| Dead `typeof resolveProjectPath === "function"` guard | Remove. Production import is statically known. |
-| `context.sessionId` fallback | Remove if installed host type confirms only `sessionID`. |
-| `registerTools(_ctx)` unused arg | Remove or use only if needed for a closure-based host dependency later. |
-| Provenance formatting duplicated | Extract one formatter after behavioral changes stabilize. |
-| Hand-maintained JSON Schema mirrors Zod | Drift risk; consider schema generation if it remains compatible with the host structured-output API. |
-| Heuristic active files replace cross-session set | Design question, not obviously a bug; document intended semantics before changing. |
-| `TRANSCRIPT_WINDOW = 50` | Product tradeoff; document and test rather than calling it inherently wrong. |
-| Tool argument bounds | Add explicit max/min bounds for `limit`, `lines`, and `paths`. |
-| README `Bun.$` claim | Correct documentation if implementation is `child_process` only. |
-| Early `HEADER.md` placeholder creation | Cleanup/product behavior; lower priority. |
-| Large writer/extractor files | Refactor after correctness fixes. |
-| `verbatimModuleSyntax` | Optional TypeScript hygiene; not a reliability finding by itself. |
+Recommended trust ladder:
+
+```text
+legacy
+  < heuristic observation
+  < LLM corroborated with fact-specific evidence
+  < explicitly human reviewed
+```
+
+The following should become hard invariants:
+
+1. `llm-corroborated` means the exact fact passed a deterministic evidence check.
+2. `human-reviewed` means a human completed an affirmative confirmation action outside model control.
+3. `foundational` implies explicitly human-promoted current authoritative decision.
+4. no invalid decision may become foundational.
+5. one normalized topic has at most one authoritative valid decision.
+6. provenance should not be fabricated by using unrelated “first available” evidence.
+
+These invariants are more valuable than adding more extraction heuristics.
 
 ---
 
-## 6. False, stale, or corrected statements from the original assessment
+# 7. Corrected implementation sequence
 
-### 6.1 "No CI workflow exists" — false
+The independent findings change the recommended order substantially.
 
-`.github/workflows/ci.yml` exists and currently performs:
+## PR 1 — storage read semantics and effective location
 
-- checkout;
-- Node setup;
-- `npm ci`;
-- full Vitest suite;
-- `npx tsc --noEmit`;
-- `npm run build`;
-- bundle self-containment checks;
-- `bash -n install.sh`.
+**Fix:** C1 + I8 + N2 + I9 + I10 + I11
 
-The assessment commit itself passed this workflow.
+Goals:
 
-Remove the original HIGH finding that CI is absent.
+- typed missing/error filesystem reads
+- local/global candidate resolver
+- cache tracks enough state to notice either candidate changing
+- selected path/source/size exposed to diagnostics
+- non-git project identity uses resolved project
+- HEADER generation cannot overturn primary persistence success
+- unique atomic temp names
 
-### 6.2 Finding counts were internally inconsistent
-
-The original header claimed "seven HIGH" and "eight MEDIUM" findings, while its own table and assessment commit message described different totals.
-
-Do not preserve headline counts unless generated from the actual final table.
-
-### 6.3 Repository visibility statement is stale
-
-The original assessment says the repository is private. At the time of this revision the connected GitHub repository reports `visibility: public`.
-
-Distribution/install behavior should be tested against current repository/package state rather than preserving the old private-repository conclusion.
-
-### 6.4 "Local-only, no network surface" is too broad
-
-The plugin is local-first and does not expose its own network server, but optional LLM extraction uses the OpenCode client/model/session path. Security review should therefore include host API trust boundaries, model-callable tools, file access, logs, and package dependencies.
+Do this before other memory behavior because every higher layer depends on trustworthy storage reads.
 
 ---
 
-## 7. Revised implementation plan
+## PR 2 — cross-process transaction correctness
 
-The original five-PR plan mixed correctness, schema changes, presentation cleanup, and questionable remediations. Use the following order instead.
+**Fix:** I1
 
-## PR 1 — storage correctness and observability
+Goals:
 
-**Fix:** C1 + N2
+- one project transaction primitive across processes
+- short lock windows around read/modify/write
+- no lock held during LLM network/model request
+- idle merge, audit metadata, model health, cache commit, and promotion all use the same transaction discipline
+- child-process concurrency tests
 
-Files likely touched:
-
-- `src/memory/store.ts`
-- `src/tools/status.ts`
-- `test/memory/store.test.ts` (new or expanded)
-- `test/tools/status.test.ts`
-
-Deliverables:
-
-- resolve project/global candidates by freshness;
-- cache both candidate mtimes;
-- expose selected storage metadata;
-- status reports actual selected path/size;
-- regression test for **stale local + newer global**.
-
-This is the most important PR because it protects the core durability promise.
+This is the largest core durability fix.
 
 ---
 
-## PR 2 — OpenCode host-contract correctness
+## PR 3 — decision authority and promotion trust
 
-**Fix:** G3 + N1 + N3 + tool bounds
+**Fix:** I2 + I3 + I4 + I5
 
-Files likely touched:
+Goals:
 
-- `src/tools/efficiency.ts`
-- `src/index.ts`
-- `package.json`
-- `test/tools/efficiency.test.ts`
-- CI compatibility configuration if practical
+- one authoritative valid decision per normalized topic
+- corroboration does not create duplicate valid authority
+- promotion targets decision ID
+- invalid decisions cannot be promoted
+- model calls can request but not mint `human-reviewed`
+- explicit human confirmation required
+- foundational decisions receive highest retention priority
 
-Deliverables:
-
-- `registerEfficiencyTools(client)` closes over plugin client;
-- remove `(context as any).client`;
-- retain host `client.file.read` behavior;
-- constrain `head_files.paths` and `head_files.lines`;
-- set peer lower bound to the oldest verified compatible OpenCode plugin version;
-- registered-tool test uses a real `ToolContext` shape.
-
-Do **not** introduce raw unrestricted filesystem reading as the default fix.
+This PR should define the decision-state machine in tests before changing implementation.
 
 ---
 
-## PR 3 — recall relevance correctness
+## PR 4 — OpenCode host contract
 
-**Fix:** G5
+**Fix:** G3 + N1 + N3 + tool argument bounds
 
-Files likely touched:
+Goals:
 
-- `src/memory/writer.ts`
-- `src/memory/reader.ts` only if helpers need exporting/refactoring
-- `test/memory/writer.test.ts`
-
-Deliverables:
-
-- reconstruct recalled decisions from structured `state.input` using `queryDecisions`;
-- mark exact decision IDs;
-- no parser for formatted output strings;
-- multiple-recall and same-topic regression tests.
+- close over plugin client for efficiency tools
+- remove `(context as any).client`
+- keep host file API semantics
+- tighten supported host range
+- make health/version fallback policy consistent with supported range
+- registered-tool tests use real ToolContext shape
+- real host smoke test
 
 ---
 
-## PR 4 — truthful idle outcomes
+## PR 5 — source idempotency and outcome semantics
 
-**Fix:** C2
+**Fix:** I7 + C2 + G5
 
-Files likely touched:
+Goals:
 
-- `src/memory/writer.ts`
-- `test/memory/writer-llm.test.ts`
-- possibly queue/status assertions
-
-Deliverables:
-
-- `error` for unexpected pre-persist failures;
-- `llm-failed` when LLM work actually attempted and fails after heuristic persistence;
-- `heuristic-only` reserved for intentional/no-model heuristic fallback;
-- bounded diagnostic log with stage/persistence state.
+- immutable source-processing identity
+- sequential duplicate idle event is cache/no-op after success
+- process reload does not cause repeat prompt for unchanged source
+- append/change to source permits reprocessing
+- stage-accurate idle outcomes
+- recall marks exact returned decision IDs from structured input/query semantics
 
 ---
 
-## PR 5 — compaction output budget
+## PR 6 — complete LLM evidence boundary
 
-**Fix:** G4
+**Fix:** I6 + existing extract-schema type mismatch
 
-Files likely touched:
+Choose and document either:
 
-- `src/compaction/durable.ts`
-- `src/memory/schema.ts` if item-level limits are added
-- `src/memory/migrate.ts` for safe normalization
-- related compaction/schema/migration tests
+- evidence-backed every durable LLM fact, or
+- LLM durability restricted to decisions.
 
-Deliverables:
+Do not keep the present ambiguous hybrid.
 
-- explicit durable block total budget;
-- prioritized rendering;
-- per-section defense-in-depth caps;
-- no unconditional deletion of older foundational decisions merely because injection is capped;
-- migration truncates legacy over-limit strings/arrays safely.
+If all facts are accepted:
 
----
-
-## PR 6 — status + quality cleanup
-
-**Fix:** G8 + H1 + G7 + G6
-
-Deliverables:
-
-- last compaction read from existing `last_compaction.log`;
-- delete process-global last-compaction state and setter;
-- correct active-file operation labels;
-- warn on failed audit/health metadata writes;
-- update tests.
-
-H1 disappears naturally when the setter is removed.
+- add fact-specific evidence refs
+- add blocker/next-step provenance or structured fact objects
+- validate active files against tool-derived candidates
+- remove generic first-candidate corroboration
 
 ---
 
-## PR 7 — build/dependency hygiene
+## PR 7 — compaction and storage budgets
 
-**Fix:** N4 + N5 and low-risk cleanup
+**Fix:** G4 + I12
 
-Deliverables:
+Goals:
 
-- either enforce committed `dist/` parity with `git diff --exit-code -- dist/` or stop committing build output;
-- audit dependency findings deliberately;
-- correct README stale implementation claims;
-- remove dead compatibility guards/unused parameters;
-- optionally hoist constant Sets/regexes.
+- explicit total durable-block injection budget
+- section priority under budget
+- storage prune has a guaranteed representable result or typed failure
+- foundational retention priority maintained
+- bounds on decision fields and other large strings
 
 ---
 
-## 8. Test and verification strategy
+## PR 8 — status and diagnostic artifacts
 
-The current 202-test suite is a strong base, but the missing dimension is **host fidelity**.
+**Fix:** G8 + G6 + G7 + H1
 
-### 8.1 Required automated checks on every PR
+Goals:
+
+- remove process-global last compaction
+- use local/global diagnostic artifact resolver
+- surface best-effort metadata persistence failures
+- accurate file activity categories
+- H1 disappears with removal of setter
+
+---
+
+## PR 9 — release/build/dependency hygiene
+
+**Fix:** N4 + N5 + I13 + stale documentation
+
+Goals:
+
+- enforce or eliminate committed-dist parity
+- dependency vulnerability triage
+- release-pinned installer + integrity manifest
+- atomic config edits/backups
+- update stale README claims such as `Bun.$` usage if implementation remains `child_process`
+
+---
+
+# 8. Verification plan
+
+## 8.1 Existing checks
+
+Every PR should keep:
 
 ```bash
 npm ci
@@ -993,167 +1297,195 @@ npm run build
 bash -n install.sh
 ```
 
-If `dist/` remains committed:
+If `dist/` remains tracked:
 
 ```bash
 git diff --exit-code -- dist/
 ```
 
-### 8.2 Storage proof tests
+## 8.2 New invariant tests
 
-Required for C1/N2:
+### Storage
 
-| Scenario | Expected |
-|---|---|
-| no local, no global | no memory |
-| local only | local selected |
-| global only | global selected |
-| local older, global newer | global selected |
-| global older, local newer | local selected |
-| equal mtimes | deterministic local selection |
-| selected global changes | cache invalidates |
-| non-selected global becomes newest | cache invalidates and switches source |
-| selected local corrupt | corrupt backup + defined recovery behavior |
-| selected global corrupt | corrupt backup + defined recovery behavior |
-| status with global source | path and byte size show global file |
+- unreadable existing STATE is never treated as empty
+- local/global newest selection
+- global fallback round trip
+- status reports effective source
+- non-git project identity
+- HEADER failure cannot change memory write outcome
+- same-process atomic writes use distinct temp files
 
-### 8.3 Host-contract tests
+### Concurrency
 
-At least one test should exercise the actual registered tool wrapper, not only inner helpers.
+- two child processes preserve both updates
+- idle + promotion child-process race preserves both
+- stale lock recovery
+- different projects remain independent
 
-The context object must be assignable to the installed `ToolContext` type and must not invent `client`.
+### Decisions
 
-Also add a static review rule: no `(context as any).client` in tool registration code.
+- one valid row per normalized topic
+- equivalent LLM corroboration does not produce duplicate authority
+- later supersession invalidates all prior authority
+- promote by ID only
+- invalid decision cannot promote
+- human-review label requires affirmative confirmation
+- foundational survives age/pressure pruning
 
-### 8.4 Real OpenCode smoke test
+### LLM
 
-Before release, run a built install in a real OpenCode session and verify:
+- exact source processed twice sequentially -> no second prompt
+- same after simulated process reload
+- changed source digest -> new extraction permitted
+- every accepted corroborated fact has fact-specific evidence
+- unsupported file/blocker/next-step/current-task claims rejected
+
+### Budget
+
+- `pruneOld`/replacement always fits 8 KB or returns explicit failure
+- durable compaction block stays under declared injection budget
+- retention and injection priority independently tested
+
+### Host integration
+
+Run a built release against the oldest supported OpenCode and normal pinned/tested version:
 
 1. `tokenmaxxer_status`
 2. `head_files`
 3. `preview_compaction`
 4. `get_project_state`
 5. `recall_decision`
-6. `recall_promote`
-7. one `session.idle` memory write
-8. one compaction hook
-9. plugin reload followed by status/recall
-10. a project where local memory is intentionally unwritable and global fallback is exercised
-
-This should become a repeatable release checklist or integration test. G3 demonstrates that passing unit tests alone is not sufficient for host API compatibility.
-
-### 8.5 Supported-version verification
-
-Once the minimum OpenCode plugin version is chosen:
-
-- run typecheck/tests against that minimum;
-- run at least the host-contract smoke test against it;
-- run the same against the normal pinned/current supported version.
-
-Do not claim `>=1.0.0` support without proving that contract.
+6. promotion request/confirmation path
+7. idle heuristic write
+8. LLM extraction when enabled
+9. compaction
+10. reload
+11. non-git directory
+12. read-only project/global fallback
 
 ---
 
-## 9. Risk notes
+# 9. Lower-priority maintainability items
 
-### Storage resolver
+These are still worth addressing after the correctness work:
 
-Choosing the newest candidate by mtime is safer than unconditional project-path preference, but it makes filesystem timestamp behavior part of source selection. Keep tie-breaking deterministic and test rapid successive writes. If a later design needs stronger ordering, persist a monotonic revision/generation inside the memory format and compare that before mtime.
-
-### Host client closure
-
-Closing over the plugin client couples tool registration to `TokenmaxxerPlugin`, which is appropriate: the client is legitimately part of plugin initialization state. Keep it typed through a small interface or `PluginInput["client"]` if importing that type is stable.
-
-### Recall reconstruction
-
-Re-running `queryDecisions()` from transcript input is much safer than output regex parsing, but exact historical result identity could differ if memory changed between the tool call and idle processing. Current project serialization reduces this risk. If exact identity later matters, include machine-readable result IDs in structured metadata rather than in display text.
-
-### Durable output budget
-
-A hard byte/character budget can truncate lower-priority content. That is the intended tradeoff; ensure explicit recall remains available for omitted decisions. The budget should be documented as an injection policy, not a storage-retention policy.
-
-### Dependency audit
-
-Audit severity alone does not prove exploitability. Separate dev-only packages from shipped/runtime packages before prioritizing upgrades.
-
----
-
-## 10. Assumptions and limits of this revision
-
-This revision validated the repository structure, current source for the major findings, the assessment document itself, the GitHub Actions workflow/run, and the current OpenCode host contract relevant to custom tool context.
-
-It did **not** perform:
-
-- a live OpenCode runtime session;
-- a real LLM extraction request;
-- dependency-vulnerability exploitability analysis;
-- performance benchmarking;
-- fuzzing of migration/state parsing;
-- a full security audit of all model-callable surfaces.
-
-Therefore findings such as C1, C2, G3, G4, G5, G7, G8 and the CI/document inconsistencies are code-level confirmed, while dependency/security implications should be treated as follow-up triage until separately tested.
+| Item | Recommendation |
+|---|---|
+| Decision regex recreated per sentence | Hoist/clean up after behavioral tests. |
+| `COMMON_WORDS` Set allocated per call | Hoist to module scope. |
+| `stripCodeBlocks` misses indented code | Add fixtures before altering extraction. |
+| Duplicated file normalization | Consolidate after G7/I6 define canonical semantics. |
+| `evidence_refs` optional in TS but runtime-required | Remove type lie when I6 restructures schema. |
+| Cache construction uses legacy facts type | Align construction/runtime types with I6. |
+| Repeated `pruneOld` cloning | Optimize after transaction semantics are stable. |
+| Dead `resolveProjectPath` compatibility guard | Remove. |
+| `sessionId` fallback in recall context | Remove if supported host type confirms `sessionID`. |
+| Unused `registerTools(_ctx)` | Remove or use explicit closure dependencies. |
+| Provenance formatting duplicated | Centralize after provenance model stabilizes. |
+| Hand-maintained JSON Schema + Zod | Consider generation or drift tests. |
+| `TRANSCRIPT_WINDOW = 50` | Document as product tradeoff. |
+| Tool bounds | Add max/min for recall limit, head lines, path count/string length. |
+| Early HEADER placeholder | Reconsider after artifact storage policy. |
+| Large writer/extract-llm modules | Split after correctness contracts land. |
+| `verbatimModuleSyntax` | Optional TS hygiene, not reliability priority. |
 
 ---
 
-## Appendix A — Current CI reality
+# 10. Corrections to the original agentic assessment
 
-`.github/workflows/ci.yml` currently runs on pushes and pull requests to `main` and performs:
+## 10.1 CI exists
+
+The original assessment said no CI workflow existed. That is false/stale.
+
+`.github/workflows/ci.yml` currently runs:
 
 ```text
 npm ci
 npm test
 npx tsc --noEmit
 npm run build
-bundle self-containment verification
+self-contained bundle verification
 bash -n install.sh
 ```
 
-For assessment commit `9c618f36db458537984140c0989d74d5d850bcd4`, GitHub Actions completed successfully with:
+The previously reviewed assessment commit passed with 21 test files / 202 tests.
 
-```text
-21 test files passed
-202 tests passed
-TypeScript check passed
-Build passed
-Bundle verification passed
-Installer syntax passed
-```
+## 10.2 Finding counts were internally inconsistent
 
-The previous assessment statement that CI did not exist is removed.
+Do not preserve static “X critical / Y high / Z medium” prose unless generated from the actual final table.
 
----
+## 10.3 Raw fs is not the preferred G3 fix
 
-## Appendix B — Upstream OpenCode contract references
+The original G3 remediation would create a new file-access boundary. Capture the legitimate plugin client instead.
 
-The compatibility findings above rely on these upstream references:
+## 10.4 G5 should not parse display output
 
-- Current custom plugin tool bridge:  
-  `https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/registry.ts`
-- Current plugin initialization/client context:  
-  `https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/plugin/index.ts`
-- Historical 1.0.x ToolContext missing project directory/worktree:  
-  `https://github.com/anomalyco/opencode/issues/10477`
-- Current built-in read-tool implementation, useful when comparing file-access semantics:  
-  `https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/read.ts`
+Use structured tool input and the canonical decision query implementation.
 
-These should be rechecked when changing the supported OpenCode version range because upstream contracts can evolve.
+## 10.5 G8 local log recommendation required correction
+
+The first revised assessment suggested existing `last_compaction.log` as the durable source. The independent review found that local-only artifact fails in the same read-only case that motivates global STATE fallback. Use a local/global diagnostic artifact resolver instead.
+
+## 10.6 Security scope should not say “no network surface”
+
+TokenMaxxer is local-first, but optional extraction calls host model/session APIs and custom tools cross file/permission boundaries. Security review should include those boundaries and installer/dependency supply chain.
 
 ---
 
-## Final recommendation
+# 11. Assumptions and limits
 
-Do not hand the old implementation plan directly to an implementation agent.
+This independent pass reviewed the current source and tests for the major runtime paths, including:
 
-The revised priority is:
+- `src/index.ts`
+- `src/util/fs.ts`, `git.ts`, `log.ts`
+- `src/memory/store.ts`
+- `src/memory/lock.ts`
+- `src/memory/schema.ts`
+- `src/memory/migrate.ts`
+- `src/memory/writer.ts`
+- `src/memory/extract-schema.ts`
+- `src/memory/extract-prompt.ts`
+- `src/memory/extract-llm.ts`
+- `src/memory/llm-adapter.ts`
+- `src/memory/reader.ts`
+- `src/memory/activity-state.ts`
+- `src/compaction/durable.ts`
+- `src/compaction/prompt.ts`
+- `src/tools/recall.ts`
+- `src/tools/status.ts`
+- `src/tui.tsx`
+- `install.sh`
+- `bin/tokenmaxxer`
+- `package.json`
+- `.github/workflows/ci.yml`
+- key merge/prune/writer/recall/reliability tests
+- reliability and README contracts
+
+It also checked current upstream OpenCode source relevant to custom ToolContext behavior.
+
+It did **not** execute a live OpenCode session, induce real cross-process races, perform real permission-failure filesystem tests, invoke a real LLM during this review, or perform exploitability analysis of npm audit findings. Findings above marked confirmed are direct static/data-flow violations or invariant mismatches visible in the current source; the recommended regression tests are intended to convert them into executable proofs before implementation.
+
+---
+
+# 12. Final priority recommendation
+
+If only a few changes can be made immediately, do these first:
 
 ```text
-1. Fix storage source resolution + status path reporting.
-2. Fix the OpenCode tool/client boundary and supported-version claim.
-3. Fix exact recall-reference tracking.
-4. Make idle outcomes truthful.
-5. Add an explicit compaction output budget.
-6. Clean up status/activity/audit diagnostics.
-7. Refactor large files and lower-priority hygiene afterward.
+1. Make storage reads trustworthy: local/global resolution + typed read errors.
+2. Add cross-process transaction isolation for every memory read/modify/write.
+3. Repair decision authority: one valid decision per topic.
+4. Make promotion target an exact valid decision and require real human confirmation.
+5. Protect foundational decisions from ordinary pruning.
+6. Make source-session idempotency survive completed writes and process reload.
+7. Complete the evidence contract for every durable LLM-generated fact.
+8. Fix the OpenCode client/context compatibility boundary and supported version range.
+9. Add explicit compaction/prune budget postconditions.
+10. Then address status, activity labels, build parity, dependencies, and release installer hardening.
 ```
 
-That sequence addresses the durability and host-contract risks first while preserving the strongest parts of the existing architecture.
+The most important architectural theme is this:
+
+> **TokenMaxxer already has good local safety mechanisms, but the next reliability step should turn implicit assumptions into global invariants: one current storage source, one serialized project transaction across processes, one authoritative decision per topic, one trustworthy meaning for each provenance label, and one stable identity for each processed source session.**
+
+Those invariants will provide more reliability than adding further extraction features before the persistence model is hardened.
