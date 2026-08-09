@@ -73,11 +73,13 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
           durableLength: durable.length,
         })
 
-        // Dump the injected prompt for debugging (best effort)
+        // last_compaction.log is intentionally a last-only snapshot, not a
+        // history. Atomic replacement ensures successive hooks leave only the
+        // newest compaction payload visible to diagnostics.
         try {
           const logPath = join(project, ".opencode", "memory", "last_compaction.log")
-          const entry = `[${new Date().toISOString()}] session=${input.sessionID}\n${output.prompt ?? "(durable via context)"}\n---\n`
-          await atomicWrite(logPath, entry)
+          const snapshot = `[${new Date().toISOString()}] session=${input.sessionID}\n${output.prompt ?? "(durable via context)"}\n---\n`
+          await atomicWrite(logPath, snapshot)
         } catch {
           // Non-fatal
         }

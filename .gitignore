@@ -4,5 +4,6 @@ node_modules/
 .opencode/memory/STATE.json
 .opencode/memory/last_compaction.log
 .opencode/memory/*.corrupt.*
+.opencode/.tokenmaxxer-memory-activity
 *.tsbuildinfo
 .slim/deepwork/

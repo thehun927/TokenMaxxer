@@ -16,6 +16,7 @@ import { enqueueProjectJob, setProjectQueueOutcome } from "./lock"
 import { getCurrentGitSha } from "../util/git"
 import { atomicWrite } from "../util/fs"
 import { basename, join } from "node:path"
+import { randomUUID } from "node:crypto"
 import {
   buildCanonicalInput,
   buildTranscriptEvidenceCandidateMap,
@@ -1312,7 +1313,7 @@ export function mergeMemory(
     if (origin === "llm" && !evidence) continue
 
     const decision: Decision = {
-      id: cryptoRandomUUID(),
+      id: randomUUID(),
       topic: newDec.topic,
       decision: newDec.decision,
       rationale: newDec.rationale,
@@ -1381,15 +1382,6 @@ export function recordRecentSession(mem: MemoryFile, sessionId: string): MemoryF
     ...mem,
     recent_sessions: recentSessions.slice(-10),
   }
-}
-
-/** Generate a random UUID v4 (crypto-safe). */
-function cryptoRandomUUID(): string {
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0
-    const v = c === "x" ? r : (r & 0x3) | 0x8
-    return v.toString(16)
-  })
 }
 
 // ─── pruneOld ────────────────────────────────────────────────────────────────

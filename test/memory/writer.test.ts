@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { extractFactsHeuristic, recordRecentSession } from "../../src/memory/writer"
+import { extractFactsHeuristic, mergeMemory, recordRecentSession } from "../../src/memory/writer"
 import type { TranscriptMessage } from "../../src/types"
 import { emptyMemory } from "../../src/memory/schema"
 import { readFileSync } from "node:fs"
@@ -27,6 +27,47 @@ describe("recordRecentSession", () => {
     const deduped = recordRecentSession(withEleven, "session-10")
     expect(deduped.recent_sessions).toEqual(withEleven.recent_sessions)
     expect(deduped.recent_sessions.filter((id) => id === "session-10")).toHaveLength(1)
+  })
+})
+
+describe("mergeMemory decision IDs", () => {
+  it("generates unique UUID v4 IDs without changing legacy IDs", () => {
+    const existing = {
+      ...emptyMemory("/test/project"),
+      decisions: [{
+        id: "legacy-decision-id",
+        topic: "legacy topic",
+        decision: "Keep the legacy record",
+        timestamp: "2026-08-09T00:00:00.000Z",
+        session_id: "legacy-session",
+        still_valid: true,
+        foundational: false,
+      }],
+    }
+    const extracted = {
+      current_task: null,
+      active_files: [],
+      decisions: [
+        { topic: "first topic", decision: "Use the first choice" },
+        { topic: "second topic", decision: "Use the second choice" },
+      ],
+      blockers: [],
+      next_steps: [],
+    }
+
+    const merged = mergeMemory(existing, extracted, {
+      sessionId: "new-session",
+      gitSha: null,
+      timestamp: "2026-08-09T00:01:00.000Z",
+    })
+    const generated = merged.decisions.slice(1).map((decision) => decision.id)
+
+    expect(merged.decisions[0]?.id).toBe("legacy-decision-id")
+    expect(generated).toHaveLength(2)
+    expect(new Set(generated).size).toBe(generated.length)
+    for (const id of generated) {
+      expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+    }
   })
 })
 

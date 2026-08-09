@@ -1,12 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
-const { writeMemoryOnIdle } = vi.hoisted(() => {
+const { writeMemoryOnIdle, buildDurableBlock } = vi.hoisted(() => {
   return {
     writeMemoryOnIdle: vi.fn(),
+    buildDurableBlock: vi.fn(),
   }
 })
 
 vi.mock("../src/memory/writer", () => ({ writeMemoryOnIdle }))
+vi.mock("../src/compaction/durable", () => ({ buildDurableBlock }))
 
 import { TokenmaxxerPlugin } from "../src/index"
 import { extractFactsLLM } from "../src/memory/extract-llm"
@@ -35,6 +40,47 @@ describe("plugin initialization", () => {
     expect(configGet).not.toHaveBeenCalled()
     expect(ctx.client.app.info).not.toHaveBeenCalled()
     expect(ctx.client.app.log).not.toHaveBeenCalled()
+  })
+
+  it("replaces the compaction log with only the newest snapshot", async () => {
+    const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-compaction-"))
+    buildDurableBlock
+      .mockResolvedValueOnce("first durable snapshot")
+      .mockResolvedValueOnce("newest durable snapshot")
+
+    try {
+      const ctx = {
+        client: { app: { log: vi.fn(), info: vi.fn() } },
+        directory: project,
+        worktree: project,
+        serverUrl: new URL("http://127.0.0.1:4096"),
+        project: {},
+        experimental_workspace: { register: vi.fn() },
+        $: {},
+      }
+      const hooks = await TokenmaxxerPlugin(ctx as never)
+      const firstOutput = { context: [] as string[] }
+      const secondOutput = { context: [] as string[] }
+
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "first-session" },
+        firstOutput,
+      )
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "newest-session" },
+        secondOutput,
+      )
+
+      const memoryDir = join(project, ".opencode", "memory")
+      const snapshot = await readFile(join(memoryDir, "last_compaction.log"), "utf-8")
+      expect(snapshot).toContain("session=newest-session")
+      expect(snapshot).toContain("newest durable snapshot")
+      expect(snapshot).not.toContain("first-session")
+      expect(snapshot).not.toContain("first durable snapshot")
+      expect(await readdir(memoryDir)).toEqual(["HEADER.md", "last_compaction.log"])
+    } finally {
+      await rm(project, { recursive: true, force: true })
+    }
   })
 
   it("does not expose a system transform hook or inject composer text", async () => {

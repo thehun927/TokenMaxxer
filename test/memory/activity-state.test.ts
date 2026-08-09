@@ -40,6 +40,7 @@ describe("memory activity marker", () => {
   it("treats malformed and stale state as inactive without throwing", async () => {
     const path = await project()
     const marker = memoryActivityPath(path)
+    expect(marker).toBe(join(path, ".opencode/.tokenmaxxer-memory-activity"))
     await mkdir(join(path, ".opencode"), { recursive: true })
     await writeFile(marker, "not json", "utf8")
     expect(await isMemoryActivityFresh(path)).toBe(false)

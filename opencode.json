@@ -3,7 +3,7 @@
   "compaction": { "auto": true, "prune": true, "reserved": 15000 },
   "instructions": ["AGENTS.md"],
   "watcher": {
-    "ignore": ["node_modules/**", "dist/**", ".git/**", ".opencode/memory/**"]
+    "ignore": ["node_modules/**", "dist/**", ".git/**", ".opencode/memory/**", ".opencode/.tokenmaxxer-memory-activity"]
   },
   "permission": {
     "webfetch": "deny",
