@@ -5,3 +5,4 @@ node_modules/
 .opencode/memory/last_compaction.log
 .opencode/memory/*.corrupt.*
 *.tsbuildinfo
+.slim/deepwork/

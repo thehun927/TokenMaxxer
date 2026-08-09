@@ -107,7 +107,7 @@ export async function readMemory({
 export async function writeMemory(
   { worktree, directory }: { worktree: string; directory: string },
   mem: MemoryFile,
-): Promise<void> {
+): Promise<boolean> {
   const project = resolveProjectPath(worktree, directory)
   const path = memoryPath(project)
   const json = JSON.stringify(mem, null, 2)
@@ -125,14 +125,17 @@ export async function writeMemory(
       await atomicWrite(globalPath(project), json)
     } catch {
       // Both paths failed — give up silently (don't throw from event handler)
+      cache.delete(project)
+      return false
     }
     // Even on global fallback success, invalidate the cache
     cache.delete(project)
-    return
+    return true
   }
 
   // Invalidate cache after successful write
   cache.delete(project)
+  return true
 }
 
 export { emptyMemory } from "./schema"

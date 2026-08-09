@@ -7,6 +7,7 @@
  */
 import { tool } from "@opencode-ai/plugin"
 import { readMemory, resolveProjectPath } from "../memory/store"
+import { getProjectQueueStatus } from "../memory/lock"
 import { safeRead } from "../util/fs"
 import { join } from "node:path"
 
@@ -33,6 +34,7 @@ export async function _tokenmaxxerStatus(
     const path = join(project, ".opencode", "memory", "STATE.json")
     const content = await safeRead(path)
     const size = content?.length ?? 0
+    const queue = getProjectQueueStatus(project)
 
     return [
       `Project: ${mem?.project_path ?? "none"}`,
@@ -42,6 +44,9 @@ export async function _tokenmaxxerStatus(
       `Last updated: ${mem?.last_updated ?? "never"}`,
       `Last git SHA: ${mem?.last_git_sha ?? "unknown"}`,
       `Last compaction: ${lastCompactionTimestamp ?? "none"}`,
+      `Queue depth: ${queue.queueDepth}`,
+      `In-flight: ${queue.inFlight}`,
+      `Last idle outcome: ${queue.lastOutcome ?? "none"}`,
     ].join("\n")
   } catch (e) {
     return `Error checking status: ${String(e)}`

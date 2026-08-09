@@ -29,8 +29,9 @@ type CacheBearingMemory = MemoryFile & {
 }
 
 /**
- * Remove result-cache metadata from the prior snapshot without mutating it.
- * Cache entries must not change the identity of the same source input.
+ * Remove operational result metadata from the prior snapshot without
+ * mutating it. Cache entries and audit guards must not change the identity of
+ * the same source input.
  */
 export function withoutExtractionCache(
   priorState: CacheBearingMemory | null,
@@ -39,6 +40,7 @@ export function withoutExtractionCache(
 
   const snapshot = { ...(priorState as Record<string, unknown>) }
   delete snapshot.llm_extraction_cache
+  delete snapshot.llm_extraction_audits
   return snapshot
 }
 

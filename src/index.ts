@@ -14,7 +14,10 @@ import { loadOptions } from "./config"
 import { buildCompactionPrompt } from "./compaction/prompt"
 import { buildDurableBlock } from "./compaction/durable"
 import { writeMemoryOnIdle } from "./memory/writer"
-import { isRetainedExtractionSession } from "./memory/extract-llm"
+import {
+  isPersistedRetainedExtractionSession,
+  isRetainedExtractionSession,
+} from "./memory/extract-llm"
 import { resolveProjectPath } from "./memory/store"
 import { registerTools } from "./tools/recall"
 import { registerEfficiencyTools } from "./tools/efficiency"
@@ -93,6 +96,13 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
             return
           }
           if (isRetainedExtractionSession(sessionId)) return
+          // The process-local guard is fast, but the durable v2 guard is what
+          // prevents a retained audit from re-entering after plugin reload.
+          if (await isPersistedRetainedExtractionSession({
+            sessionID: sessionId,
+            worktree,
+            directory,
+          })) return
           await writeMemoryOnIdle({ client, worktree, directory, sessionId })
         }
       } catch (e) {

@@ -11,11 +11,14 @@ import {
 } from "./extract-schema"
 import {
   LLMExtractionCacheEntrySchema,
+  type AuditTerminalOutcome,
+  type LLMAuditMetadata,
   type LLMExtractionCacheEntry,
   type MemoryFile,
 } from "./schema"
 import type { CanonicalExtractionInput } from "./extract-prompt"
 import { buildExtractionPrompt, makeExtractionCacheKey } from "./extract-prompt"
+import { readMemory } from "./store"
 
 export interface SmallModel {
   providerID: string
@@ -70,9 +73,33 @@ export function sanitizeError(error: unknown): SanitizedError {
 // those audit sessions instead of recursively extracting them.
 const retainedExtractionSessionIDs = new Set<string>()
 
+/** One extraction transaction per project/source, including direct callers. */
+const extractionInFlight = new Map<string, Promise<ExtractedFacts | null>>()
+
 /** Whether an idle event belongs to a session created for LLM extraction. */
 export function isRetainedExtractionSession(sessionID: string): boolean {
   return retainedExtractionSessionIDs.has(sessionID)
+}
+
+/** Check the durable v2 audit guard used after a plugin/module reload. */
+export async function isPersistedRetainedExtractionSession(args: {
+  sessionID: string
+  worktree: string
+  directory: string
+}): Promise<boolean> {
+  try {
+    const memory = await readMemory({ worktree: args.worktree, directory: args.directory })
+    return (memory?.llm_extraction_audits ?? []).some(
+      (audit) => audit.audit_session_id === args.sessionID,
+    )
+  } catch {
+    return false
+  }
+}
+
+/** Bounded extraction lifecycle diagnostics for local status consumers. */
+export function getLLMExtractionInFlightCount(): number {
+  return extractionInFlight.size
 }
 
 /** The small model is provider/model, with the first slash as separator. */
@@ -344,18 +371,36 @@ export type LLMExtractionDiagnostic =
       kind: "retries-exhausted"
       attempts: number
     }
+  | {
+      kind: "audit-registration-failed"
+    }
 
 export type LLMExtractionDiagnosticCallback = (
   diagnostic: LLMExtractionDiagnostic,
 ) => void | Promise<void>
 
+export type AuditCreatedCallback = (
+  audit: LLMAuditMetadata,
+) => boolean | void | Promise<boolean | void>
+
+export type AuditTerminalCallback = (
+  auditSessionID: string,
+  outcome: Exclude<AuditTerminalOutcome, "pending">,
+) => void | Promise<void>
+
 export interface ExtractFactsLLMOptions {
   /** Project directory required by every v1 request. */
   directory?: string
+  /** Stable resolved project key for process-local in-flight coalescing. */
+  projectKey?: string
   /** A validated cache result, checked before creating an audit session. */
   cachedFacts?: ExtractedFacts | null
   /** Optional best-effort callback for bounded extraction diagnostics. */
   onDiagnostic?: LLMExtractionDiagnosticCallback
+  /** Persist the guard before the first audit prompt. Returning false aborts. */
+  onAuditCreated?: AuditCreatedCallback
+  /** Persist the terminal state after structured extraction completes. */
+  onAuditTerminal?: AuditTerminalCallback
 }
 
 /** Diagnostics must never change extraction behavior, even if a callback fails. */
@@ -388,6 +433,43 @@ export async function extractFactsLLM(
 ): Promise<ExtractedFacts | null> {
   if (!config.enabled || !config.model) return null
   if (options?.cachedFacts) return options.cachedFacts
+
+  const projectKey = options?.projectKey ?? options?.directory ?? projectName
+  const inFlightKey = `${projectKey}\u0000${sourceSessionID}`
+  const existing = extractionInFlight.get(inFlightKey)
+  if (existing) return existing
+
+  let promise!: Promise<ExtractedFacts | null>
+  promise = (async () => {
+    try {
+      return await extractFactsLLMOnce(
+        canonicalInput,
+        sourceSessionID,
+        projectName,
+        clientValue,
+        config,
+        options,
+      )
+    } finally {
+      if (extractionInFlight.get(inFlightKey) === promise) {
+        extractionInFlight.delete(inFlightKey)
+      }
+    }
+  })()
+  extractionInFlight.set(inFlightKey, promise)
+  return promise
+}
+
+async function extractFactsLLMOnce(
+  canonicalInput: CanonicalExtractionInput,
+  sourceSessionID: string,
+  projectName: string,
+  clientValue: unknown,
+  config: LLMExtractionConfig,
+  options?: ExtractFactsLLMOptions,
+): Promise<ExtractedFacts | null> {
+
+  if (!config.enabled || !config.model) return null
 
   const client = (clientValue ?? {}) as V1ClientLike
   if (!client.session?.create || !client.session.prompt) {
@@ -436,6 +518,33 @@ export async function extractFactsLLM(
     // Register before the first prompt so the audit session's idle event can
     // never re-enter extraction.
     retainedExtractionSessionIDs.add(extractionSessionID)
+
+    const audit: LLMAuditMetadata = {
+      audit_session_id: extractionSessionID,
+      source_session_id: sourceSessionID,
+      cache_key: makeExtractionCacheKey(
+        sourceSessionID,
+        canonicalInput.sha256,
+        config.model,
+      ),
+      provider_id: config.model.providerID,
+      model_id: config.model.modelID,
+      created_at: new Date().toISOString(),
+      terminal_outcome: "pending",
+    }
+
+    if (options?.onAuditCreated) {
+      try {
+        const persisted = await options.onAuditCreated(audit)
+        if (persisted === false) {
+          emitDiagnostic(options.onDiagnostic, { kind: "audit-registration-failed" })
+          return null
+        }
+      } catch {
+        emitDiagnostic(options.onDiagnostic, { kind: "audit-registration-failed" })
+        return null
+      }
+    }
   } catch (error) {
     emitDiagnostic(options?.onDiagnostic, {
       kind: "session-create-failed",
@@ -493,7 +602,10 @@ export async function extractFactsLLM(
       // particular, assistant text and free-form JSON are never fallbacks.
       const structured = info?.structured
       const facts = validateStructuredResult(structured)
-      if (facts) return facts
+      if (facts) {
+        await notifyAuditTerminal(options?.onAuditTerminal, extractionSessionID, "success")
+        return facts
+      }
       emitDiagnostic(options?.onDiagnostic, {
         kind: "structured-output-failed",
         attempt: attempt + 1,
@@ -514,7 +626,21 @@ export async function extractFactsLLM(
   }
 
   emitDiagnostic(options?.onDiagnostic, { kind: "retries-exhausted", attempts: 2 })
+  await notifyAuditTerminal(options?.onAuditTerminal, extractionSessionID, "failed")
   return null
+}
+
+async function notifyAuditTerminal(
+  callback: AuditTerminalCallback | undefined,
+  auditSessionID: string,
+  outcome: Exclude<AuditTerminalOutcome, "pending">,
+): Promise<void> {
+  if (!callback) return
+  try {
+    await callback(auditSessionID, outcome)
+  } catch {
+    // Terminal persistence is best effort and must not alter extraction.
+  }
 }
 
 /** Return validated facts for a cache key, or null for a stale/malformed entry. */

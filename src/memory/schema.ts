@@ -38,6 +38,29 @@ export const LLMExtractionCacheEntrySchema = z.object({
 })
 export type LLMExtractionCacheEntry = z.infer<typeof LLMExtractionCacheEntrySchema>
 
+/**
+ * Bounded durable guard information for a retained extraction session.
+ *
+ * This is deliberately operational metadata only.  It does not contain a
+ * transcript, prompt, response, or provenance claim.  `pending` is used while
+ * the audit session exists but before extraction has reached a terminal
+ * outcome; keeping that record is what prevents an audit idle event from
+ * re-entering after a reload.
+ */
+export const AuditTerminalOutcomeSchema = z.enum(["pending", "success", "failed"])
+export type AuditTerminalOutcome = z.infer<typeof AuditTerminalOutcomeSchema>
+
+export const LLMAuditMetadataSchema = z.object({
+  audit_session_id: z.string().max(256),
+  source_session_id: z.string().max(256),
+  cache_key: z.string().max(512),
+  provider_id: z.string().max(256),
+  model_id: z.string().max(256),
+  created_at: z.string().datetime({ offset: true }).or(z.string().max(128)),
+  terminal_outcome: AuditTerminalOutcomeSchema,
+})
+export type LLMAuditMetadata = z.infer<typeof LLMAuditMetadataSchema>
+
 export const MemoryFileSchema = z.object({
   version: z.literal(2),
   project_path: z.string(),
@@ -51,6 +74,8 @@ export const MemoryFileSchema = z.object({
   next_steps: z.array(z.string()).default([]),
   recent_sessions: z.array(z.string()).max(10).default([]),
   llm_extraction_cache: z.array(LLMExtractionCacheEntrySchema).max(10).optional(),
+  /** Additive v2 guard metadata; absent in older STATE.json files. */
+  llm_extraction_audits: z.array(LLMAuditMetadataSchema).max(20).optional(),
 })
 export type MemoryFile = z.infer<typeof MemoryFileSchema>
 

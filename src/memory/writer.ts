@@ -2,9 +2,10 @@
  * Memory writer — extracts facts from session transcripts and writes to STATE.json.
  * Triggered on session.idle. Full specification in docs/IMPLEMENTATION.md Appendix A.
  */
-import type { MemoryFile, Decision } from "./schema"
+import type { MemoryFile, Decision, AuditTerminalOutcome, LLMAuditMetadata } from "./schema"
 import type { ExtractedFacts, TranscriptMessage, TranscriptPart } from "../types"
 import { readMemory, writeMemory, emptyMemory, resolveProjectPath } from "./store"
+import { enqueueProjectJob, setProjectQueueOutcome } from "./lock"
 import { getCurrentGitSha } from "../util/git"
 import { atomicWrite } from "../util/fs"
 import { basename, join } from "node:path"
@@ -19,6 +20,7 @@ import {
   readExtractionCache,
   upsertExtractionCache,
   type LLMExtractionDiagnostic,
+  type AuditCreatedCallback,
 } from "./extract-llm"
 import { log } from "../util/log"
 
@@ -48,76 +50,86 @@ function logLLMDiagnostic(client: unknown, diagnostic: LLMExtractionDiagnostic):
 
 // ─── writeMemoryOnIdle ───────────────────────────────────────────────────────
 
-/**
- * Main entry point called from session.idle event handler.
- * Pulls transcript, extracts facts, merges, prunes, writes, generates header.
- * Never throws — try/catch around everything.
- */
-export async function writeMemoryOnIdle(opts: {
+export type IdleWriteOutcome =
+  | "no-messages"
+  | "heuristic-only"
+  | "cache-hit"
+  | "llm-success"
+  | "llm-failed"
+  | "queue-failed"
+
+type IdleWriteOptions = {
   client: unknown
   worktree: string
   directory: string
   sessionId: string
-}): Promise<void> {
+}
+
+/**
+ * Main entry point called from session.idle.  The queue is deliberately at
+ * this public boundary so direct callers cannot accidentally bypass the
+ * project/source serialization contract.
+ */
+export async function writeMemoryOnIdle(opts: IdleWriteOptions): Promise<IdleWriteOutcome> {
+  const project = resolveProjectPath(opts.worktree, opts.directory)
+  try {
+    const outcome = await enqueueProjectJob(
+      project,
+      opts.sessionId,
+      () => writeMemoryOnIdleSerialized(opts),
+    )
+    setProjectQueueOutcome(project, outcome)
+    return outcome
+  } catch {
+    setProjectQueueOutcome(project, "queue-failed")
+    return "queue-failed"
+  }
+}
+
+/** The serialized transaction; heuristic persistence always precedes LLM work. */
+async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<IdleWriteOutcome> {
   try {
     const { client, worktree, directory, sessionId } = opts
 
-    // Fetch session messages
     const c = client as {
       session?: {
         messages: (args: { path: { id: string } }) => Promise<{ data?: TranscriptMessage[] }>
       }
     }
-    if (!c.session?.messages) return
+    if (!c.session?.messages) return "no-messages"
 
     const result = await c.session.messages({ path: { id: sessionId } })
     const allMessages = result.data
-    if (!allMessages || allMessages.length === 0) return
+    if (!allMessages || allMessages.length === 0) return "no-messages"
 
-    // Cap to last TRANSCRIPT_WINDOW messages
     const messages = allMessages.slice(-TRANSCRIPT_WINDOW)
-
-    // Read this snapshot before the heuristic write. It is the stable prior
-    // state used to identify the exact extraction input, and does not include
-    // facts produced by this idle event.
     const existing = (await readMemory({ worktree, directory })) ?? emptyMemory(worktree)
-    const canonicalInput = buildCanonicalInput(messages, existing)
-
-    // Get git SHA
+    // Operational audit guards, like the result cache itself, must not change
+    // the identity of the same source transcript on a later idle/reload.
+    const canonicalPrior = { ...existing, llm_extraction_audits: undefined }
+    const canonicalInput = buildCanonicalInput(messages, canonicalPrior)
     const gitSha = await getCurrentGitSha(worktree)
-
-    // Extract facts from transcript
     const extracted = extractFactsHeuristic(messages)
 
-    // Mark referenced decisions (scan for recall_decision tool calls)
     markReferencedDecisions(existing, allMessages, sessionId)
-
-    // Merge extracted facts into existing memory
     const merged = mergeMemory(existing, extracted, {
       sessionId,
       gitSha,
       timestamp: new Date().toISOString(),
     })
+    const pruned = pruneOld(recordRecentSession(merged, sessionId))
 
-    // Record the source session once per idle write, retaining the newest ten.
-    const withRecentSession = recordRecentSession(merged, sessionId)
-
-    // Prune to 8KB cap
-    const pruned = pruneOld(withRecentSession)
-
-    // Write to disk before doing any LLM work. This is the durable heuristic
-    // fallback if the process exits or an LLM request is unavailable.
-    await writeMemory({ worktree, directory }, pruned)
+    // Durable heuristic fallback. A failed state write cannot justify an
+    // un-serialized prompt, so stop before model discovery in that case.
+    const heuristicPersisted = await writeMemory({ worktree, directory }, pruned)
+    if (heuristicPersisted === false) return "heuristic-only"
     await generateHeader(worktree, directory, pruned)
 
-    // The feature is opt-in and all LLM calls happen after the idle handler has
-    // entered this function. In particular, initialization never resolves
-    // config.small_model.
     if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
       void log(client, "debug", "llm extraction skipped: TOKENMAXXER_LLM_EXTRACT is disabled", {
         reason: "TOKENMAXXER_LLM_EXTRACT is disabled",
       })
-      return
+      return "heuristic-only"
     }
 
     const llmConfig = await getLLMConfig(client, directory)
@@ -125,28 +137,42 @@ export async function writeMemoryOnIdle(opts: {
       void log(client, "info", "llm extraction skipped: model unavailable", {
         reason: boundedDiagnosticValue(llmConfig.reason ?? "model resolution returned no model"),
       })
-      return
+      return "heuristic-only"
     }
     void log(client, "info", "llm extraction model resolved", {
       provider: boundedDiagnosticValue(llmConfig.model.providerID),
       model: boundedDiagnosticValue(llmConfig.model.modelID),
     })
 
+    // This is the first cache check under the project queue, immediately
+    // before any retained audit session or prompt can be created.
     const cacheKey = extractionCacheKey(sessionId, canonicalInput, llmConfig.model)
     const afterHeuristic = (await readMemory({ worktree, directory })) ?? pruned
     const cachedFacts = readExtractionCache(afterHeuristic, cacheKey)
-
-    // Cache hits still merge validated facts into the latest state, but make
-    // no session or prompt request.
     if (cachedFacts) {
       void log(client, "debug", "llm extraction cache hit")
       await mergeAsyncFacts(opts, cachedFacts, gitSha, sessionId)
       void log(client, "info", "llm extraction facts merged")
-      return
+      return "cache-hit"
     }
 
     const project = resolveProjectPath(worktree, directory)
     const projectName = basename(project) || project
+    const persistAudit: AuditCreatedCallback = async (audit) => {
+      const latest = (await readMemory({ worktree, directory })) ?? afterHeuristic
+      const guarded = upsertAuditMetadata(latest, audit)
+      return writeMemory({ worktree, directory }, pruneOld(guarded))
+    }
+    const persistTerminal = async (
+      auditSessionID: string,
+      outcome: Exclude<AuditTerminalOutcome, "pending">,
+    ): Promise<void> => {
+      const latest = await readMemory({ worktree, directory })
+      if (!latest) return
+      const updated = setAuditTerminalOutcome(latest, auditSessionID, outcome)
+      await writeMemory({ worktree, directory }, pruneOld(updated))
+    }
+
     void log(client, "debug", "llm extraction audit session requested")
     const llmFacts = await extractFactsLLM(
       canonicalInput,
@@ -156,18 +182,27 @@ export async function writeMemoryOnIdle(opts: {
       llmConfig,
       {
         directory,
+        projectKey: project,
         onDiagnostic: (diagnostic) => logLLMDiagnostic(client, diagnostic),
+        onAuditCreated: persistAudit,
+        onAuditTerminal: persistTerminal,
       },
     )
     if (!llmFacts) {
       void log(client, "warn", "llm extraction returned no facts")
-      return
+      return "llm-failed"
     }
 
-    // Prompting is asynchronous. Re-read immediately before applying the
-    // result so another memory update is not overwritten by the stale prior
-    // snapshot used for this extraction.
+    // Re-read under the same project transaction immediately before the final
+    // merge/upsert. A duplicate completion therefore replaces, rather than
+    // appends, the same cache identity.
     const latest = (await readMemory({ worktree, directory })) ?? pruned
+    const cacheAlreadyCommitted = readExtractionCache(latest, cacheKey)
+    if (cacheAlreadyCommitted) {
+      await mergeAsyncFacts(opts, cacheAlreadyCommitted, gitSha, sessionId)
+      return "cache-hit"
+    }
+
     const timestamp = new Date().toISOString()
     const mergedLLM = mergeMemory(latest, llmFacts, {
       sessionId,
@@ -185,11 +220,66 @@ export async function writeMemoryOnIdle(opts: {
       }),
     )
     const finalMemory = pruneOld(withCache)
-    await writeMemory({ worktree, directory }, finalMemory)
+    const committed = await writeMemory({ worktree, directory }, finalMemory)
+    if (committed === false) return "llm-failed"
     await generateHeader(worktree, directory, finalMemory)
     void log(client, "info", "llm extraction facts merged")
+    return "llm-success"
   } catch {
-    // Never throw from event handler
+    // Never throw from event handler or poison later queued source sessions.
+    return "heuristic-only"
+  }
+}
+
+function upsertAuditMetadata(mem: MemoryFile, audit: LLMAuditMetadata): MemoryFile {
+  const audits = (mem.llm_extraction_audits ?? [])
+    .filter((candidate) => candidate.audit_session_id !== audit.audit_session_id)
+  return {
+    ...mem,
+    llm_extraction_audits: boundedAuditMetadata([...audits, audit]),
+  }
+}
+
+export function boundedAuditMetadata(audits: LLMAuditMetadata[]): LLMAuditMetadata[] {
+  const active = audits.filter((audit) => audit.terminal_outcome === "pending")
+  const completed = audits.filter((audit) => audit.terminal_outcome !== "pending")
+  // Keep the newest pending guards first, then use whatever capacity remains
+  // for the newest completed audit history. Restore original order after the
+  // timestamp selection so serialized metadata stays deterministic.
+  const retainedActive = mostRecentAuditRecords(active, 20)
+  const completedSlots = Math.max(0, 20 - retainedActive.length)
+  // Pending guards are retained ahead of pruning completed history so a
+  // reload cannot re-enter an active audit session.
+  return [...mostRecentAuditRecords(completed, completedSlots), ...retainedActive]
+}
+
+function mostRecentAuditRecords(
+  audits: LLMAuditMetadata[],
+  limit: number,
+): LLMAuditMetadata[] {
+  if (limit >= audits.length) return audits
+  return audits
+    .map((audit, index) => ({ audit, index }))
+    .sort((left, right) => (
+      left.audit.created_at.localeCompare(right.audit.created_at) || left.index - right.index
+    ))
+    .slice(-limit)
+    .sort((left, right) => left.index - right.index)
+    .map(({ audit }) => audit)
+}
+
+function setAuditTerminalOutcome(
+  mem: MemoryFile,
+  auditSessionID: string,
+  outcome: Exclude<AuditTerminalOutcome, "pending">,
+): MemoryFile {
+  return {
+    ...mem,
+    llm_extraction_audits: (mem.llm_extraction_audits ?? []).map((audit) => (
+      audit.audit_session_id === auditSessionID
+        ? { ...audit, terminal_outcome: outcome }
+        : audit
+    )),
   }
 }
 
@@ -936,6 +1026,7 @@ export function mergeMemory(
     next_steps: extracted.next_steps,
     recent_sessions: existing.recent_sessions ?? [],
     llm_extraction_cache: existing.llm_extraction_cache,
+    llm_extraction_audits: existing.llm_extraction_audits,
   }
 }
 
@@ -970,6 +1061,30 @@ function cryptoRandomUUID(): string {
 const MAX_BYTES = 8192
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000
 
+function removeOldestCompletedAudit(mem: MemoryFile): boolean {
+  const audits = mem.llm_extraction_audits
+  if (!audits?.length) return false
+
+  let oldestIndex = -1
+  for (let index = 0; index < audits.length; index++) {
+    const audit = audits[index]
+    if (!audit || audit.terminal_outcome === "pending") continue
+    if (oldestIndex === -1) {
+      oldestIndex = index
+      continue
+    }
+
+    const oldest = audits[oldestIndex]
+    if (oldest && audit.created_at.localeCompare(oldest.created_at) < 0) {
+      oldestIndex = index
+    }
+  }
+
+  if (oldestIndex === -1) return false
+  audits.splice(oldestIndex, 1)
+  return true
+}
+
 /**
  * Prune a MemoryFile to fit within the 8KB cap.
  * Returns a NEW object (deep clone) — does not mutate input.
@@ -999,6 +1114,16 @@ export function pruneOld(mem: MemoryFile): MemoryFile {
         next_steps: [...entry.facts.next_steps],
       },
     })),
+    llm_extraction_audits: mem.llm_extraction_audits
+      ? boundedAuditMetadata(mem.llm_extraction_audits.map((audit) => ({ ...audit })))
+      : undefined,
+  }
+
+  // Audit metadata is more important than disposable completed history. Drop
+  // oldest completed records while the state is oversized, but never discard
+  // pending guards before the later state reductions have run.
+  while (jsonSize(cloned) > MAX_BYTES && removeOldestCompletedAudit(cloned)) {
+    // Re-check after each bounded removal.
   }
 
   // 1. Check if within cap

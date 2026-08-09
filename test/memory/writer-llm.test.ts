@@ -249,6 +249,8 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
     expect(prompt).toHaveBeenCalledTimes(2)
     expect(memory?.current_task).toContain("Implement the extraction")
     expect(memory?.llm_extraction_cache).toBeUndefined()
+    expect(memory?.llm_extraction_audits).toHaveLength(1)
+    expect(memory?.llm_extraction_audits?.[0]?.terminal_outcome).toBe("failed")
     expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
       body: expect.objectContaining({
         level: "warn",
