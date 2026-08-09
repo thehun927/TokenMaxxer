@@ -20,6 +20,12 @@ import type { EvidenceKind, Evidence } from "./schema"
 import type { CanonicalExtractionInput } from "./extract-prompt"
 import { buildExtractionPrompt, makeExtractionCacheKey } from "./extract-prompt"
 import { readMemory } from "./store"
+import {
+  createAuditSession,
+  getHostStructuredContractGate,
+  requestStructuredOutput,
+  type LLMAdapterError,
+} from "./llm-adapter"
 
 export interface SmallModel {
   providerID: string
@@ -139,35 +145,9 @@ type V1ClientLike = {
     list: (parameters: { query: { directory: string } }) => Promise<unknown>
   }
   session?: {
-    create: (parameters: {
-      body: { title: string }
-      query: { directory: string }
-    }) => Promise<unknown>
-    prompt: (parameters: {
-      path: { id: string }
-      query: { directory: string }
-      body: {
-        model: SmallModel
-        parts: Array<{ type: "text"; text: string }>
-      }
-    }) => Promise<unknown>
+    create: (parameters: unknown) => Promise<unknown>
+    prompt: (parameters: unknown) => Promise<unknown>
   }
-}
-
-type StructuredPromptParameters = {
-  path: { id: string }
-  query: { directory: string }
-  body: {
-    model: SmallModel
-    parts: Array<{ type: "text"; text: string }>
-    format: { type: "json_schema"; schema: Record<string, unknown> }
-    variant?: string
-  }
-}
-
-type StructuredResponseInfo = {
-  structured?: unknown
-  error?: unknown
 }
 
 type ProviderInventoryEntry = {
@@ -335,6 +315,14 @@ export async function getLLMConfig(
     return { enabled: false, reason: "TOKENMAXXER_LLM_EXTRACT is disabled" }
   }
 
+  const hostGate = await getHostStructuredContractGate(clientValue)
+  if (!hostGate.allowed) {
+    return {
+      enabled: false,
+      reason: `host structured contract gate: ${hostGate.reason}`,
+    }
+  }
+
   const client = (clientValue ?? {}) as V1ClientLike
   let configuredModel: SmallModel | undefined
 
@@ -379,7 +367,12 @@ export type LLMExtractionDiagnostic =
   | {
       kind: "structured-output-failed"
       attempt: number
-      reason: "request-error" | "error-response" | "malformed-response" | "invalid-structured-output"
+      reason:
+        | "request-error"
+        | "error-response"
+        | "malformed-response"
+        | "response-shape-drift"
+        | "invalid-structured-output"
       error?: SanitizedError
     }
   | {
@@ -409,6 +402,22 @@ export type EvidenceRejectionReason =
 export type LLMExtractionDiagnosticCallback = (
   diagnostic: LLMExtractionDiagnostic,
 ) => void | Promise<void>
+
+function adapterFailureReason(
+  error: LLMAdapterError,
+  stage: "session-create" | "structured-prompt",
+): "request-error" | "error-response" | "malformed-response" | "response-shape-drift" {
+  if (error.code === "request-error") return "request-error"
+  if (error.code === "error-response") return "error-response"
+  if (stage === "structured-prompt") {
+    return "response-shape-drift"
+  }
+  return "malformed-response"
+}
+
+function adapterFailureError(error: LLMAdapterError): SanitizedError | undefined {
+  return error.causeValue === undefined ? undefined : sanitizeError(error.causeValue)
+}
 
 export type AuditCreatedCallback = (
   audit: LLMAuditMetadata,
@@ -660,39 +669,23 @@ async function extractFactsLLMOnce(
 
   let extractionSessionID: string | undefined
   try {
-    // The v1 create type omits metadata. Keep the compatibility cast at this
-    // call site rather than widening the rest of the client surface.
-    const create = client.session.create as unknown as (parameters: {
-      body: {
-        title: string
-        metadata: Record<string, unknown>
-      }
-      query: { directory: string }
-    }) => Promise<unknown>
-    const created = await create.call(client.session, {
-      body: {
-        title: `tokenmaxxer extract · ${projectName} · ${sourceSessionID.slice(-8)}`,
-        metadata: {
-          tokenmaxxer: {
-            kind: "llm-extraction",
-            sourceSessionID,
-          },
-        },
-      },
-      query: { directory: options?.directory ?? "" },
+    const created = await createAuditSession(client, {
+      directory: options?.directory ?? "",
+      title: `tokenmaxxer extract · ${projectName} · ${sourceSessionID.slice(-8)}`,
+      sourceSessionID,
     })
-    const response = created as { data?: { id?: unknown }; error?: unknown } | null
-    if (!response || response.error != null || typeof response.data?.id !== "string") {
+    if (!created.ok) {
+      const reason = adapterFailureReason(created.error, "session-create")
       emitDiagnostic(options?.onDiagnostic, {
         kind: "session-create-failed",
-        reason: response?.error != null
-          ? "error-response"
-          : "malformed-response",
-        ...(response?.error != null ? { error: sanitizeError(response.error) } : {}),
+        reason: reason === "response-shape-drift" ? "malformed-response" : reason,
+        ...(adapterFailureError(created.error)
+          ? { error: adapterFailureError(created.error) }
+          : {}),
       })
       return null
     }
-    extractionSessionID = response.data.id
+    extractionSessionID = created.value
     // Register before the first prompt so the audit session's idle event can
     // never re-enter extraction.
     retainedExtractionSessionIDs.add(extractionSessionID)
@@ -732,53 +725,35 @@ async function extractFactsLLMOnce(
     return null
   }
 
-  // The v1 prompt type omits structured format. Cast only this request shape;
-  // response text is intentionally never inspected as a fallback.
-  const prompt = client.session.prompt as unknown as (
-    parameters: StructuredPromptParameters,
-  ) => Promise<unknown>
-  const promptParameters: StructuredPromptParameters = {
-    path: { id: extractionSessionID },
-    query: { directory: options?.directory ?? "" },
-    body: {
-      model: {
-        providerID: config.model.providerID,
-        modelID: config.model.modelID,
-      },
-      parts: [{ type: "text", text: buildExtractionPrompt(canonicalInput) }],
-      format: {
-        type: "json_schema",
-        schema: ExtractedFactsJsonSchema,
-      },
-      ...(config.model.variant !== undefined ? { variant: config.model.variant } : {}),
-    },
-  }
-
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const result = await prompt.call(client.session, promptParameters)
-      const response = result as {
-        data?: { info?: unknown }
-        error?: unknown
-      } | null
+      const result = await requestStructuredOutput(client, {
+        sessionID: extractionSessionID,
+        directory: options?.directory ?? "",
+        model: {
+          providerID: config.model.providerID,
+          modelID: config.model.modelID,
+        },
+        prompt: buildExtractionPrompt(canonicalInput),
+        schema: ExtractedFactsJsonSchema,
+        ...(config.model.variant !== undefined ? { variant: config.model.variant } : {}),
+      })
 
-      // The SDK may return an error field without throwing. It is a failed
-      // attempt even if a partial data object happens to be present.
-      const info = response?.data?.info as StructuredResponseInfo | undefined
-      if (!response || response.error != null || info?.error != null) {
-        const responseError = response?.error ?? info?.error
+      if (!result.ok) {
         emitDiagnostic(options?.onDiagnostic, {
           kind: "structured-output-failed",
           attempt: attempt + 1,
-          reason: !response ? "malformed-response" : "error-response",
-          ...(responseError != null ? { error: sanitizeError(responseError) } : {}),
+          reason: adapterFailureReason(result.error, "structured-prompt"),
+          ...(adapterFailureError(result.error)
+            ? { error: adapterFailureError(result.error) }
+            : {}),
         })
         continue
       }
 
       // Structured output is the only response value that is inspected. In
       // particular, assistant text and free-form JSON are never fallbacks.
-      const structured = info?.structured
+      const structured = result.value
       const facts = validateStructuredResult(structured)
       if (facts) {
         const corroborated = corroborateLLMFacts(facts, options)

@@ -12,6 +12,7 @@ import {
   getActiveFiles,
   getProjectState,
 } from "../memory/reader"
+import { enqueueProjectJob } from "../memory/lock"
 
 function decisionProvenanceLabel(value: { provenance?: {
   source_session_id: string
@@ -81,28 +82,37 @@ export async function _recallPromote(
   context: { worktree: string; directory: string; sessionID?: string; sessionId?: string },
 ): Promise<string> {
   try {
-    const mem = await readMemory({ worktree: context.worktree, directory: context.directory })
-    if (!mem) return "No project memory."
-    const d = mem.decisions.find(
-      (d) => d.topic.toLowerCase() === args.topic.toLowerCase(),
-    )
-    if (!d) return `No decision with topic "${args.topic}".`
-    d.foundational = true
-    d.foundational_requested = false
-    const reviewSession = context.sessionID ?? context.sessionId ?? d.session_id ?? "human-review"
-    d.provenance = {
-      ...(d.provenance ?? {
-        extractor: "legacy" as const,
-        source_session_id: d.session_id || "legacy",
-        confidence: "legacy" as const,
-        evidence: [],
-      }),
-      extractor: "human",
-      source_session_id: reviewSession,
-      confidence: "human-reviewed",
-    }
-    await writeMemory({ worktree: context.worktree, directory: context.directory }, mem)
-    return `Promoted: ${d.topic}: ${d.decision}${d.provenance ? ` [${decisionProvenanceLabel(d)}]` : ""}`
+    const project = context.worktree && context.worktree !== "/"
+      ? context.worktree
+      : context.directory
+    // Read, review, and write must be one queued project operation.  Otherwise
+    // an idle writer can read the pre-promotion state and overwrite a human
+    // review after this tool returns.
+    const operationKey = `recall-promote:${args.topic.trim().toLowerCase().slice(0, 256)}`
+    return await enqueueProjectJob(project, operationKey, async () => {
+      const mem = await readMemory({ worktree: context.worktree, directory: context.directory })
+      if (!mem) return "No project memory."
+      const d = mem.decisions.find(
+        (d) => d.topic.toLowerCase() === args.topic.toLowerCase(),
+      )
+      if (!d) return `No decision with topic "${args.topic}".`
+      d.foundational = true
+      d.foundational_requested = false
+      const reviewSession = context.sessionID ?? context.sessionId ?? d.session_id ?? "human-review"
+      d.provenance = {
+        ...(d.provenance ?? {
+          extractor: "legacy" as const,
+          source_session_id: d.session_id || "legacy",
+          confidence: "legacy" as const,
+          evidence: [],
+        }),
+        extractor: "human",
+        source_session_id: reviewSession,
+        confidence: "human-reviewed",
+      }
+      await writeMemory({ worktree: context.worktree, directory: context.directory }, mem)
+      return `Promoted: ${d.topic}: ${d.decision}${d.provenance ? ` [${decisionProvenanceLabel(d)}]` : ""}`
+    })
   } catch (e) {
     return `Error promoting decision: ${String(e)}`
   }

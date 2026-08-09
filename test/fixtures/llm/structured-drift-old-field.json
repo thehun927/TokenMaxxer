@@ -1,0 +1,13 @@
+{
+  "data": {
+    "info": {
+      "structured_output": {
+        "current_task": "must not be accepted",
+        "active_files": [],
+        "decisions": [],
+        "blockers": [],
+        "next_steps": []
+      }
+    }
+  }
+}

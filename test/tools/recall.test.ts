@@ -13,6 +13,7 @@ vi.mock("../../src/memory/reader", () => ({
 
 import { readMemory, writeMemory } from "../../src/memory/store"
 import { queryDecisions, getActiveFiles, getProjectState } from "../../src/memory/reader"
+import { enqueueProjectJob, resetProjectQueues } from "../../src/memory/lock"
 import {
   _recallDecision,
   _getActiveFiles,
@@ -61,6 +62,7 @@ const mockContext = { worktree: "/home/user/my-project", directory: "/home/user/
 describe("_recallDecision", () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetProjectQueues()
   })
 
   it("with empty query: calls queryDecisions with undefined query, limit 10", async () => {
@@ -210,6 +212,7 @@ describe("_getProjectState", () => {
 describe("_recallPromote", () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetProjectQueues()
   })
 
   it("with existing topic: sets foundational=true, calls writeMemory", async () => {
@@ -310,5 +313,50 @@ describe("_recallPromote", () => {
     const result = await _recallPromote({ topic: "database" }, mockContext)
 
     expect(result).toContain("Error promoting decision: Error: disk failure")
+  })
+
+  it("serializes promotion after a concurrent idle write", async () => {
+    let stored = makeMemory()
+    vi.mocked(readMemory).mockImplementation(async () => structuredClone(stored))
+    vi.mocked(writeMemory).mockImplementation(async (_context, memory) => {
+      stored = structuredClone(memory)
+      return true
+    })
+
+    let markIdleStarted!: () => void
+    let releaseIdle!: () => void
+    const idleStarted = new Promise<void>((resolve) => { markIdleStarted = resolve })
+    const idleRelease = new Promise<void>((resolve) => { releaseIdle = resolve })
+    const staleIdleSnapshot = structuredClone(stored)
+    const idle = enqueueProjectJob(
+      mockContext.worktree,
+      "idle-session-serialization",
+      async () => {
+        markIdleStarted()
+        await idleRelease
+        await writeMemory(mockContext, {
+          ...staleIdleSnapshot,
+          current_task: "idle update",
+        })
+      },
+    )
+    await idleStarted
+
+    const promotion = _recallPromote(
+      { topic: "database" },
+      { ...mockContext, sessionID: "human-review-session" },
+    )
+    releaseIdle()
+    await Promise.all([idle, promotion])
+
+    expect(stored.decisions[0]).toMatchObject({
+      foundational: true,
+      foundational_requested: false,
+      provenance: {
+        extractor: "human",
+        source_session_id: "human-review-session",
+        confidence: "human-reviewed",
+      },
+    })
   })
 })

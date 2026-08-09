@@ -30,7 +30,7 @@
     "zod": ">=3.0.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "latest",
+    "@opencode-ai/plugin": "1.18.15",
     "@opentui/core": "^0.4.5",
     "@opentui/keymap": "^0.4.5",
     "@opentui/solid": "^0.4.5",

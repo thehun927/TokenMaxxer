@@ -8,6 +8,7 @@ import { pruneOld } from "../../src/memory/writer"
 import { readMemory, writeMemory } from "../../src/memory/store"
 import { emptyMemory, type LLMAuditMetadata } from "../../src/memory/schema"
 import { isPersistedRetainedExtractionSession, extractFactsLLM } from "../../src/memory/extract-llm"
+import { resetHostStructuredContractGate } from "../../src/memory/llm-adapter"
 import { buildCanonicalInput } from "../../src/memory/extract-prompt"
 import { resetProjectQueues } from "../../src/memory/lock"
 import type { TranscriptMessage } from "../../src/types"
@@ -64,6 +65,7 @@ function clientFor(
 
 afterEach(async () => {
   vi.unstubAllEnvs()
+  resetHostStructuredContractGate()
   resetProjectQueues()
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
 })
@@ -241,5 +243,35 @@ describe("P0-A idle reliability", () => {
     expect(prompt).not.toHaveBeenCalled()
     expect((await readMemory({ worktree: project, directory: project }))?.current_task)
       .toBe("heuristic fallback")
+  })
+
+  it("falls back to persisted heuristics before audit creation on an old host", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    resetHostStructuredContractGate()
+    const project = await worktree()
+    const base = clientFor({ source: messages() })
+    const client = {
+      ...base,
+      global: {
+        health: vi.fn(async () => ({
+          data: { healthy: true, version: "1.17.99" },
+        })),
+      },
+    }
+
+    await expect(writeMemoryOnIdle({
+      client,
+      worktree: project,
+      directory: project,
+      sessionId: "source",
+    })).resolves.toBe("heuristic-only")
+    expect(client.global.health).toHaveBeenCalledTimes(1)
+    expect(client.session.create).not.toHaveBeenCalled()
+    expect(client.session.prompt).not.toHaveBeenCalled()
+    expect(JSON.stringify(client.app.log.mock.calls)).not.toContain("Implement source extraction")
+    expect(client.app.log.mock.calls.some(([entry]) => (
+      entry?.body?.message === "sdk_host_version_gate" &&
+      entry.body.extra?.reason === "unsupported-version"
+    ))).toBe(true)
   })
 })
