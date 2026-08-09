@@ -179,6 +179,10 @@ describe("extraction cache identity and prompt", () => {
       'active_files: must be an array of objects, each exactly `{ "path": "relative/path", "reason": "short evidence-based reason" }`',
     )
     expect(prompt).toContain("use an empty array if no qualifying files")
+    expect(prompt).toContain(
+      'decisions: must be an array of objects, each with required `{ "topic": "short subject", "decision": "explicit decision" }`; optional `rationale` and `foundational`',
+    )
+    expect(prompt).toContain("otherwise use an empty array")
     for (const field of ExtractedFactsJsonSchema.required) {
       expect(prompt).toContain(`- ${field}:`)
     }
