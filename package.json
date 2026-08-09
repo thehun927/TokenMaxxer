@@ -18,7 +18,7 @@
     }
   },
   "scripts": {
-    "build": "tsup src/index.ts src/tui.tsx --format esm --dts --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opentui/solid --external @opentui/core --external @opentui/keymap --external zod",
+    "build": "tsup src/index.ts src/tui.tsx --format esm --dts --no-splitting --clean --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opentui/solid --external @opentui/core --external @opentui/keymap --external zod",
     "test": "vitest run",
     "test:watch": "vitest"
   },

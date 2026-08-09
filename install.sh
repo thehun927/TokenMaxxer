@@ -15,6 +15,33 @@ TUI_PLUGIN_FILE="${PLUGINS_DIR}/tokenmaxxer-tui.js"
 LAUNCHER_URL="https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/bin/tokenmaxxer"
 LAUNCHER_FILE="${BIN_DIR}/tokenmaxxer"
 
+download() {
+  local url="$1"
+  local destination="$2"
+  local temporary
+
+  temporary="$(mktemp "${destination}.tmp.XXXXXX")"
+  if command -v curl &>/dev/null; then
+    if ! curl -fsSL --retry 3 --retry-delay 1 --retry-connrefused "$url" -o "$temporary"; then
+      rm -f "$temporary"
+      echo "  ✗ Could not download $url"
+      exit 1
+    fi
+  elif command -v wget &>/dev/null; then
+    if ! wget -q --tries=3 --waitretry=1 "$url" -O "$temporary"; then
+      rm -f "$temporary"
+      echo "  ✗ Could not download $url"
+      exit 1
+    fi
+  else
+    rm -f "$temporary"
+    echo "  ✗ Need curl or wget to download."
+    exit 1
+  fi
+
+  mv "$temporary" "$destination"
+}
+
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                    tokenmaxxer installer                     ║"
 echo "║         session longevity & cross-session memory             ║"
@@ -24,14 +51,7 @@ echo ""
 # 1. Install the user launcher
 mkdir -p "$BIN_DIR"
 echo "  ↓ Downloading tokenmaxxer launcher..."
-if command -v curl &>/dev/null; then
-  curl -fsSL "$LAUNCHER_URL" -o "$LAUNCHER_FILE"
-elif command -v wget &>/dev/null; then
-  wget -q "$LAUNCHER_URL" -O "$LAUNCHER_FILE"
-else
-  echo "  ✗ Need curl or wget to download."
-  exit 1
-fi
+download "$LAUNCHER_URL" "$LAUNCHER_FILE"
 chmod +x "$LAUNCHER_FILE"
 echo "  ✓ Launcher installed: $LAUNCHER_FILE"
 
@@ -51,26 +71,12 @@ echo "  ✓ Plugins directory: $PLUGINS_DIR"
 
 # 3. Download the plugin
 echo "  ↓ Downloading plugin..."
-if command -v curl &>/dev/null; then
-  curl -fsSL "$PLUGIN_URL" -o "$PLUGIN_FILE"
-elif command -v wget &>/dev/null; then
-  wget -q "$PLUGIN_URL" -O "$PLUGIN_FILE"
-else
-  echo "  ✗ Need curl or wget to download."
-  exit 1
-fi
+download "$PLUGIN_URL" "$PLUGIN_FILE"
 echo "  ✓ Plugin installed: $PLUGIN_FILE"
 
 # 4. Download the separate TUI plugin target
 echo "  ↓ Downloading TUI plugin..."
-if command -v curl &>/dev/null; then
-  curl -fsSL "$TUI_PLUGIN_URL" -o "$TUI_PLUGIN_FILE"
-elif command -v wget &>/dev/null; then
-  wget -q "$TUI_PLUGIN_URL" -O "$TUI_PLUGIN_FILE"
-else
-  echo "  ✗ Need curl or wget to download."
-  exit 1
-fi
+download "$TUI_PLUGIN_URL" "$TUI_PLUGIN_FILE"
 echo "  ✓ TUI plugin installed: $TUI_PLUGIN_FILE"
 
 # 5. Ensure the server and TUI dependencies are in the global package.json
