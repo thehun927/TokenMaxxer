@@ -38,6 +38,7 @@ import {
   type AuditCreatedCallback,
 } from "./extract-llm"
 import { log } from "../util/log"
+import { beginMemoryActivity } from "./activity-state"
 
 const TRANSCRIPT_WINDOW = 50
 const MAX_DIAGNOSTIC_VALUE = 200
@@ -191,6 +192,7 @@ type IdleWriteOptions = {
  */
 export async function writeMemoryOnIdle(opts: IdleWriteOptions): Promise<IdleWriteOutcome> {
   const project = resolveProjectPath(opts.worktree, opts.directory)
+  const stopActivity = beginMemoryActivity(project)
   try {
     const outcome = await enqueueProjectJob(
       project,
@@ -202,6 +204,8 @@ export async function writeMemoryOnIdle(opts: IdleWriteOptions): Promise<IdleWri
   } catch {
     setProjectQueueOutcome(project, "queue-failed")
     return "queue-failed"
+  } finally {
+    stopActivity()
   }
 }
 
