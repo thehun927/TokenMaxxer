@@ -3,8 +3,8 @@
  *
  * Two layers, zero per-project config required:
  * 1. Compaction-quality hook — injects durable state + schema-constrained prompt.
- * 2. Per-project durable memory — written on session.idle, injected via
- *    experimental.chat.system.transform (no `instructions` config needed).
+ * 2. Per-project durable memory — written on session.idle and available via
+ *    the registered memory tools.
  *
  * See docs/PLAN.md and docs/IMPLEMENTATION.md for full design.
  */
@@ -15,7 +15,7 @@ import { buildCompactionPrompt } from "./compaction/prompt"
 import { buildDurableBlock } from "./compaction/durable"
 import { writeMemoryOnIdle } from "./memory/writer"
 import { isRetainedExtractionSession } from "./memory/extract-llm"
-import { readMemory, resolveProjectPath } from "./memory/store"
+import { resolveProjectPath } from "./memory/store"
 import { registerTools } from "./tools/recall"
 import { registerEfficiencyTools } from "./tools/efficiency"
 import { registerStatusTools, setLastCompaction } from "./tools/status"
@@ -105,33 +105,6 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
     ...registerEfficiencyTools(),
     ...registerStatusTools(),
 
-    // Layer 2: system prompt injection (zero-config — no `instructions` needed)
-    // This experimental hook fires when the system prompt is built (every session,
-    // every step). It pushes a brief instruction + project memory header into the
-    // system prompt, so the model always knows about the tools and sees prior
-    // project state. If the hook doesn't exist in the opencode version, it's
-    // silently ignored — the tools still work, the model just won't get the hint.
-    "experimental.chat.system.transform": async (
-      _input: unknown,
-      output: { system: string[] },
-    ) => {
-      try {
-        // Always push a tool-usage hint so the model knows to call get_project_state
-        output.system.push(
-          "tokenmaxxer: This project has cross-session memory. Call get_project_state at session start to load prior decisions, active files, and next steps.",
-        )
-
-        // If memory exists, push the project header too
-        const mem = await readMemory({ worktree, directory })
-        if (mem) {
-          output.system.push(
-            `Project: ${mem.project_path} | Last: ${mem.last_updated} (SHA ${mem.last_git_sha ?? "?"}) | Task: ${mem.current_task ?? "—"} | Decisions: ${mem.decisions.filter((d) => d.still_valid).length} valid | Call get_project_state for details.`,
-          )
-        }
-      } catch (e) {
-        await log(client, "error", "system.transform failed", { error: String(e) })
-      }
-    },
   }
 }
 

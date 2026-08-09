@@ -6,8 +6,11 @@ set -euo pipefail
 
 PLUGINS_DIR="${HOME}/.config/opencode/plugins"
 PACKAGE_JSON="${HOME}/.config/opencode/package.json"
+TUI_CONFIG_JSON="${HOME}/.config/opencode/tui.json"
 PLUGIN_URL="https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/dist/index.js"
 PLUGIN_FILE="${PLUGINS_DIR}/tokenmaxxer.js"
+TUI_PLUGIN_URL="https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/dist/tui.js"
+TUI_PLUGIN_FILE="${PLUGINS_DIR}/tokenmaxxer-tui.js"
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                    tokenmaxxer installer                     ║"
@@ -31,41 +34,104 @@ else
 fi
 echo "  ✓ Plugin installed: $PLUGIN_FILE"
 
-# 3. Ensure zod is in the global package.json
+# 3. Download the separate TUI plugin target
+echo "  ↓ Downloading TUI plugin..."
+if command -v curl &>/dev/null; then
+  curl -fsSL "$TUI_PLUGIN_URL" -o "$TUI_PLUGIN_FILE"
+elif command -v wget &>/dev/null; then
+  wget -q "$TUI_PLUGIN_URL" -O "$TUI_PLUGIN_FILE"
+else
+  echo "  ✗ Need curl or wget to download."
+  exit 1
+fi
+echo "  ✓ TUI plugin installed: $TUI_PLUGIN_FILE"
+
+# 4. Ensure the server and TUI dependencies are in the global package.json
 if [ -f "$PACKAGE_JSON" ]; then
-  if ! grep -q '"zod"' "$PACKAGE_JSON" 2>/dev/null; then
-    # Add zod to dependencies
-    TMP=$(mktemp)
-    if command -v node &>/dev/null; then
-      node -e "
-        const fs = require('fs');
-        const pkg = JSON.parse(fs.readFileSync('$PACKAGE_JSON', 'utf-8'));
-        pkg.dependencies = pkg.dependencies || {};
-        pkg.dependencies.zod = '^3.25.0';
-        fs.writeFileSync('$PACKAGE_JSON', JSON.stringify(pkg, null, 2) + '\n');
-      "
-      echo "  ✓ Added zod to global package.json"
+  if command -v node &>/dev/null; then
+    if PACKAGE_JSON="$PACKAGE_JSON" node <<'NODE'
+const fs = require('fs');
+
+const packagePath = process.env.PACKAGE_JSON;
+const pkg = JSON.parse(fs.readFileSync(packagePath, 'utf-8'));
+pkg.dependencies = pkg.dependencies || {};
+
+const required = {
+  zod: '^3.25.0',
+  '@opentui/solid': '^0.4.5',
+  '@opentui/core': '^0.4.5',
+  '@opentui/keymap': '^0.4.5',
+};
+
+for (const [name, version] of Object.entries(required)) {
+  if (!pkg.dependencies[name]) pkg.dependencies[name] = version;
+}
+
+fs.writeFileSync(packagePath, JSON.stringify(pkg, null, 2) + '\n');
+NODE
+    then
+      echo "  ✓ Ensured zod and OpenTUI dependencies in global package.json"
     else
-      echo "  ⚠ Could not add zod to package.json (node not found)."
-      echo "    Manually add \"zod\": \"^3.25.0\" to $PACKAGE_JSON dependencies."
+      echo "  ⚠ Could not update $PACKAGE_JSON (invalid or unreadable JSON)."
+      echo "    Manually add zod \"^3.25.0\" and @opentui/solid, @opentui/core, @opentui/keymap \"^0.4.5\" to its dependencies."
     fi
   else
-    echo "  ✓ zod already in global package.json"
+    echo "  ⚠ Could not add zod to package.json (node not found)."
+    echo "    Manually add \"zod\": \"^3.25.0\" to $PACKAGE_JSON dependencies."
+    echo "    Also add \"@opentui/solid\": \"^0.4.5\", \"@opentui/core\": \"^0.4.5\", and \"@opentui/keymap\": \"^0.4.5\"."
   fi
 else
   echo "  ⚠ No global package.json found at $PACKAGE_JSON"
   echo "    opencode will create it on next start and run bun install."
 fi
 
-# 4. Print success
+# 5. Add the TUI plugin to tui.json without removing or duplicating entries
+if command -v node &>/dev/null; then
+  if TUI_CONFIG_JSON="$TUI_CONFIG_JSON" node <<'NODE'
+const fs = require('fs');
+
+const configPath = process.env.TUI_CONFIG_JSON;
+const pluginPath = './plugins/tokenmaxxer-tui.js';
+let config = {};
+
+if (fs.existsSync(configPath)) {
+  config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw new Error('the root value must be a JSON object');
+  }
+}
+
+const plugins = config.plugin === undefined
+  ? []
+  : Array.isArray(config.plugin)
+    ? config.plugin
+    : [config.plugin];
+config.plugin = plugins.filter((entry) => entry !== pluginPath);
+config.plugin.push(pluginPath);
+
+fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+NODE
+  then
+    echo "  ✓ TUI plugin enabled in $TUI_CONFIG_JSON"
+  else
+    echo "  ⚠ Could not update $TUI_CONFIG_JSON; it was not changed."
+    echo "    Manually add \"./plugins/tokenmaxxer-tui.js\" once to its plugin array, keeping existing entries."
+  fi
+else
+  echo "  ⚠ Node not found; could not update $TUI_CONFIG_JSON."
+  echo "    Manually add \"./plugins/tokenmaxxer-tui.js\" once to its plugin array, keeping existing entries."
+fi
+
+# 6. Print success
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║  ✓ Installation complete!                                    ║"
 echo "║                                                              ║"
-echo "║  Both layers are active immediately in all projects:         ║"
+echo "║  Both server layers are active in all projects:              ║"
 echo "║  • Layer 1: compaction hook fires on /compact               ║"
 echo "║  • Layer 2: memory + tools work on session idle              ║"
 echo "║  • 7 custom tools registered (get_project_state, etc.)      ║"
+echo "║  • TUI: right-side memory indicator only                     ║"
 echo "║                                                              ║"
 echo "║  No per-project config required. Just restart opencode.      ║"
 echo "║                                                              ║"

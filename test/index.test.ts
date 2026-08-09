@@ -37,6 +37,24 @@ describe("plugin initialization", () => {
     expect(ctx.client.app.log).not.toHaveBeenCalled()
   })
 
+  it("does not expose a system transform hook or inject composer text", async () => {
+    const ctx = {
+      client: { app: { log: vi.fn(), info: vi.fn() } },
+      directory: "/workspace/project",
+      worktree: "/workspace/project",
+      serverUrl: new URL("http://127.0.0.1:4096"),
+      project: {},
+      experimental_workspace: { register: vi.fn() },
+      $: {},
+    }
+
+    const hooks = await TokenmaxxerPlugin(ctx as never)
+
+    expect(hooks).not.toHaveProperty("experimental.chat.system.transform")
+    expect(JSON.stringify(hooks)).not.toContain("tokenmaxxer: This project has cross-session memory")
+    expect(JSON.stringify(hooks)).not.toContain("current_task")
+  })
+
   it("skips registered extraction sessions but keeps normal idle events unchanged", async () => {
     const extractionSessionID = "registered-extraction-session"
     const input = buildCanonicalInput([], emptyMemory("/workspace/project"))

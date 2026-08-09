@@ -53,17 +53,28 @@ On `session.idle` (when the agent finishes responding), tokenmaxxer:
 2. Extracts structured facts using heuristics — current task, active files (from tool calls), decisions (from natural language), blockers, next steps.
 3. Merges with existing memory, superseding old decisions on the same topic.
 4. Prunes to stay under 8KB.
-5. Writes `STATE.json` and regenerates `HEADER.md`.
+5. Writes `STATE.json` silently.
 
-On the next session start, the model sees `HEADER.md` (loaded via opencode's `instructions` config) and can call tools to pull detailed memory:
+Memory remains available through pull-based tools; tokenmaxxer does not automatically add project memory or current-task text to a new session:
 
 ```
 Session 1: "Let's use Postgres for the database"
   → session.idle → STATE.json: { decisions: [{ topic: "postgres", ... }] }
 
-Session 2 (new): model sees HEADER.md → calls get_project_state
+Session 2 (new): model calls get_project_state
   → "You have a prior decision: use Postgres (SHA abc1234, 2026-08-08)"
 ```
+
+### Silent server target and separate TUI target
+
+The server target (`dist/index.js`) is silent: memory work never writes text to
+the composer. Automatic text injection was removed so user-derived or
+truncated current-task text cannot surface as a composer message. Memory is
+accessed through explicit tools and the compaction flow instead.
+
+The separate TUI target (`dist/tui.js`) renders only the right-side `memory`
+indicator as a non-composer status surface. It never renders composer text and
+is not required for server memory, extraction, or the core plugin.
 
 ## Install
 
@@ -73,10 +84,11 @@ Session 2 (new): model sees HEADER.md → calls get_project_state
 curl -fsSL https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/install.sh | bash
 ```
 
-That's it. Both layers are active immediately in all projects — no per-project config required.
+Restart opencode after installation. Both server layers are then active in all
+projects — no per-project config required.
 
 - **Layer 1** (compaction hook) fires on every `/compact`
-- **Layer 2** (memory + tools) writes `STATE.json` on session idle and injects the project header into the system prompt via the `experimental.chat.system.transform` hook
+- **Layer 2** (memory + tools) silently writes `STATE.json` on session idle; it does not write to the composer
 - **7 custom tools** are registered and available to the agent in every session
 
 ### Manual install
@@ -84,9 +96,30 @@ That's it. Both layers are active immediately in all projects — no per-project
 ```bash
 git clone https://github.com/thehun927/TokenMaxxer.git
 cd TokenMaxxer && npm install && npm run build
-cp dist/index.js ~/.config/opencode/plugins/tokenmaxxer.js   # global (all projects)
+mkdir -p ~/.config/opencode/plugins
+cp dist/index.js ~/.config/opencode/plugins/tokenmaxxer.js       # server target, global (all projects)
+cp dist/tui.js ~/.config/opencode/plugins/tokenmaxxer-tui.js     # TUI target, global (all projects)
 # or: cp dist/index.js .opencode/plugins/tokenmaxxer.js       # local (single project)
 ```
+
+For a global install, add `"./plugins/tokenmaxxer-tui.js"` once to the
+`plugin` array in `~/.config/opencode/tui.json` without removing existing
+entries. Also ensure `~/.config/opencode/package.json` has these dependency
+ranges (the one-liner adds them without running a network install):
+
+```json
+{
+  "dependencies": {
+    "zod": "^3.25.0",
+    "@opentui/solid": "^0.4.5",
+    "@opentui/core": "^0.4.5",
+    "@opentui/keymap": "^0.4.5"
+  }
+}
+```
+
+Restart opencode after copying both files so the server and separate TUI
+targets, dependencies, and TUI configuration are loaded.
 
 ### Optional tuning (not required)
 
@@ -105,12 +138,6 @@ For better token efficiency, add to your project's `opencode.json`:
 | `compaction.reserved: 15000` | Headroom so compaction doesn't overflow. |
 | `watcher.ignore` | Stops the file watcher from processing the plugin's writes to `.opencode/memory/`. Harmless without it, but slightly cleaner. |
 
-You can also add `.opencode/memory/HEADER.md` to `instructions` for redundant header injection (the `system.transform` hook already handles this, but `instructions` is the documented path):
-
-```jsonc
-"instructions": ["AGENTS.md", ".opencode/memory/HEADER.md"]
-```
-
 ### .gitignore
 
 Add to your project `.gitignore`:
@@ -121,7 +148,7 @@ Add to your project `.gitignore`:
 .opencode/memory/*.corrupt.*
 ```
 
-`STATE.json` contains session IDs and project decisions — don't commit it. `HEADER.md` is safe to commit (it's a <1KB pointer).
+`STATE.json` contains session IDs and project decisions — don't commit it.
 
 ## Tools
 
@@ -310,7 +337,7 @@ src/
     schema.ts             # Zod schemas (MemoryFile, Decision, ActiveFile)
     migrate.ts            # Version-aware migration (v1 → v2)
     store.ts              # Read/write STATE.json (cached, mtime-invalidated, corrupt recovery)
-    writer.ts             # Heuristic/LLM extraction, merge, prune, HEADER.md generation
+    writer.ts             # Heuristic/LLM extraction, merge, prune, STATE.json writes
     extract-llm.ts        # Opt-in structured extraction, model discovery, cache
     extract-prompt.ts     # Canonical extraction input and prompt
     reader.ts             # Query helpers for tools
