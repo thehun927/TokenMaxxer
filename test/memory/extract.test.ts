@@ -55,6 +55,12 @@ describe("LLM extraction schema", () => {
       }).success,
     ).toBe(false)
     expect(
+      ExtractedFactsSchema.safeParse({
+        ...validFacts,
+        active_files: ["src/api.ts"],
+      }).success,
+    ).toBe(false)
+    expect(
       ExtractedFactsSchema.safeParse({ ...validFacts, assistant_text: "{}" }).success,
     ).toBe(false)
     expect(validateStructuredResult({ ...validFacts, next_steps: Array(6).fill("step") })).toBeNull()
@@ -169,5 +175,12 @@ describe("extraction cache identity and prompt", () => {
     expect(prompt).toContain("free-form JSON")
     expect(prompt).toContain("assistant text")
     expect(prompt).toContain("do not copy old facts")
+    expect(prompt).toContain(
+      'active_files: must be an array of objects, each exactly `{ "path": "relative/path", "reason": "short evidence-based reason" }`',
+    )
+    expect(prompt).toContain("use an empty array if no qualifying files")
+    for (const field of ExtractedFactsJsonSchema.required) {
+      expect(prompt).toContain(`- ${field}:`)
+    }
   })
 })

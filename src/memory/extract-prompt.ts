@@ -398,7 +398,7 @@ The prior STATE.json snapshot is potentially stale context. Return only current-
 
 Rules:
 - current_task: describe what the current session is working on; use null when unclear.
-- active_files: only files read, edited, or written in this source session; max 5, relative paths.
+- active_files: must be an array of objects, each exactly \`{ "path": "relative/path", "reason": "short evidence-based reason" }\`; include only files read, edited, or written in this source session; max 5, relative paths; use an empty array if no qualifying files.
 - decisions: only explicit decisions (for example, "let's use X" or "decided to go with Y"). Do not include discussions, descriptions, or hypothetical decisions.
 - blockers: only blockers supported by the current session; otherwise use an empty array.
 - next_steps: only next steps stated by the current session; max 5.
