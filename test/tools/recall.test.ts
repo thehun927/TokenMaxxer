@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest"
 vi.mock("../../src/memory/store", () => ({
   readMemory: vi.fn(),
   writeMemory: vi.fn(),
+  resolveProjectPath: vi.fn((worktree: string, directory: string) => directory || worktree),
 }))
 
 vi.mock("../../src/memory/reader", () => ({
@@ -11,7 +12,7 @@ vi.mock("../../src/memory/reader", () => ({
   getProjectState: vi.fn(),
 }))
 
-import { readMemory, writeMemory } from "../../src/memory/store"
+import { readMemory, writeMemory, resolveProjectPath } from "../../src/memory/store"
 import { queryDecisions, getActiveFiles, getProjectState } from "../../src/memory/reader"
 import { enqueueProjectJob, resetProjectQueues } from "../../src/memory/lock"
 import {
@@ -233,6 +234,16 @@ describe("_recallPromote", () => {
     expect(writeMemory).toHaveBeenCalledWith(mockContext, mem)
     expect(result).toContain("Promoted: database: Use PostgreSQL")
     expect(result).toContain("confidence=human-reviewed")
+  })
+
+  it("uses the shared resolved project path for promotion", async () => {
+    const mem = makeMemory()
+    vi.mocked(readMemory).mockResolvedValue(mem)
+    const context = { worktree: "/", directory: "/home/user/non-git-project" }
+
+    await _recallPromote({ topic: "database" }, context)
+
+    expect(resolveProjectPath).toHaveBeenCalledWith("/", "/home/user/non-git-project")
   })
 
   it("with missing topic: returns error string", async () => {

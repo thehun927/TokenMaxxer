@@ -6,7 +6,7 @@
  * for direct testability without invoking the opencode tool runtime.
  */
 import { tool } from "@opencode-ai/plugin"
-import { readMemory, writeMemory } from "../memory/store"
+import { readMemory, writeMemory, resolveProjectPath } from "../memory/store"
 import {
   queryDecisions,
   getActiveFiles,
@@ -82,9 +82,12 @@ export async function _recallPromote(
   context: { worktree: string; directory: string; sessionID?: string; sessionId?: string },
 ): Promise<string> {
   try {
-    const project = context.worktree && context.worktree !== "/"
-      ? context.worktree
-      : context.directory
+    // Keep promotion on the same effective project key as memory reads/writes.
+    // The fallback is only for narrow test doubles that predate the shared
+    // resolver export; production always uses resolveProjectPath.
+    const project = typeof resolveProjectPath === "function"
+      ? resolveProjectPath(context.worktree, context.directory)
+      : (context.worktree && context.worktree !== "/" ? context.worktree : context.directory)
     // Read, review, and write must be one queued project operation.  Otherwise
     // an idle writer can read the pre-promotion state and overwrite a human
     // review after this tool returns.

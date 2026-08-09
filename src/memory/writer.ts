@@ -30,6 +30,8 @@ import {
   readExtractionCacheEntry,
   resolveEvidenceReferences,
   upsertExtractionCache,
+  upsertModelHealth,
+  MODEL_HEALTH_MAX_RECORDS,
   type EvidenceCandidate,
   type EvidenceCandidateMap,
   type LLMExtractionDiagnostic,
@@ -256,21 +258,24 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       return "heuristic-only"
     }
 
-    const llmConfig = await getLLMConfig(client, directory)
-    if (!llmConfig.enabled || !llmConfig.model) {
+    // Resolve once without the health gate so an already accepted cache row can
+    // still be used for a model whose last real attempt failed.  No prompt or
+    // audit session is created by this lookup.
+    const cacheConfig = await getLLMConfig(client, directory, { ignoreHealth: true })
+    if (!cacheConfig.model) {
       void log(client, "info", "llm extraction skipped: model unavailable", {
-        reason: boundedDiagnosticValue(llmConfig.reason ?? "model resolution returned no model"),
+        reason: boundedDiagnosticValue(cacheConfig.reason ?? "model resolution returned no model"),
       })
       return "heuristic-only"
     }
     void log(client, "info", "llm extraction model resolved", {
-      provider: boundedDiagnosticValue(llmConfig.model.providerID),
-      model: boundedDiagnosticValue(llmConfig.model.modelID),
+      provider: boundedDiagnosticValue(cacheConfig.model.providerID),
+      model: boundedDiagnosticValue(cacheConfig.model.modelID),
     })
 
     // This is the first cache check under the project queue, immediately
     // before any retained audit session or prompt can be created.
-    const cacheKey = extractionCacheKey(sessionId, canonicalInput, llmConfig.model)
+    const cacheKey = extractionCacheKey(sessionId, canonicalInput, cacheConfig.model)
     const afterHeuristic = (await readMemory({ worktree, directory })) ?? pruned
     const cachedEntry = readExtractionCacheEntry(afterHeuristic, cacheKey, {
       evidenceCandidateMap: candidates,
@@ -286,6 +291,32 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       })
       void log(client, "info", "llm extraction facts merged")
       return "cache-hit"
+    }
+
+    // A cache miss must honor the circuit breaker.  Explicit models remain
+    // terminal here: the health gate never substitutes an automatic model.
+    const llmConfig = await getLLMConfig(client, directory, { memory: afterHeuristic })
+    if (!llmConfig.enabled || !llmConfig.model) {
+      void log(client, "info", "llm extraction skipped: model unavailable", {
+        reason: boundedDiagnosticValue(llmConfig.reason ?? "model resolution returned no model"),
+      })
+      return "heuristic-only"
+    }
+    const selectedCacheKey = extractionCacheKey(sessionId, canonicalInput, llmConfig.model)
+    if (selectedCacheKey !== cacheKey) {
+      const selectedCachedEntry = readExtractionCacheEntry(afterHeuristic, selectedCacheKey, {
+        evidenceCandidateMap: candidates,
+        evidenceDigestMap: digests,
+      })
+      if (selectedCachedEntry) {
+        await mergeAsyncFacts(opts, selectedCachedEntry.facts, gitSha, sessionId, {
+          origin: "llm",
+          auditSessionID: selectedCachedEntry.provenance?.source_audit_session_id,
+          evidenceCandidates: candidates,
+          provenanceEvidence: selectedCachedEntry.provenance?.evidence,
+        })
+        return "cache-hit"
+      }
     }
 
     const project = resolveProjectPath(worktree, directory)
@@ -322,6 +353,12 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
         onDiagnostic: (diagnostic) => logLLMDiagnostic(client, diagnostic),
         onAuditCreated: persistAudit,
         onAuditTerminal: persistTerminal,
+        onHealthOutcome: async (report) => {
+          const latest = await readMemory({ worktree, directory })
+          if (!latest) return
+          const updated = upsertModelHealth(latest, report)
+          await writeMemory({ worktree, directory }, pruneOld(updated))
+        },
       },
     )
     if (!llmFacts) {
@@ -333,7 +370,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     // merge/upsert. A duplicate completion therefore replaces, rather than
     // appends, the same cache identity.
     const latest = (await readMemory({ worktree, directory })) ?? pruned
-    const cacheAlreadyCommitted = readExtractionCacheEntry(latest, cacheKey, {
+    const cacheAlreadyCommitted = readExtractionCacheEntry(latest, selectedCacheKey, {
       evidenceCandidateMap: candidates,
       evidenceDigestMap: digests,
     })
@@ -1380,6 +1417,19 @@ function removeOldestCompletedAudit(mem: MemoryFile): boolean {
   return true
 }
 
+function boundedModelHealth(memories: NonNullable<MemoryFile["model_health"]>): NonNullable<MemoryFile["model_health"]> {
+  if (memories.length <= MODEL_HEALTH_MAX_RECORDS) return memories
+  return memories
+    .map((health, index) => ({ health, index }))
+    .sort((left, right) => (
+      (left.health.last_outcome_at ?? "").localeCompare(right.health.last_outcome_at ?? "")
+      || left.index - right.index
+    ))
+    .slice(-MODEL_HEALTH_MAX_RECORDS)
+    .sort((left, right) => left.index - right.index)
+    .map(({ health }) => health)
+}
+
 /**
  * Prune a MemoryFile to fit within the 8KB cap.
  * Returns a NEW object (deep clone) — does not mutate input.
@@ -1418,7 +1468,9 @@ export function pruneOld(mem: MemoryFile): MemoryFile {
     llm_extraction_audits: mem.llm_extraction_audits
       ? boundedAuditMetadata(mem.llm_extraction_audits.map((audit) => ({ ...audit })))
       : undefined,
-    model_health: mem.model_health?.map((health) => ({ ...health })),
+    model_health: mem.model_health
+      ? boundedModelHealth(mem.model_health.map((health) => ({ ...health })))
+      : undefined,
     llm_extraction_cache_quarantine: mem.llm_extraction_cache_quarantine
       ? { ...mem.llm_extraction_cache_quarantine }
       : undefined,

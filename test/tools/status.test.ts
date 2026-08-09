@@ -16,6 +16,7 @@ import {
   lastCompactionTimestamp,
   setLastCompaction,
 } from "../../src/tools/status"
+import { getLLMConfig } from "../../src/memory/extract-llm"
 
 function makeMemory(overrides?: Record<string, unknown>) {
   return {
@@ -66,6 +67,7 @@ const mockContext = {
 describe("_tokenmaxxerStatus", () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    vi.unstubAllEnvs()
     // Reset the module-level variable between tests
     ;(setLastCompaction as (ts: string | null) => void)(null as unknown as string)
   })
@@ -141,6 +143,37 @@ describe("_tokenmaxxerStatus", () => {
     expect(result).toContain("confidence=llm-corroborated")
     expect(result).toContain("evidence=1")
     expect(result).not.toContain("must not be stored")
+  })
+
+  it("reports normalized selection and bounded model health", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    await getLLMConfig({
+      config: { get: vi.fn(async () => ({ data: {} })) },
+      provider: { list: vi.fn(async () => ({ data: {
+        all: [{ id: "provider", models: {
+          model: { tool_call: true, cost: { input: 0, output: 0 }, variants: { none: {} } },
+        } }],
+        connected: ["provider"],
+      } })) },
+    }, "/home/user/my-project")
+    vi.mocked(readMemory).mockResolvedValue(makeMemory({ model_health: [{
+      provider_id: "provider",
+      model_id: "model",
+      last_outcome: "timeout",
+      failure_streak: 2,
+      last_outcome_at: "2026-08-08T12:00:00.000Z",
+      cooldown_until: "2026-08-08T12:30:00.000Z",
+      failure_reason: "timeout",
+    }] }))
+    vi.mocked(safeRead).mockResolvedValue("{}")
+
+    const result = await _tokenmaxxerStatus({}, mockContext)
+
+    expect(result).toContain("LLM candidates: 1")
+    expect(result).toContain("LLM selected: provider/model (automatic)")
+    expect(result).toContain("LLM variant: none")
+    expect(result).toContain("LLM health: timeout")
+    expect(result).toContain("reason=timeout")
   })
 
   it("catches errors and returns error string", async () => {

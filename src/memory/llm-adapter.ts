@@ -38,26 +38,32 @@ export type LLMAdapterErrorCode =
   | "response-shape-drift"
   | "structured-output-drift"
 
+export type SanitizedAdapterError = {
+  name: string
+  message: string
+}
+
 /** A bounded, typed failure at the host transport boundary. */
 export class LLMAdapterError extends Error {
   readonly code: LLMAdapterErrorCode
   readonly stage: "session-create" | "structured-prompt"
   readonly receivedKeys?: string[]
-  readonly causeValue?: unknown
+  /** Sanitized metadata only; raw SDK causes must not be retained. */
+  readonly errorMetadata?: SanitizedAdapterError
 
   constructor(args: {
     code: LLMAdapterErrorCode
     stage: "session-create" | "structured-prompt"
     message: string
     receivedKeys?: string[]
-    causeValue?: unknown
+    errorMetadata?: SanitizedAdapterError
   }) {
     super(args.message)
     this.name = "LLMAdapterError"
     this.code = args.code
     this.stage = args.stage
-    this.receivedKeys = args.receivedKeys
-    this.causeValue = args.causeValue
+    this.receivedKeys = args.receivedKeys?.slice(0, 16).map((key) => key.slice(0, 64))
+    this.errorMetadata = args.errorMetadata
   }
 }
 
@@ -101,7 +107,24 @@ function clientOf(value: unknown): V1ClientLike | null {
 
 function boundedKeys(value: unknown): string[] | undefined {
   if (!isRecord(value)) return undefined
-  return Object.keys(value).slice(0, 16)
+  return Object.keys(value).slice(0, 16).map((key) => key.slice(0, 64))
+}
+
+function sanitizeError(value: unknown): SanitizedAdapterError {
+  const bounded = (item: unknown, fallback: string): string => (
+    typeof item === "string" && item.length > 0 ? item.slice(0, 200) : fallback
+  )
+  if (value instanceof Error) {
+    return { name: bounded(value.name, "Error"), message: bounded(value.message, "Unknown error") }
+  }
+  if (typeof value === "string") return { name: "Error", message: bounded(value, "Unknown error") }
+  if (isRecord(value)) {
+    return {
+      name: bounded(value.name, "Error"),
+      message: bounded(value.message, "Unknown error"),
+    }
+  }
+  return { name: "Error", message: "Unknown error" }
 }
 
 function adapterError(args: {
@@ -109,14 +132,14 @@ function adapterError(args: {
   stage: "session-create" | "structured-prompt"
   message: string
   received?: unknown
-  causeValue?: unknown
+  cause?: unknown
 }): LLMAdapterError {
   return new LLMAdapterError({
     code: args.code,
     stage: args.stage,
     message: args.message,
     ...(args.received !== undefined ? { receivedKeys: boundedKeys(args.received) } : {}),
-    ...(args.causeValue !== undefined ? { causeValue: args.causeValue } : {}),
+    ...(args.cause !== undefined ? { errorMetadata: sanitizeError(args.cause) } : {}),
   })
 }
 
@@ -185,7 +208,7 @@ export async function createAuditSession(
           code: "error-response",
           stage: "session-create",
           message: "host session create returned an error",
-          causeValue: response.error,
+          cause: response.error,
         }),
       }
     }
@@ -206,7 +229,7 @@ export async function createAuditSession(
         code: "request-error",
         stage: "session-create",
         message: "host session create request failed",
-        causeValue: error,
+        cause: error,
       }),
     }
   }
@@ -272,7 +295,7 @@ export async function requestStructuredOutput(
           code: "error-response",
           stage: "structured-prompt",
           message: "host structured request returned an error",
-          causeValue: response.error,
+          cause: response.error,
         }),
       }
     }
@@ -291,7 +314,7 @@ export async function requestStructuredOutput(
           code: "error-response",
           stage: "structured-prompt",
           message: "host structured response info returned an error",
-          causeValue: response.data.info.error,
+          cause: response.data.info.error,
         }),
       }
     }
@@ -320,7 +343,7 @@ export async function requestStructuredOutput(
         code: "request-error",
         stage: "structured-prompt",
         message: "host structured request failed",
-        causeValue: error,
+        cause: error,
       }),
     }
   }

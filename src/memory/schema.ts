@@ -12,7 +12,7 @@ import type { ExtractedFacts as LegacyExtractedFacts } from "../types"
 const MAX_IDENTIFIER = 256
 const MAX_REFERENCE = 128
 const MAX_CACHE_QUARANTINE_COUNT = 10_000
-const MAX_MODEL_HEALTH_RECORDS = 10
+export const MAX_MODEL_HEALTH_RECORDS = 10
 
 /** The two kinds of source material an extractor may point at. */
 export const EvidenceKindSchema = z.enum(["transcript", "heuristic-candidate"])
@@ -177,7 +177,7 @@ const MemoryFileBaseSchema = z.object({
   llm_extraction_cache: z.array(LLMExtractionCacheEntrySchema).max(10).optional(),
   /** Additive v2 guard metadata; absent in older STATE.json files. */
   llm_extraction_audits: z.array(LLMAuditMetadataSchema).max(20).optional(),
-  /** Bounded health records; behavior is intentionally owned by a later lane. */
+  /** Bounded local provider/model health records used by extraction gating. */
   model_health: z.array(ModelHealthSchema).max(MAX_MODEL_HEALTH_RECORDS).optional(),
   /** Count/reason only; quarantined cache payloads are never retained. */
   llm_extraction_cache_quarantine: CacheQuarantineMetadataSchema.optional(),

@@ -15,6 +15,7 @@ import {
   type LLMAuditMetadata,
   type LLMExtractionCacheEntry,
   type MemoryFile,
+  MAX_MODEL_HEALTH_RECORDS,
 } from "./schema"
 import type { EvidenceKind, Evidence } from "./schema"
 import type { CanonicalExtractionInput } from "./extract-prompt"
@@ -26,6 +27,15 @@ import {
   requestStructuredOutput,
   type LLMAdapterError,
 } from "./llm-adapter"
+import {
+  hasVariant,
+  isEligibleAutomaticModel,
+  normalizeProviderInventory,
+  type NormalizedProviderInventory,
+  type NormalizedProviderModel,
+} from "./provider-inventory"
+import type { ModelHealthOutcome, MemoryFile as HealthMemoryFile } from "./schema"
+import { log } from "../util/log"
 
 export interface SmallModel {
   providerID: string
@@ -40,12 +50,97 @@ export interface LLMExtractionConfig {
   reason?: string
 }
 
+export type LLMModelSelection = "explicit" | "automatic"
+
+export type LLMModelResolutionStatus = {
+  candidate_count: number
+  selected_provider?: string
+  selected_model?: string
+  selection: LLMModelSelection | "none"
+  variant?: string
+  reason?: string
+}
+
+export type LLMHealthOutcomeReport = {
+  providerID: string
+  modelID: string
+  outcome: ModelHealthOutcome
+  reason: string
+}
+
+export const MODEL_HEALTH_MAX_RECORDS = MAX_MODEL_HEALTH_RECORDS
+export const MODEL_HEALTH_BASE_COOLDOWN_MS = 30_000
+export const MODEL_HEALTH_MAX_COOLDOWN_MS = 15 * 60_000
+
+/** Return the local health row for one exact provider/model identity. */
+export function getModelHealth(
+  memory: Pick<HealthMemoryFile, "model_health"> | null | undefined,
+  model: { providerID: string; modelID: string },
+) {
+  const providerID = model.providerID.slice(0, 256)
+  const modelID = model.modelID.slice(0, 256)
+  return memory?.model_health?.find((health) => (
+    health.provider_id === providerID && health.model_id === modelID
+  ))
+}
+
+/**
+ * Upsert one bounded outcome.  This is called only after a retained audit has
+ * made a real prompt attempt; cache hits intentionally do not touch health.
+ */
+export function upsertModelHealth(
+  memory: HealthMemoryFile,
+  report: LLMHealthOutcomeReport,
+  now = Date.now(),
+): HealthMemoryFile {
+  const providerID = report.providerID.slice(0, 256)
+  const modelID = report.modelID.slice(0, 256)
+  const current = getModelHealth(memory, { providerID, modelID })
+  const success = report.outcome === "success"
+  const failureStreak = success
+    ? 0
+    : Math.min(32, (current?.failure_streak ?? 0) + 1)
+  const cooldownUntil = success
+    ? undefined
+    : new Date(now + Math.min(
+        MODEL_HEALTH_MAX_COOLDOWN_MS,
+        MODEL_HEALTH_BASE_COOLDOWN_MS * (2 ** Math.max(0, failureStreak - 1)),
+      )).toISOString()
+  const next = {
+    provider_id: providerID,
+    model_id: modelID,
+    last_outcome: report.outcome,
+    failure_streak: failureStreak,
+    last_outcome_at: new Date(now).toISOString(),
+    ...(cooldownUntil ? { cooldown_until: cooldownUntil } : {}),
+    ...(!success && report.reason ? { failure_reason: report.reason.slice(0, 128) } : {}),
+  }
+  const records = (memory.model_health ?? [])
+    .filter((health) => !(health.provider_id === providerID && health.model_id === modelID))
+  return {
+    ...memory,
+    model_health: [...records, next].slice(-MODEL_HEALTH_MAX_RECORDS),
+  }
+}
+
 export interface SanitizedError {
   name: string
   message: string
 }
 
 const MAX_DIAGNOSTIC_TEXT = 200
+
+/** Prompt requests are bounded so a detached idle event cannot hang forever. */
+export const LLM_REQUEST_TIMEOUT_MS = 120_000
+
+let lastModelResolution: LLMModelResolutionStatus = {
+  candidate_count: 0,
+  selection: "none",
+}
+
+export function getLastLLMModelResolution(): LLMModelResolutionStatus {
+  return { ...lastModelResolution }
+}
 
 /** Keep diagnostics bounded and limited to an error's name and message. */
 export function sanitizeError(error: unknown): SanitizedError {
@@ -150,17 +245,6 @@ type V1ClientLike = {
   }
 }
 
-type ProviderInventoryEntry = {
-  id: string
-  models: Record<string, unknown>
-}
-
-type ProviderInventory = {
-  providers: ProviderInventoryEntry[]
-  /** Present only when the host returned a valid connected-provider list. */
-  connected?: string[]
-}
-
 type ConfiguredModelResolution = {
   model?: SmallModel
   reason?: string
@@ -175,6 +259,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
+function isModelCoolingDown(
+  memory: HealthMemoryFile | null | undefined,
+  model: SmallModel | NormalizedProviderModel | undefined,
+  now = Date.now(),
+): boolean {
+  if (!memory || !model) return false
+  const providerID = ("providerID" in model ? model.providerID : model.provider).slice(0, 256)
+  const modelID = ("modelID" in model ? model.modelID : model.model).slice(0, 256)
+  const health = memory.model_health?.find((candidate) => (
+    candidate.provider_id === providerID && candidate.model_id === modelID
+  ))
+  if (!health?.cooldown_until) return false
+  const until = Date.parse(health.cooldown_until)
+  return Number.isFinite(until) && until > now
+}
+
+function reportInventoryDiagnostics(
+  client: unknown,
+  inventory: NormalizedProviderInventory,
+): void {
+  if (!inventory?.diagnostics.length) return
+  void log(client, "debug", "provider_inventory_shape_drift", {
+    adapter: "v1-provider-inventory",
+    diagnostics: inventory.diagnostics.slice(0, 16),
+  })
+}
+
 function readConfiguredModel(result: unknown): SmallModel | undefined {
   if (!isRecord(result) || result.error != null || !isRecord(result.data)) return undefined
 
@@ -182,74 +293,36 @@ function readConfiguredModel(result: unknown): SmallModel | undefined {
   return parseSmallModel(typeof smallModel === "string" ? smallModel : undefined)
 }
 
-function readProviderInventory(result: unknown): ProviderInventory | undefined {
-  if (!isRecord(result) || result.error != null || !isRecord(result.data)) return undefined
-  if (!Array.isArray(result.data.all)) return undefined
-
-  // Array iteration preserves the API's provider order; Object.entries below
-  // preserves each provider's model object order.
-  const providers = result.data.all.flatMap((value) => {
-    if (!isRecord(value) || typeof value.id !== "string" || !isRecord(value.models)) return []
-    return [{ id: value.id, models: value.models }]
-  })
-
-  let connected: string[] | undefined
-  if ("connected" in result.data) {
-    if (
-      Array.isArray(result.data.connected) &&
-      result.data.connected.every((providerID): providerID is string => typeof providerID === "string")
-    ) {
-      connected = result.data.connected
-    }
-  }
-
-  return { providers, connected }
-}
-
-function isFreeToolCallingModel(value: unknown): boolean {
-  if (!isRecord(value)) return false
-  if (value.status !== undefined && value.status !== "active") return false
-  const toolCalling = value.tool_call === true || (
-    isRecord(value.capabilities) && value.capabilities.toolcall === true
-  )
-  if (!toolCalling) return false
-  if (!isRecord(value.cost)) return false
-  return value.cost.input === 0 && value.cost.output === 0
-}
-
-function readNoneVariant(value: unknown): "none" | undefined {
-  if (!isRecord(value) || !isRecord(value.variants)) return undefined
-  return isRecord(value.variants.none) ? "none" : undefined
-}
-
-function withInventoryVariant(model: SmallModel, inventoryModel: unknown): SmallModel {
-  const variant = readNoneVariant(inventoryModel)
-  return variant ? { ...model, variant } : model
-}
-
 async function resolveConfiguredModelVariant(
   client: V1ClientLike,
   directory: string,
   model: SmallModel,
+  allowUnavailable = false,
 ): Promise<ConfiguredModelResolution> {
   if (!client.provider?.list) return { model }
 
   try {
-    const inventory = readProviderInventory(
+    const inventory = normalizeProviderInventory(
       await client.provider.list({ query: { directory } }),
     )
-    if (!inventory) return { model }
-
-    if (inventory.connected !== undefined && !inventory.connected.includes(model.providerID)) {
-      return { reason: "provider is not connected" }
+    reportInventoryDiagnostics(client, inventory)
+    if (inventory.providers.length === 0) {
+      return allowUnavailable
+        ? { model }
+        : { reason: "model inventory response is malformed" }
     }
 
-    const provider = inventory.providers.find((candidate) => candidate.id === model.providerID)
-    if (!provider) return { model }
-    const inventoryModel = Object.entries(provider.models).find(([modelKey, value]) => (
-      modelKey === model.modelID || (isRecord(value) && value.id === model.modelID)
-    ))?.[1]
-    return { model: withInventoryVariant(model, inventoryModel) }
+    const provider = inventory.providers.find((candidate) => candidate.provider === model.providerID)
+    if (!provider) return allowUnavailable ? { model } : { reason: "provider is not available" }
+    if (!provider.connected) {
+      return allowUnavailable ? { model } : { reason: "provider is not connected" }
+    }
+
+    const inventoryModel = provider.models.find((candidate) => candidate.model === model.modelID)
+    if (!inventoryModel) return allowUnavailable ? { model } : { reason: "model is not available" }
+    return {
+      model: hasVariant(inventoryModel, "none") ? { ...model, variant: "none" } : model,
+    }
   } catch {
     // An explicit model remains valid when optional inventory lookup fails.
     return { model }
@@ -263,39 +336,57 @@ async function resolveConfiguredModelVariant(
 async function discoverFreeSmallModel(
   client: V1ClientLike,
   directory: string,
+  memory?: HealthMemoryFile | null,
 ): Promise<ModelDiscoveryResult> {
   if (!client.provider?.list) return { reason: "model inventory is unavailable" }
 
   try {
-    const inventory = readProviderInventory(
+    const inventory = normalizeProviderInventory(
       await client.provider.list({ query: { directory } }),
     )
-    if (!inventory) return { reason: "model inventory response is malformed" }
+    reportInventoryDiagnostics(client, inventory)
+    if (inventory.providers.length === 0) {
+      return { reason: "model inventory response is malformed" }
+    }
 
     let firstEligible: SmallModel | undefined
-    for (const provider of inventory.providers) {
-      if (inventory.connected !== undefined && !inventory.connected.includes(provider.id)) continue
-      for (const [modelID, model] of Object.entries(provider.models)) {
-        if (!modelID || !isFreeToolCallingModel(model)) continue
-        const valueModelID = isRecord(model) && typeof model.id === "string" && model.id.length > 0
-          ? model.id
-          : modelID
-        const candidate = withInventoryVariant(
-          { providerID: provider.id, modelID: valueModelID },
-          model,
-        )
-        if (candidate.variant === "none") {
-          return { model: candidate, reason: "eligible model discovered" }
-        }
-        firstEligible ??= candidate
+    const eligible = inventory.models.filter(isEligibleAutomaticModel)
+    const healthyEligible = eligible.filter((candidate) => !isModelCoolingDown(memory, candidate))
+    lastModelResolution = {
+      candidate_count: eligible.length,
+      selection: "none",
+    }
+    for (const candidate of healthyEligible) {
+      const selected = {
+        providerID: candidate.provider,
+        modelID: candidate.model,
+        ...(hasVariant(candidate, "none") ? { variant: "none" } : {}),
       }
+      if (selected.variant === "none") {
+        return { model: selected, reason: "eligible model discovered" }
+      }
+      firstEligible ??= selected
     }
 
     if (firstEligible) {
       return { model: firstEligible, reason: "eligible model discovered" }
     }
+    if (eligible.length > 0 && healthyEligible.length === 0) {
+      const cooled = eligible[0]
+      if (cooled) {
+        lastModelResolution = {
+          candidate_count: eligible.length,
+          selected_provider: cooled.provider,
+          selected_model: cooled.model,
+          selection: "automatic",
+          ...(hasVariant(cooled, "none") ? { variant: "none" } : {}),
+          reason: "all eligible models are on cooldown",
+        }
+      }
+      return { reason: "all eligible models are on cooldown" }
+    }
     return {
-      reason: inventory.connected !== undefined
+      reason: inventory.connected_provider_ids !== undefined
         ? "no connected provider has a suitable free tool model"
         : "no eligible free model found",
     }
@@ -310,16 +401,24 @@ async function discoverFreeSmallModel(
 export async function getLLMConfig(
   clientValue: unknown,
   directory = "",
+  options?: {
+    /** Used by the writer to gate a model after a real failed extraction. */
+    memory?: HealthMemoryFile | null
+    /** Resolve a model for an already accepted cache lookup. */
+    ignoreHealth?: boolean
+  },
 ): Promise<LLMExtractionConfig> {
   if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
     return { enabled: false, reason: "TOKENMAXXER_LLM_EXTRACT is disabled" }
   }
 
-  const hostGate = await getHostStructuredContractGate(clientValue)
-  if (!hostGate.allowed) {
-    return {
-      enabled: false,
-      reason: `host structured contract gate: ${hostGate.reason}`,
+  if (!options?.ignoreHealth) {
+    const hostGate = await getHostStructuredContractGate(clientValue)
+    if (!hostGate.allowed) {
+      return {
+        enabled: false,
+        reason: `host structured contract gate: ${hostGate.reason}`,
+      }
     }
   }
 
@@ -340,15 +439,54 @@ export async function getLLMConfig(
   // A syntactically valid explicit override is authoritative for model choice;
   // a valid connected-provider list may still reject an unavailable provider.
   if (configuredModel) {
-    const resolved = await resolveConfiguredModelVariant(client, directory, configuredModel)
+    const resolved = await resolveConfiguredModelVariant(
+      client,
+      directory,
+      configuredModel,
+      options?.ignoreHealth,
+    )
+    lastModelResolution = {
+      candidate_count: 1,
+      selected_provider: configuredModel.providerID,
+      selected_model: configuredModel.modelID,
+      selection: "explicit",
+      ...(resolved.model?.variant ? { variant: resolved.model.variant } : {}),
+      ...(resolved.reason ? { reason: resolved.reason } : {}),
+    }
     if (resolved.reason) return { enabled: false, reason: resolved.reason }
+    if (!options?.ignoreHealth && isModelCoolingDown(options?.memory, resolved.model)) {
+      lastModelResolution = {
+        ...lastModelResolution,
+        reason: "configured model is on cooldown",
+      }
+      return { enabled: false, reason: "configured model is on cooldown" }
+    }
     return {
       enabled: true,
       model: resolved.model,
     }
   }
 
-  const discovered = await discoverFreeSmallModel(client, directory)
+  const discovered = await discoverFreeSmallModel(
+    client,
+    directory,
+    options?.ignoreHealth ? null : options?.memory,
+  )
+  if (discovered.model) {
+    lastModelResolution = {
+      ...lastModelResolution,
+      selected_provider: discovered.model.providerID,
+      selected_model: discovered.model.modelID,
+      selection: "automatic",
+      ...(discovered.model.variant ? { variant: discovered.model.variant } : {}),
+    }
+  } else {
+    lastModelResolution = {
+      ...lastModelResolution,
+      selection: "none",
+      reason: discovered.reason,
+    }
+  }
   return discovered.model
     ? { enabled: true, model: discovered.model }
     : { enabled: false, reason: discovered.reason }
@@ -416,7 +554,7 @@ function adapterFailureReason(
 }
 
 function adapterFailureError(error: LLMAdapterError): SanitizedError | undefined {
-  return error.causeValue === undefined ? undefined : sanitizeError(error.causeValue)
+  return error.errorMetadata
 }
 
 export type AuditCreatedCallback = (
@@ -452,6 +590,10 @@ export interface ExtractFactsLLMOptions {
   onAuditCreated?: AuditCreatedCallback
   /** Persist the terminal state after structured extraction completes. */
   onAuditTerminal?: AuditTerminalCallback
+  /** Persist one outcome for the retained provider/model attempt. */
+  onHealthOutcome?: (report: LLMHealthOutcomeReport) => void | Promise<void>
+  /** Test-only/lifecycle override; production remains bounded at two minutes. */
+  requestTimeoutMs?: number
 }
 
 /** A bounded candidate at the LLM corroboration boundary. */
@@ -606,6 +748,50 @@ function reportUnvalidatedEvidenceFailures(
   }
 }
 
+function isTimeoutError(error: unknown): boolean {
+  if (isRecord(error) && (error.name === "TimeoutError" || error.code === "ETIMEDOUT")) return true
+  return error instanceof Error && /timed? ?out|timeout/i.test(error.message)
+}
+
+function adapterHealthOutcome(error: LLMAdapterError): ModelHealthOutcome {
+  if (error.errorMetadata && isTimeoutError(error.errorMetadata)) return "timeout"
+  if (error.code === "response-shape-drift" || error.code === "structured-output-drift") {
+    return "structured-shape-failure"
+  }
+  return "transport-auth-failure"
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return promise
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error("structured request timed out")
+          error.name = "TimeoutError"
+          reject(error)
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+async function notifyHealthOutcome(
+  callback: ExtractFactsLLMOptions["onHealthOutcome"],
+  report: LLMHealthOutcomeReport,
+): Promise<void> {
+  if (!callback) return
+  try {
+    await callback(report)
+  } catch {
+    // Health persistence is diagnostic metadata and must not change fallback.
+  }
+}
+
 /**
  * Extract facts through one retained audit session. Prompt errors and invalid
  * structured values share exactly one retry budget.
@@ -669,11 +855,14 @@ async function extractFactsLLMOnce(
 
   let extractionSessionID: string | undefined
   try {
-    const created = await createAuditSession(client, {
-      directory: options?.directory ?? "",
-      title: `tokenmaxxer extract · ${projectName} · ${sourceSessionID.slice(-8)}`,
-      sourceSessionID,
-    })
+    const created = await withTimeout(
+      createAuditSession(client, {
+        directory: options?.directory ?? "",
+        title: `tokenmaxxer extract · ${projectName} · ${sourceSessionID.slice(-8)}`,
+        sourceSessionID,
+      }),
+      options?.requestTimeoutMs ?? LLM_REQUEST_TIMEOUT_MS,
+    )
     if (!created.ok) {
       const reason = adapterFailureReason(created.error, "session-create")
       emitDiagnostic(options?.onDiagnostic, {
@@ -725,21 +914,28 @@ async function extractFactsLLMOnce(
     return null
   }
 
+  let terminalOutcome: ModelHealthOutcome = "transport-auth-failure"
+  let terminalReason = "request-error"
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const result = await requestStructuredOutput(client, {
-        sessionID: extractionSessionID,
-        directory: options?.directory ?? "",
-        model: {
-          providerID: config.model.providerID,
-          modelID: config.model.modelID,
-        },
-        prompt: buildExtractionPrompt(canonicalInput),
-        schema: ExtractedFactsJsonSchema,
-        ...(config.model.variant !== undefined ? { variant: config.model.variant } : {}),
-      })
+      const result = await withTimeout(
+        requestStructuredOutput(client, {
+          sessionID: extractionSessionID,
+          directory: options?.directory ?? "",
+          model: {
+            providerID: config.model.providerID,
+            modelID: config.model.modelID,
+          },
+          prompt: buildExtractionPrompt(canonicalInput),
+          schema: ExtractedFactsJsonSchema,
+          ...(config.model.variant !== undefined ? { variant: config.model.variant } : {}),
+        }),
+        options?.requestTimeoutMs ?? LLM_REQUEST_TIMEOUT_MS,
+      )
 
       if (!result.ok) {
+        terminalOutcome = adapterHealthOutcome(result.error)
+        terminalReason = terminalOutcome === "timeout" ? "timeout" : result.error.code
         emitDiagnostic(options?.onDiagnostic, {
           kind: "structured-output-failed",
           attempt: attempt + 1,
@@ -759,8 +955,16 @@ async function extractFactsLLMOnce(
         const corroborated = corroborateLLMFacts(facts, options)
         if (corroborated) {
           await notifyAuditTerminal(options?.onAuditTerminal, extractionSessionID, "success")
+          await notifyHealthOutcome(options?.onHealthOutcome, {
+            providerID: config.model.providerID,
+            modelID: config.model.modelID,
+            outcome: "success",
+            reason: "accepted-extraction",
+          })
           return corroborated
         }
+        terminalOutcome = "validation-failure"
+        terminalReason = "evidence-rejection"
         emitDiagnostic(options?.onDiagnostic, {
           kind: "structured-output-failed",
           attempt: attempt + 1,
@@ -769,6 +973,8 @@ async function extractFactsLLMOnce(
         continue
       }
       reportUnvalidatedEvidenceFailures(structured, options)
+      terminalOutcome = "validation-failure"
+      terminalReason = "structured-validation-failure"
       emitDiagnostic(options?.onDiagnostic, {
         kind: "structured-output-failed",
         attempt: attempt + 1,
@@ -777,6 +983,8 @@ async function extractFactsLLMOnce(
           : "invalid-structured-output",
       })
     } catch (error) {
+      terminalOutcome = isTimeoutError(error) ? "timeout" : "transport-auth-failure"
+      terminalReason = isTimeoutError(error) ? "timeout" : "request-error"
       emitDiagnostic(options?.onDiagnostic, {
         kind: "structured-output-failed",
         attempt: attempt + 1,
@@ -790,6 +998,12 @@ async function extractFactsLLMOnce(
 
   emitDiagnostic(options?.onDiagnostic, { kind: "retries-exhausted", attempts: 2 })
   await notifyAuditTerminal(options?.onAuditTerminal, extractionSessionID, "failed")
+  await notifyHealthOutcome(options?.onHealthOutcome, {
+    providerID: config.model.providerID,
+    modelID: config.model.modelID,
+    outcome: terminalOutcome,
+    reason: terminalReason,
+  })
   return null
 }
 
