@@ -10,6 +10,7 @@ const MAX_PRIOR_STATE_CHARS = 8_000
 const MAX_TRANSCRIPT_MESSAGES = 20
 const MAX_MESSAGE_CHARS = 500
 const MAX_FILE_CANDIDATES = 20
+const MAX_EVIDENCE_REF_CHARS = 128
 
 const FILE_TOOL_NAMES = new Set(["read", "edit", "write", "glob", "grep", "bash"])
 
@@ -23,6 +24,25 @@ export interface CanonicalExtractionInput {
   /** SHA-256 of the canonical representation of the three fields above. */
   sha256: string
 }
+
+/**
+ * An ephemeral source-transcript candidate used to corroborate model output.
+ * `text` is intentionally kept out of durable state and diagnostics; it is
+ * available only to the caller that is building the prompt or corroborating
+ * the current source transcript.
+ */
+export interface TranscriptEvidenceCandidate {
+  /** Stable bounded ID cited by a structured decision. */
+  ref: string
+  role: "user" | "assistant"
+  text: string
+  /** Digest of the bounded candidate representation, never the candidate text. */
+  digest: string
+}
+
+export type TranscriptEvidenceCandidateMap = Readonly<
+  Record<string, TranscriptEvidenceCandidate>
+>
 
 type CacheBearingMemory = MemoryFile & {
   llm_extraction_cache?: unknown
@@ -41,6 +61,8 @@ export function withoutExtractionCache(
   const snapshot = { ...(priorState as Record<string, unknown>) }
   delete snapshot.llm_extraction_cache
   delete snapshot.llm_extraction_audits
+  delete snapshot.llm_extraction_cache_quarantine
+  delete snapshot.model_health
   return snapshot
 }
 
@@ -70,6 +92,15 @@ export function stableJson(value: unknown): string {
 /** Return a lowercase SHA-256 digest for a canonical string. */
 export function sha256Hex(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex")
+}
+
+/**
+ * Derive a short, opaque evidence ID from a source TranscriptMessage ID.
+ * Hashing keeps arbitrary host/session IDs out of the prompt while preserving
+ * stable references for the same message.
+ */
+export function makeTranscriptEvidenceRef(messageID: string): string {
+  return `tr-${sha256Hex(messageID).slice(0, 16)}`.slice(0, MAX_EVIDENCE_REF_CHARS)
 }
 
 interface MutableJsonContainer {
@@ -232,31 +263,109 @@ function capPriorStateJson(snapshot: Record<string, unknown>): string {
   }
 }
 
+function normalizedTextCandidate(message: TranscriptMessage): {
+  role: "user" | "assistant"
+  text: string
+} | null {
+  const role = message.info.role.trim().toLowerCase()
+  if (role !== "user" && role !== "assistant") return null
+
+  const text = message.parts
+    .filter(
+      (part): part is Extract<typeof part, { type: "text" }> =>
+        part.type === "text" && typeof part.text === "string",
+    )
+    .map((part) => part.text)
+    .join("\n")
+    .replace(/\r\n?/g, "\n")
+    .trim()
+
+  if (!text) return null
+  return { role, text: text.slice(0, MAX_MESSAGE_CHARS) }
+}
+
+/** Digest a bounded candidate without retaining or exposing its source text. */
+export function digestTranscriptEvidenceCandidate(
+  candidate: Pick<TranscriptEvidenceCandidate, "ref" | "role" | "text">,
+): string {
+  return sha256Hex(stableJson({
+    ref: candidate.ref,
+    role: candidate.role,
+    text: candidate.text,
+  }))
+}
+
 /**
- * Keep only text parts from the last 20 text-bearing messages. Tool parts and
+ * Build the bounded, deterministic source candidates shared by prompting and
+ * later corroboration. Only user/assistant text is eligible; tool parts,
+ * tool output, and audit-session prose are never candidates.
+ */
+export function buildTranscriptEvidenceCandidates(
+  messages: readonly TranscriptMessage[],
+): TranscriptEvidenceCandidate[] {
+  const seenRefs = new Map<string, number>()
+  const candidates: TranscriptEvidenceCandidate[] = []
+
+  for (const message of messages) {
+    const normalized = normalizedTextCandidate(message)
+    if (!normalized) continue
+
+    const baseRef = makeTranscriptEvidenceRef(message.info.id)
+    const occurrence = (seenRefs.get(baseRef) ?? 0) + 1
+    seenRefs.set(baseRef, occurrence)
+    const ref = occurrence === 1
+      ? baseRef
+      : `${baseRef}-${occurrence}`.slice(0, MAX_EVIDENCE_REF_CHARS)
+    const candidate = {
+      ref,
+      role: normalized.role,
+      text: normalized.text,
+    }
+    candidates.push({
+      ...candidate,
+      digest: digestTranscriptEvidenceCandidate(candidate),
+    })
+  }
+
+  return candidates.slice(-MAX_TRANSCRIPT_MESSAGES)
+}
+
+/** Build an ID-indexed candidate map for deterministic corroboration. */
+export function buildTranscriptEvidenceCandidateMap(
+  messages: readonly TranscriptMessage[],
+): TranscriptEvidenceCandidateMap {
+  const map: Record<string, TranscriptEvidenceCandidate> = {}
+  for (const candidate of buildTranscriptEvidenceCandidates(messages)) {
+    map[candidate.ref] = candidate
+  }
+  return map
+}
+
+/** Return only reference digests for privacy-safe logging or persistence. */
+export function buildTranscriptEvidenceRefDigestMap(
+  messages: readonly TranscriptMessage[],
+): Readonly<Record<string, string>> {
+  const candidates = buildTranscriptEvidenceCandidateMap(messages)
+  const digests: Record<string, string> = {}
+  for (const ref of Object.keys(candidates).sort()) {
+    digests[ref] = candidates[ref].digest
+  }
+  return digests
+}
+
+// Short aliases keep the corroboration boundary discoverable without making
+// callers reconstruct the candidate map from the prompt string.
+export const buildEvidenceCandidateMap = buildTranscriptEvidenceCandidateMap
+export const buildEvidenceRefDigestMap = buildTranscriptEvidenceRefDigestMap
+
+/**
+ * Keep only labelled text from the last 20 eligible messages. Tool parts and
  * their outputs are deliberately omitted from the transcript sent to the LLM.
  */
 export function compressTranscript(messages: readonly TranscriptMessage[]): string {
-  const textMessages = messages
-    .map((message) => {
-      const text = message.parts
-        .filter(
-          (part): part is Extract<typeof part, { type: "text" }> =>
-            part.type === "text" && typeof part.text === "string",
-        )
-        .map((part) => part.text)
-        .join("\n")
-        .replace(/\r\n?/g, "\n")
-        .trim()
-
-      if (!text) return null
-
-      const role = message.info.role.trim().toLowerCase() || "unknown"
-      return `[${role}] ${text.slice(0, MAX_MESSAGE_CHARS)}`
-    })
-    .filter((message): message is string => message !== null)
-
-  return textMessages.slice(-MAX_TRANSCRIPT_MESSAGES).join("\n")
+  return buildTranscriptEvidenceCandidates(messages)
+    .map((candidate) => `[${candidate.ref}] [${candidate.role}] ${candidate.text}`)
+    .join("\n")
 }
 
 /**
@@ -401,9 +510,11 @@ The prior STATE.json snapshot is potentially stale context. Return only current-
 Rules:
 - current_task: describe what the current session is working on; use null when unclear.
 - active_files: must be an array of objects, each exactly \`{ "path": "relative/path", "reason": "short evidence-based reason" }\`; include only files read, edited, or written in this source session; max 5, relative paths; use an empty array if no qualifying files.
-- decisions: must be an array of objects, each with required \`{ "topic": "short subject", "decision": "explicit decision" }\`; optional \`rationale\` and \`foundational\`; include only explicit decisions (for example, "let's use X" or "decided to go with Y"); otherwise use an empty array. Do not include discussions, descriptions, or hypothetical decisions.
+- decisions: must be an array of objects, each with required \`{ "topic": "short subject", "decision": "explicit decision", "evidence_refs": ["evidence ID"] }\`; \`evidence_refs\` must contain 1–3 unique IDs copied exactly from the labels in the COMPRESSED SOURCE TRANSCRIPT. Optional \`rationale\` and \`foundational\` must not replace evidence; include only explicit decisions (for example, "let's use X" or "decided to go with Y"); otherwise use an empty array. Do not include discussions, descriptions, or hypothetical decisions.
 - blockers: only blockers supported by the current session; otherwise use an empty array.
 - next_steps: only next steps stated by the current session; max 5.
+- Every decision must cite one to three labelled source-transcript evidence IDs. Cite IDs only, never raw quotes or excerpts.
+- Evidence IDs may point only to eligible user/assistant source-text labels in COMPRESSED SOURCE TRANSCRIPT. Never cite prior STATE.json, FILE CANDIDATES, these instructions, model/audit prose, or the model's own response.
 - Do not include code snippets, tool outputs, or file contents.
 - Do not answer with assistant text or free-form JSON. Return the result through the required StructuredOutput tool.
 

@@ -25,7 +25,7 @@ export async function buildDurableBlock(opts: {
     lines.push(`Last updated: ${mem.last_updated}  git SHA: ${mem.last_git_sha ?? "unknown"}`)
 
     if (mem.current_task) {
-      lines.push(`Current task: ${mem.current_task}`)
+      lines.push(`Current task: ${mem.current_task}${formatProvenance(mem.current_task_provenance)}`)
     }
 
     const activeFiles = [...mem.active_files]
@@ -35,7 +35,7 @@ export async function buildDurableBlock(opts: {
     if (activeFiles.length) {
       lines.push("Active files:")
       for (const f of activeFiles) {
-        lines.push(`  - ${f.path} — ${f.reason}`)
+        lines.push(`  - ${f.path} — ${f.reason}${formatProvenance(f.provenance)}`)
       }
     }
 
@@ -61,6 +61,7 @@ export async function buildDurableBlock(opts: {
       for (const d of [...foundational, ...recent]) {
         lines.push(
           `  - ${d.topic}: ${d.decision} (SHA ${d.git_sha ?? "?"}, ${d.timestamp})`,
+          `    ${formatProvenance(d.provenance)}`,
         )
       }
     }
@@ -69,7 +70,7 @@ export async function buildDurableBlock(opts: {
       lines.push("Older decisions:")
       for (const d of older) {
         const date = d.timestamp.slice(0, 10)
-        lines.push(`  - ${d.topic}: ${d.decision} (SHA ${d.git_sha ?? "?"}, ${date})`)
+        lines.push(`  - ${d.topic}: ${d.decision} (SHA ${d.git_sha ?? "?"}, ${date})${formatProvenance(d.provenance)}`)
       }
     }
 
@@ -95,4 +96,16 @@ export async function buildDurableBlock(opts: {
 function isRecentSession(d: Decision, recentSessions: string[]): boolean {
   if (!d.last_used_in_session) return false
   return recentSessions.slice(-3).includes(d.last_used_in_session)
+}
+
+function formatProvenance(provenance: {
+  source_session_id: string
+  source_audit_session_id?: string
+  confidence: string
+  evidence?: unknown[]
+} | undefined): string {
+  if (!provenance) return " (source=unknown confidence=unknown evidence=0)"
+  return ` (source=${provenance.source_session_id}${provenance.source_audit_session_id
+    ? ` audit=${provenance.source_audit_session_id}`
+    : ""} confidence=${provenance.confidence} evidence=${provenance.evidence?.length ?? 0})`
 }

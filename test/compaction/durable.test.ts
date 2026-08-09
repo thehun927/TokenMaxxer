@@ -99,6 +99,7 @@ describe("buildDurableBlock", () => {
     expect(result).toContain("Last updated: 2026-08-08T12:00:00.000Z")
     expect(result).toContain("git SHA: abc1234")
     expect(result).toContain("Current task: Building the compaction module")
+    expect(result).toContain("confidence=unknown evidence=0")
     expect(result).toContain("Active files:")
     expect(result).toContain("  - src/compaction/prompt.ts — main implementation file")
     expect(result).toContain("  - src/compaction/durable.ts — durable block builder")
@@ -124,6 +125,40 @@ describe("buildDurableBlock", () => {
     // d2 (framework, still_valid: false) should NOT appear
     expect(result).not.toContain("framework:")
     expect(result).not.toContain("Express")
+  })
+
+  it("renders bounded source, audit, confidence, and evidence counts", async () => {
+    const evidence = [{ kind: "transcript" as const, ref: "tr-1", digest: "a".repeat(64) }]
+    vi.mocked(readMemory).mockResolvedValue(makeFullMemory({
+      current_task_provenance: {
+        extractor: "llm",
+        source_session_id: "source-1",
+        source_audit_session_id: "audit-1",
+        confidence: "llm-corroborated",
+        evidence,
+      },
+      decisions: [
+        {
+          ...makeFullMemory().decisions[0]!,
+          provenance: {
+            extractor: "llm",
+            source_session_id: "source-1",
+            source_audit_session_id: "audit-1",
+            confidence: "llm-corroborated",
+            evidence,
+          },
+        },
+      ],
+    }))
+
+    const result = await buildDurableBlock({
+      worktree: "/home/user/my-project",
+      directory: "/home/user/my-project",
+      client: mockClient,
+    })
+
+    expect(result).toContain("source=source-1 audit=audit-1 confidence=llm-corroborated evidence=1")
+    expect(result).not.toContain("raw transcript")
   })
 
   it("applies the bounded decision policy", async () => {

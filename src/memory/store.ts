@@ -4,7 +4,7 @@
  */
 import { loadAndMigrate } from "./migrate"
 import { atomicWrite, safeRead, getMtime } from "../util/fs"
-import { emptyMemory } from "./schema"
+import { emptyMemory, MemoryFileSchema } from "./schema"
 import type { MemoryFile } from "./schema"
 import { join } from "node:path"
 import { createHash } from "node:crypto"
@@ -109,8 +109,14 @@ export async function writeMemory(
   mem: MemoryFile,
 ): Promise<boolean> {
   const project = resolveProjectPath(worktree, directory)
+  const validated = MemoryFileSchema.safeParse(mem)
+  if (!validated.success) {
+    // Never persist a state that the v3 reader would quarantine. This is also
+    // the final guard against an unproven LLM cache or provenance-less fact.
+    return false
+  }
   const path = memoryPath(project)
-  const json = JSON.stringify(mem, null, 2)
+  const json = JSON.stringify(validated.data, null, 2)
 
   if (json.length > MAX_BYTES) {
     // Should have been pruned before write — warn if still over

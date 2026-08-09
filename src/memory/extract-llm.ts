@@ -16,6 +16,7 @@ import {
   type LLMExtractionCacheEntry,
   type MemoryFile,
 } from "./schema"
+import type { EvidenceKind, Evidence } from "./schema"
 import type { CanonicalExtractionInput } from "./extract-prompt"
 import { buildExtractionPrompt, makeExtractionCacheKey } from "./extract-prompt"
 import { readMemory } from "./store"
@@ -76,6 +77,9 @@ const retainedExtractionSessionIDs = new Set<string>()
 /** One extraction transaction per project/source, including direct callers. */
 const extractionInFlight = new Map<string, Promise<ExtractedFacts | null>>()
 
+let evidenceAcceptedCount = 0
+let evidenceRejectedCount = 0
+
 /** Whether an idle event belongs to a session created for LLM extraction. */
 export function isRetainedExtractionSession(sessionID: string): boolean {
   return retainedExtractionSessionIDs.has(sessionID)
@@ -100,6 +104,17 @@ export async function isPersistedRetainedExtractionSession(args: {
 /** Bounded extraction lifecycle diagnostics for local status consumers. */
 export function getLLMExtractionInFlightCount(): number {
   return extractionInFlight.size
+}
+
+/** Bounded process-local evidence counters for the status tool. */
+export function getLLMEvidenceStats(): {
+  accepted: number
+  rejected: number
+} {
+  return {
+    accepted: evidenceAcceptedCount,
+    rejected: evidenceRejectedCount,
+  }
 }
 
 /** The small model is provider/model, with the first slash as separator. */
@@ -374,6 +389,22 @@ export type LLMExtractionDiagnostic =
   | {
       kind: "audit-registration-failed"
     }
+  | {
+      kind: "evidence-rejected"
+      reason:
+        | "missing-evidence"
+        | "unknown-reference"
+        | "digest-mismatch"
+        | "invalid-candidate"
+      evidence_count: number
+      candidate_count: number
+    }
+
+export type EvidenceRejectionReason =
+  | "missing-evidence"
+  | "unknown-reference"
+  | "digest-mismatch"
+  | "invalid-candidate"
 
 export type LLMExtractionDiagnosticCallback = (
   diagnostic: LLMExtractionDiagnostic,
@@ -395,6 +426,17 @@ export interface ExtractFactsLLMOptions {
   projectKey?: string
   /** A validated cache result, checked before creating an audit session. */
   cachedFacts?: ExtractedFacts | null
+  /**
+   * Ephemeral deterministic evidence candidates.  Candidate text is accepted
+   * here only so the caller can corroborate the current transcript; it is
+   * never returned, logged, or persisted by this module.
+   */
+  evidenceCandidateMap?: EvidenceCandidateMap
+  /** Digest-only view of the same candidate map, used to detect drift. */
+  evidenceDigestMap?: Readonly<Record<string, string>>
+  /** Compatibility aliases for callers that use the shorter names. */
+  evidenceCandidates?: EvidenceCandidateMap
+  evidenceDigests?: Readonly<Record<string, string>>
   /** Optional best-effort callback for bounded extraction diagnostics. */
   onDiagnostic?: LLMExtractionDiagnosticCallback
   /** Persist the guard before the first audit prompt. Returning false aborts. */
@@ -402,6 +444,18 @@ export interface ExtractFactsLLMOptions {
   /** Persist the terminal state after structured extraction completes. */
   onAuditTerminal?: AuditTerminalCallback
 }
+
+/** A bounded candidate at the LLM corroboration boundary. */
+export type EvidenceCandidate = {
+  kind: EvidenceKind
+  ref: string
+  digest: string
+  /** Optional source material is ephemeral and is not used for persistence. */
+  text?: string
+  role?: string
+}
+
+export type EvidenceCandidateMap = Readonly<Record<string, EvidenceCandidate>>
 
 /** Diagnostics must never change extraction behavior, even if a callback fails. */
 function emitDiagnostic(
@@ -416,6 +470,130 @@ function emitDiagnostic(
     })
   } catch {
     // Diagnostics are best effort.
+  }
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value)
+}
+
+function candidateContext(options: ExtractFactsLLMOptions | undefined): {
+  candidates: EvidenceCandidateMap
+  digests: Readonly<Record<string, string>>
+} {
+  const candidates = options?.evidenceCandidateMap ?? options?.evidenceCandidates ?? {}
+  const digests = options?.evidenceDigestMap ?? options?.evidenceDigests ?? {}
+  return { candidates, digests }
+}
+
+/**
+ * Resolve structured evidence references to the exact ephemeral candidates
+ * supplied for this source transcript.  Only the reference and digest leave
+ * this boundary.
+ */
+export function resolveEvidenceReferences(
+  refs: unknown,
+  options?: Pick<ExtractFactsLLMOptions, "evidenceCandidateMap" | "evidenceDigestMap" | "evidenceCandidates" | "evidenceDigests">,
+): { evidence: Evidence[]; reason?: EvidenceRejectionReason } {
+  if (!Array.isArray(refs) || refs.length < 1 || refs.length > 3) {
+    return { evidence: [], reason: "missing-evidence" }
+  }
+  if (!refs.every((ref): ref is string => typeof ref === "string" && ref.length > 0 && ref.length <= 128)) {
+    return { evidence: [], reason: "unknown-reference" }
+  }
+  if (new Set(refs).size !== refs.length) {
+    return { evidence: [], reason: "invalid-candidate" }
+  }
+
+  const { candidates, digests } = candidateContext(options)
+  const evidence: Evidence[] = []
+  for (const ref of refs) {
+    const candidate = candidates[ref]
+    if (!candidate || candidate.ref !== ref) {
+      return { evidence: [], reason: "unknown-reference" }
+    }
+    if (
+      (candidate.kind !== "transcript" && candidate.kind !== "heuristic-candidate") ||
+      !isSha256(candidate.digest)
+    ) {
+      return { evidence: [], reason: "invalid-candidate" }
+    }
+    const expectedDigest = digests[ref]
+    if (expectedDigest !== undefined && expectedDigest !== candidate.digest) {
+      return { evidence: [], reason: "digest-mismatch" }
+    }
+    evidence.push({
+      kind: candidate.kind,
+      ref,
+      digest: candidate.digest,
+    })
+  }
+  return { evidence }
+}
+
+/**
+ * Validate every LLM decision and drop only decisions that fail evidence
+ * corroboration.  A result containing decisions but no accepted decisions is
+ * rejected as a whole, so it cannot create a cache row without proof.
+ */
+export function corroborateLLMFacts(
+  facts: ExtractedFacts,
+  options?: Pick<ExtractFactsLLMOptions, "evidenceCandidateMap" | "evidenceDigestMap" | "evidenceCandidates" | "evidenceDigests" | "onDiagnostic">,
+): ExtractedFacts | null {
+  const decisions = facts.decisions as Array<{ evidence_refs?: unknown } & Record<string, unknown>>
+  if (decisions.length === 0) return facts
+
+  const accepted: typeof decisions = []
+  for (const decision of decisions) {
+    const resolved = resolveEvidenceReferences(decision.evidence_refs, options)
+    if (resolved.reason) {
+      evidenceRejectedCount = Math.min(Number.MAX_SAFE_INTEGER, evidenceRejectedCount + 1)
+      emitDiagnostic(options?.onDiagnostic, {
+        kind: "evidence-rejected",
+        reason: resolved.reason,
+        evidence_count: Array.isArray(decision.evidence_refs)
+          ? Math.min(decision.evidence_refs.length, 3)
+          : 0,
+        candidate_count: Math.min(
+          Object.keys(candidateContext(options).candidates).length,
+          128,
+        ),
+      })
+      continue
+    }
+    evidenceAcceptedCount = Math.min(Number.MAX_SAFE_INTEGER, evidenceAcceptedCount + 1)
+    accepted.push(decision)
+  }
+
+  if (accepted.length === 0) return null
+  return {
+    ...facts,
+    decisions: accepted as ExtractedFacts["decisions"],
+  }
+}
+
+/** Surface the evidence-specific reason when the outer structured shape fails. */
+function reportUnvalidatedEvidenceFailures(
+  structured: unknown,
+  options?: Pick<ExtractFactsLLMOptions, "evidenceCandidateMap" | "evidenceDigestMap" | "evidenceCandidates" | "evidenceDigests" | "onDiagnostic">,
+): void {
+  if (!isRecord(structured) || !Array.isArray(structured.decisions)) return
+  for (const decision of structured.decisions) {
+    if (!isRecord(decision)) continue
+    const resolved = resolveEvidenceReferences(decision.evidence_refs, options)
+    if (!resolved.reason) continue
+    evidenceRejectedCount = Math.min(Number.MAX_SAFE_INTEGER, evidenceRejectedCount + 1)
+    emitDiagnostic(options?.onDiagnostic, {
+      kind: "evidence-rejected",
+      reason: resolved.reason,
+      evidence_count: Array.isArray(decision.evidence_refs)
+        ? Math.min(decision.evidence_refs.length, 3)
+        : 0,
+      candidate_count: Math.min(
+        Object.keys(candidateContext(options).candidates).length,
+        128,
+      ),
+    })
   }
 }
 
@@ -603,9 +781,19 @@ async function extractFactsLLMOnce(
       const structured = info?.structured
       const facts = validateStructuredResult(structured)
       if (facts) {
-        await notifyAuditTerminal(options?.onAuditTerminal, extractionSessionID, "success")
-        return facts
+        const corroborated = corroborateLLMFacts(facts, options)
+        if (corroborated) {
+          await notifyAuditTerminal(options?.onAuditTerminal, extractionSessionID, "success")
+          return corroborated
+        }
+        emitDiagnostic(options?.onDiagnostic, {
+          kind: "structured-output-failed",
+          attempt: attempt + 1,
+          reason: "invalid-structured-output",
+        })
+        continue
       }
+      reportUnvalidatedEvidenceFailures(structured, options)
       emitDiagnostic(options?.onDiagnostic, {
         kind: "structured-output-failed",
         attempt: attempt + 1,
@@ -643,16 +831,68 @@ async function notifyAuditTerminal(
   }
 }
 
+type CacheEvidenceOptions = Pick<ExtractFactsLLMOptions, "evidenceCandidateMap" | "evidenceDigestMap" | "evidenceCandidates" | "evidenceDigests">
+
+function hasEvidenceBackedProvenance(
+  entry: LLMExtractionCacheEntry,
+  options?: CacheEvidenceOptions,
+): boolean {
+  const provenance = entry.provenance
+  if (
+    !provenance ||
+    provenance.extractor !== "llm" ||
+    provenance.confidence !== "llm-corroborated" ||
+    !provenance.source_audit_session_id ||
+    provenance.evidence.length === 0
+  ) return false
+
+  const evidenceByRef = new Map(provenance.evidence.map((evidence) => [evidence.ref, evidence]))
+  for (const decision of entry.facts.decisions as Array<{ evidence_refs?: unknown }>) {
+    if (!Array.isArray(decision.evidence_refs) || decision.evidence_refs.length < 1) return false
+    for (const ref of decision.evidence_refs) {
+      const evidence = evidenceByRef.get(ref)
+      if (!evidence) return false
+    }
+  }
+
+  if (!options) return true
+  const { candidates, digests } = candidateContext(options)
+  return provenance.evidence.every((evidence) => {
+    const candidate = candidates[evidence.ref]
+    return Boolean(
+      candidate &&
+        candidate.ref === evidence.ref &&
+        candidate.kind === evidence.kind &&
+        candidate.digest === evidence.digest &&
+        (digests[evidence.ref] === undefined || digests[evidence.ref] === evidence.digest),
+    )
+  })
+}
+
+/** Return a validated cache entry for a key, or null for a stale/malformed row. */
+export function readExtractionCacheEntry(
+  memory: Pick<MemoryFile, "llm_extraction_cache"> | null | undefined,
+  cacheKey: string,
+  options?: CacheEvidenceOptions,
+): LLMExtractionCacheEntry | null {
+  for (const candidate of [...(memory?.llm_extraction_cache ?? [])].reverse()) {
+    const parsed = LLMExtractionCacheEntrySchema.safeParse(candidate)
+    if (
+      parsed.success &&
+      parsed.data.cache_key === cacheKey &&
+      hasEvidenceBackedProvenance(parsed.data, options)
+    ) return parsed.data
+  }
+  return null
+}
+
 /** Return validated facts for a cache key, or null for a stale/malformed entry. */
 export function readExtractionCache(
   memory: Pick<MemoryFile, "llm_extraction_cache"> | null | undefined,
   cacheKey: string,
+  options?: CacheEvidenceOptions,
 ): ExtractedFacts | null {
-  for (const candidate of [...(memory?.llm_extraction_cache ?? [])].reverse()) {
-    const parsed = LLMExtractionCacheEntrySchema.safeParse(candidate)
-    if (parsed.success && parsed.data.cache_key === cacheKey) return parsed.data.facts
-  }
-  return null
+  return readExtractionCacheEntry(memory, cacheKey, options)?.facts ?? null
 }
 
 /** Build a validated cache entry for a successful extraction. */
@@ -661,8 +901,22 @@ export function makeExtractionCacheEntry(args: {
   canonicalInput: CanonicalExtractionInput
   model: SmallModel
   facts: ExtractedFacts
+  auditSessionID?: string
+  evidence?: Evidence[]
+  provenance?: LLMExtractionCacheEntry["provenance"]
   completedAt?: string
 }): LLMExtractionCacheEntry {
+  const provenance = args.provenance ?? (
+    args.auditSessionID && args.evidence && args.evidence.length > 0
+      ? {
+          extractor: "llm" as const,
+          source_session_id: args.sourceSessionID,
+          source_audit_session_id: args.auditSessionID,
+          confidence: "llm-corroborated" as const,
+          evidence: args.evidence.slice(0, 3),
+        }
+      : undefined
+  )
   return {
     cache_key: makeExtractionCacheKey(
       args.sourceSessionID,
@@ -674,6 +928,7 @@ export function makeExtractionCacheEntry(args: {
     provider_id: args.model.providerID,
     model_id: args.model.modelID,
     completed_at: args.completedAt ?? new Date().toISOString(),
+    ...(provenance ? { provenance } : {}),
     facts: args.facts,
   }
 }
@@ -684,7 +939,7 @@ export function upsertExtractionCache(
   entry: LLMExtractionCacheEntry,
 ): MemoryFile {
   const parsed = LLMExtractionCacheEntrySchema.safeParse(entry)
-  if (!parsed.success) return memory
+  if (!parsed.success || !hasEvidenceBackedProvenance(parsed.data)) return memory
 
   const entries = (memory.llm_extraction_cache ?? [])
     .map((candidate) => LLMExtractionCacheEntrySchema.safeParse(candidate))

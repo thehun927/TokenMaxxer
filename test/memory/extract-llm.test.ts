@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
+  corroborateLLMFacts,
   extractFactsLLM,
   getLLMConfig,
   isRetainedExtractionSession,
@@ -17,9 +18,25 @@ import type { TranscriptMessage } from "../../src/types"
 const facts = {
   current_task: "Ship the SDK integration",
   active_files: [{ path: "src/memory/writer.ts", reason: "edited" }],
-  decisions: [{ topic: "transport", decision: "Use SDK v2" }],
+  decisions: [{
+    topic: "transport",
+    decision: "Use SDK v2",
+    evidence_refs: ["tr-source-evidence"],
+  }],
   blockers: [],
   next_steps: ["Run tests"],
+}
+
+const evidenceCandidateMap = {
+  "tr-source-evidence": {
+    kind: "transcript" as const,
+    ref: "tr-source-evidence",
+    digest: "a".repeat(64),
+  },
+}
+const evidenceOptions = {
+  evidenceCandidateMap,
+  evidenceDigestMap: { "tr-source-evidence": "a".repeat(64) },
 }
 
 function canonical() {
@@ -73,6 +90,38 @@ describe("v1 structured extraction", () => {
     expect(parseSmallModel(undefined)).toBeUndefined()
   })
 
+  it("accepts only decisions whose bounded evidence resolves and matches digests", () => {
+    const diagnostics: unknown[] = []
+    expect(corroborateLLMFacts(facts, {
+      ...evidenceOptions,
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    })).toEqual(facts)
+
+    expect(corroborateLLMFacts({
+      ...facts,
+      decisions: [{ topic: "transport", decision: "Use SDK v2" }],
+    }, {
+      ...evidenceOptions,
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    })).toBeNull()
+
+    expect(corroborateLLMFacts(facts, {
+      evidenceCandidateMap: {},
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    })).toBeNull()
+
+    expect(corroborateLLMFacts(facts, {
+      evidenceCandidateMap,
+      evidenceDigestMap: { "tr-source-evidence": "b".repeat(64) },
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    })).toBeNull()
+
+    expect(diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "evidence-rejected", reason: "unknown-reference" }),
+      expect.objectContaining({ kind: "evidence-rejected", reason: "digest-mismatch" }),
+    ]))
+  })
+
   it("uses nested v1 calls and retains one visible audit session", async () => {
     const create = vi.fn(async (parameters: unknown) => ({ data: { id: "audit-1" }, parameters }))
     const prompt = vi.fn(async () => ({ data: { info: { structured: facts } } }))
@@ -85,7 +134,7 @@ describe("v1 structured extraction", () => {
       "project",
       client,
       { enabled: true, model: { providerID: "anthropic", modelID: "haiku" } },
-      { directory: "/worktree" },
+      { directory: "/worktree", ...evidenceOptions },
     )).resolves.toEqual(facts)
     expect(isRetainedExtractionSession("audit-1")).toBe(true)
 
@@ -126,7 +175,7 @@ describe("v1 structured extraction", () => {
       "project",
       { session },
       { enabled: true, model: { providerID: "provider", modelID: "model" } },
-      { directory: "/worktree" },
+      { directory: "/worktree", ...evidenceOptions },
     )).resolves.toEqual(facts)
     expect(session.create).toHaveBeenCalledTimes(1)
     expect(session.prompt).toHaveBeenCalledTimes(1)
@@ -147,7 +196,7 @@ describe("v1 structured extraction", () => {
       "project",
       client,
       { enabled: true, model: { providerID: "provider", modelID: "model", variant: "none" } },
-      { directory: "/worktree" },
+      { directory: "/worktree", ...evidenceOptions },
     )).resolves.toEqual(facts)
 
     expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
@@ -172,6 +221,8 @@ describe("v1 structured extraction", () => {
       canonicalInput: input,
       model,
       facts,
+      auditSessionID: "audit-cache",
+      evidence: [{ kind: "transcript", ref: "tr-source-evidence", digest: "a".repeat(64) }],
     })
     const memory = { ...emptyMemory("/worktree"), llm_extraction_cache: [entry] }
 
@@ -182,7 +233,7 @@ describe("v1 structured extraction", () => {
       "project",
       client,
       { enabled: true, model },
-      { directory: "/worktree", cachedFacts: cached },
+      { directory: "/worktree", cachedFacts: cached, ...evidenceOptions },
     )).resolves.toEqual(facts)
     expect(client.session.create).not.toHaveBeenCalled()
     expect(client.session.prompt).not.toHaveBeenCalled()
@@ -205,7 +256,7 @@ describe("v1 structured extraction", () => {
       "project",
       client,
       { enabled: true, model: { providerID: "p", modelID: "m" } },
-      { directory: "/worktree" },
+      { directory: "/worktree", ...evidenceOptions },
     )).resolves.toBeNull()
     expect(invalidThenError).toHaveBeenCalledTimes(2)
   })
@@ -314,6 +365,8 @@ describe("v1 structured extraction", () => {
         canonicalInput: { ...canonical(), sha256: String(index).padStart(64, "0") },
         model,
         facts,
+        auditSessionID: `audit-${index}`,
+        evidence: [{ kind: "transcript", ref: "tr-source-evidence", digest: "a".repeat(64) }],
       }))
     }
     expect(memory.llm_extraction_cache).toHaveLength(10)

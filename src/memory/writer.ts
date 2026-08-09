@@ -2,7 +2,14 @@
  * Memory writer — extracts facts from session transcripts and writes to STATE.json.
  * Triggered on session.idle. Full specification in docs/IMPLEMENTATION.md Appendix A.
  */
-import type { MemoryFile, Decision, AuditTerminalOutcome, LLMAuditMetadata } from "./schema"
+import type {
+  MemoryFile,
+  Decision,
+  AuditTerminalOutcome,
+  LLMAuditMetadata,
+  Evidence,
+  Provenance,
+} from "./schema"
 import type { ExtractedFacts, TranscriptMessage, TranscriptPart } from "../types"
 import { readMemory, writeMemory, emptyMemory, resolveProjectPath } from "./store"
 import { enqueueProjectJob, setProjectQueueOutcome } from "./lock"
@@ -11,14 +18,20 @@ import { atomicWrite } from "../util/fs"
 import { basename, join } from "node:path"
 import {
   buildCanonicalInput,
+  buildTranscriptEvidenceCandidateMap,
+  stableJson,
+  sha256Hex,
 } from "./extract-prompt"
 import {
   extractFactsLLM,
   extractionCacheKey,
   getLLMConfig,
   makeExtractionCacheEntry,
-  readExtractionCache,
+  readExtractionCacheEntry,
+  resolveEvidenceReferences,
   upsertExtractionCache,
+  type EvidenceCandidate,
+  type EvidenceCandidateMap,
   type LLMExtractionDiagnostic,
   type AuditCreatedCallback,
 } from "./extract-llm"
@@ -42,10 +55,114 @@ function logLLMDiagnostic(client: unknown, diagnostic: LLMExtractionDiagnostic):
   if ("reason" in diagnostic) extra.reason = boundedDiagnosticValue(diagnostic.reason)
   if ("attempt" in diagnostic) extra.attempt = diagnostic.attempt
   if ("attempts" in diagnostic) extra.attempts = diagnostic.attempts
+  if ("evidence_count" in diagnostic) extra.evidence_count = diagnostic.evidence_count
+  if ("candidate_count" in diagnostic) extra.candidate_count = diagnostic.candidate_count
   if ("error" in diagnostic && diagnostic.error) extra.error = diagnostic.error
 
   // Logging must never delay or change extraction/memory behavior.
   void log(client, level, "llm extraction diagnostic", extra)
+}
+
+/** The ephemeral deterministic candidate used by provenance construction. */
+export type HeuristicEvidenceCandidate = EvidenceCandidate
+
+function heuristicCandidateRef(kind: string, value: unknown): string {
+  return `hc-${sha256Hex(stableJson({ kind, value })).slice(0, 16)}`
+}
+
+function heuristicCandidate(
+  kind: string,
+  value: unknown,
+): HeuristicEvidenceCandidate {
+  const ref = heuristicCandidateRef(kind, value)
+  return {
+    kind: "heuristic-candidate",
+    ref,
+    digest: sha256Hex(stableJson({ kind, ref, value })),
+  }
+}
+
+/**
+ * Build bounded, deterministic heuristic candidates.  Candidate values are
+ * kept only for this idle transaction and are never written to STATE.json.
+ */
+export function buildHeuristicEvidenceCandidateMap(
+  facts: ExtractedFacts,
+): EvidenceCandidateMap {
+  const map: Record<string, EvidenceCandidate> = {}
+  if (facts.current_task) {
+    const candidate = heuristicCandidate("current-task", facts.current_task)
+    map[candidate.ref] = candidate
+  }
+  for (const file of facts.active_files.slice(0, 5)) {
+    const candidate = heuristicCandidate("active-file", file)
+    map[candidate.ref] = candidate
+  }
+  for (const decision of facts.decisions.slice(0, 5)) {
+    const candidate = heuristicCandidate("decision", {
+      topic: decision.topic,
+      decision: decision.decision,
+    })
+    map[candidate.ref] = candidate
+  }
+  return map
+}
+
+function transcriptCandidateMap(
+  messages: TranscriptMessage[],
+): EvidenceCandidateMap {
+  const source = buildTranscriptEvidenceCandidateMap(messages)
+  const map: Record<string, EvidenceCandidate> = {}
+  for (const [ref, candidate] of Object.entries(source)) {
+    map[ref] = {
+      kind: "transcript",
+      ref,
+      digest: candidate.digest,
+      text: candidate.text,
+      role: candidate.role,
+    }
+  }
+  return map
+}
+
+function mergeEvidenceCandidateMaps(
+  ...maps: EvidenceCandidateMap[]
+): EvidenceCandidateMap {
+  const merged: Record<string, EvidenceCandidate> = {}
+  for (const map of maps) {
+    for (const [ref, candidate] of Object.entries(map)) {
+      if (!merged[ref]) merged[ref] = candidate
+    }
+  }
+  return merged
+}
+
+function evidenceDigestMap(
+  candidates: EvidenceCandidateMap,
+): Readonly<Record<string, string>> {
+  const digests: Record<string, string> = {}
+  for (const ref of Object.keys(candidates).sort()) {
+    const digest = candidates[ref]?.digest
+    if (digest) digests[ref] = digest
+  }
+  return digests
+}
+
+function candidateEvidence(
+  refs: unknown,
+  candidates: EvidenceCandidateMap,
+): Evidence[] {
+  return resolveEvidenceReferences(refs, {
+    evidenceCandidateMap: candidates,
+    evidenceDigestMap: evidenceDigestMap(candidates),
+  }).evidence
+}
+
+function firstCandidateEvidence(candidates: EvidenceCandidateMap): Evidence[] {
+  const ref = Object.keys(candidates).sort()[0]
+  if (!ref) return []
+  const candidate = candidates[ref]
+  return candidate ? [{ kind: candidate.kind, ref, digest: candidate.digest }] : []
 }
 
 // ─── writeMemoryOnIdle ───────────────────────────────────────────────────────
@@ -110,12 +227,19 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     const canonicalInput = buildCanonicalInput(messages, canonicalPrior)
     const gitSha = await getCurrentGitSha(worktree)
     const extracted = extractFactsHeuristic(messages)
+    const candidates = mergeEvidenceCandidateMaps(
+      transcriptCandidateMap(messages),
+      buildHeuristicEvidenceCandidateMap(extracted),
+    )
+    const digests = evidenceDigestMap(candidates)
 
     markReferencedDecisions(existing, allMessages, sessionId)
     const merged = mergeMemory(existing, extracted, {
       sessionId,
       gitSha,
       timestamp: new Date().toISOString(),
+      origin: "heuristic",
+      evidenceCandidates: candidates,
     })
     const pruned = pruneOld(recordRecentSession(merged, sessionId))
 
@@ -148,17 +272,27 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     // before any retained audit session or prompt can be created.
     const cacheKey = extractionCacheKey(sessionId, canonicalInput, llmConfig.model)
     const afterHeuristic = (await readMemory({ worktree, directory })) ?? pruned
-    const cachedFacts = readExtractionCache(afterHeuristic, cacheKey)
-    if (cachedFacts) {
+    const cachedEntry = readExtractionCacheEntry(afterHeuristic, cacheKey, {
+      evidenceCandidateMap: candidates,
+      evidenceDigestMap: digests,
+    })
+    if (cachedEntry) {
       void log(client, "debug", "llm extraction cache hit")
-      await mergeAsyncFacts(opts, cachedFacts, gitSha, sessionId)
+      await mergeAsyncFacts(opts, cachedEntry.facts, gitSha, sessionId, {
+        origin: "llm",
+        auditSessionID: cachedEntry.provenance?.source_audit_session_id,
+        evidenceCandidates: candidates,
+        provenanceEvidence: cachedEntry.provenance?.evidence,
+      })
       void log(client, "info", "llm extraction facts merged")
       return "cache-hit"
     }
 
     const project = resolveProjectPath(worktree, directory)
     const projectName = basename(project) || project
+    let extractionAuditSessionID: string | undefined
     const persistAudit: AuditCreatedCallback = async (audit) => {
+      extractionAuditSessionID = audit.audit_session_id
       const latest = (await readMemory({ worktree, directory })) ?? afterHeuristic
       const guarded = upsertAuditMetadata(latest, audit)
       return writeMemory({ worktree, directory }, pruneOld(guarded))
@@ -183,6 +317,8 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       {
         directory,
         projectKey: project,
+        evidenceCandidateMap: candidates,
+        evidenceDigestMap: digests,
         onDiagnostic: (diagnostic) => logLLMDiagnostic(client, diagnostic),
         onAuditCreated: persistAudit,
         onAuditTerminal: persistTerminal,
@@ -197,9 +333,17 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     // merge/upsert. A duplicate completion therefore replaces, rather than
     // appends, the same cache identity.
     const latest = (await readMemory({ worktree, directory })) ?? pruned
-    const cacheAlreadyCommitted = readExtractionCache(latest, cacheKey)
+    const cacheAlreadyCommitted = readExtractionCacheEntry(latest, cacheKey, {
+      evidenceCandidateMap: candidates,
+      evidenceDigestMap: digests,
+    })
     if (cacheAlreadyCommitted) {
-      await mergeAsyncFacts(opts, cacheAlreadyCommitted, gitSha, sessionId)
+      await mergeAsyncFacts(opts, cacheAlreadyCommitted.facts, gitSha, sessionId, {
+        origin: "llm",
+        auditSessionID: cacheAlreadyCommitted.provenance?.source_audit_session_id,
+        evidenceCandidates: candidates,
+        provenanceEvidence: cacheAlreadyCommitted.provenance?.evidence,
+      })
       return "cache-hit"
     }
 
@@ -208,17 +352,36 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       sessionId,
       gitSha,
       timestamp,
+      origin: "llm",
+      auditSessionID: extractionAuditSessionID,
+      evidenceCandidates: candidates,
     })
-    const withCache = upsertExtractionCache(
-      recordRecentSession(mergedLLM, sessionId),
-      makeExtractionCacheEntry({
-        sourceSessionID: sessionId,
-        canonicalInput,
-        model: llmConfig.model,
-        facts: llmFacts,
-        completedAt: timestamp,
-      }),
-    )
+    const decisionEvidence = [
+      ...llmFacts.decisions.flatMap((decision) => candidateEvidence(
+        (decision as { evidence_refs?: unknown }).evidence_refs,
+        candidates,
+      )),
+    ].filter((evidence, index, all) => (
+      all.findIndex((candidate) => candidate.ref === evidence.ref) === index
+    ))
+    const cacheEvidence = decisionEvidence.length > 0
+      ? decisionEvidence
+      : firstCandidateEvidence(candidates)
+    const cacheCanRepresentAllEvidence = decisionEvidence.length <= 3
+    const withCache = cacheCanRepresentAllEvidence && cacheEvidence.length > 0 && extractionAuditSessionID
+      ? upsertExtractionCache(
+          recordRecentSession(mergedLLM, sessionId),
+          makeExtractionCacheEntry({
+            sourceSessionID: sessionId,
+            canonicalInput,
+            model: llmConfig.model,
+            facts: llmFacts,
+            auditSessionID: extractionAuditSessionID,
+            evidence: cacheEvidence,
+            completedAt: timestamp,
+          }),
+        )
+      : recordRecentSession(mergedLLM, sessionId)
     const finalMemory = pruneOld(withCache)
     const committed = await writeMemory({ worktree, directory }, finalMemory)
     if (committed === false) return "llm-failed"
@@ -289,6 +452,7 @@ async function mergeAsyncFacts(
   facts: ExtractedFacts,
   gitSha: string | null,
   sessionId: string,
+  mergeOptions: MergeOptions,
 ): Promise<void> {
   const latest = (await readMemory({ worktree: opts.worktree, directory: opts.directory }))
     ?? emptyMemory(opts.worktree)
@@ -296,6 +460,7 @@ async function mergeAsyncFacts(
     sessionId,
     gitSha,
     timestamp: new Date().toISOString(),
+    ...mergeOptions,
   })
   const finalMemory = pruneOld(recordRecentSession(merged, sessionId))
   await writeMemory({ worktree: opts.worktree, directory: opts.directory }, finalMemory)
@@ -951,6 +1116,83 @@ export function markReferencedDecisions(
 
 // ─── mergeMemory ─────────────────────────────────────────────────────────────
 
+type MergeOptions = {
+  origin?: "heuristic" | "llm"
+  auditSessionID?: string
+  evidenceCandidates?: EvidenceCandidateMap
+  provenanceEvidence?: Evidence[]
+}
+
+type MergeMeta = {
+  sessionId: string
+  gitSha: string | null
+  timestamp: string
+} & MergeOptions
+
+function normalizedFact(value: string): string {
+  return value.toLowerCase().trim().replace(/\s+/g, " ")
+}
+
+function existingProvenance(value: { provenance?: Provenance }): Provenance | undefined {
+  return value.provenance
+}
+
+function makeProvenance(
+  meta: MergeMeta,
+  evidence: Evidence[],
+): Provenance {
+  const llm = meta.origin === "llm"
+  return {
+    extractor: llm ? "llm" : "heuristic",
+    source_session_id: meta.sessionId,
+    ...(llm && meta.auditSessionID
+      ? { source_audit_session_id: meta.auditSessionID }
+      : {}),
+    confidence: llm ? "llm-corroborated" : "heuristic",
+    evidence: evidence.slice(0, 3),
+  }
+}
+
+function heuristicEvidenceFor(
+  value: { topic?: string; decision?: string; path?: string; reason?: string },
+  candidates: EvidenceCandidateMap | undefined,
+): Evidence[] {
+  if (!candidates) return []
+  const needle = normalizedFact(value.decision ?? value.path ?? value.topic ?? "")
+  const transcript = Object.values(candidates).find((candidate) => (
+    candidate.kind === "transcript" &&
+    typeof candidate.text === "string" &&
+    normalizedFact(candidate.text).includes(needle)
+  ))
+  if (transcript) {
+    return [{ kind: transcript.kind, ref: transcript.ref, digest: transcript.digest }]
+  }
+
+  const kind = value.topic !== undefined
+    ? "decision"
+    : value.path !== undefined
+      ? "active-file"
+      : "current-task"
+  const ref = heuristicCandidateRef(kind, value.topic !== undefined
+    ? { topic: value.topic, decision: value.decision }
+    : value.path !== undefined
+      ? { path: value.path, reason: value.reason }
+      : value.decision)
+  const candidate = candidates[ref]
+  return candidate
+    ? [{ kind: candidate.kind, ref: candidate.ref, digest: candidate.digest }]
+    : []
+}
+
+function llmEvidenceFor(
+  refs: unknown,
+  meta: MergeMeta,
+): Evidence[] | null {
+  if (!meta.evidenceCandidates) return null
+  const evidence = candidateEvidence(refs, meta.evidenceCandidates)
+  return evidence.length > 0 ? evidence : null
+}
+
 /**
  * Merge extracted facts into existing memory.
  * Full rules in docs/IMPLEMENTATION.md Appendix A.2.
@@ -958,36 +1200,75 @@ export function markReferencedDecisions(
 export function mergeMemory(
   existing: MemoryFile,
   extracted: ExtractedFacts,
-  meta: { sessionId: string; gitSha: string | null; timestamp: string },
+  meta: MergeMeta,
 ): MemoryFile {
-  // current_task: overwrite if extracted has one, else keep
-  const current_task =
-    extracted.current_task !== null ? extracted.current_task : existing.current_task
+  const origin = meta.origin ?? "heuristic"
 
-  // active_files: replace list, preserve old reason for files in both if new is generic
-  const oldFileMap = new Map(existing.active_files.map((f) => [f.path, f.reason]))
-  const active_files = extracted.active_files.map((f) => {
-    const oldReason = oldFileMap.get(f.path)
+  // Heuristic state is written first and remains authoritative for an already
+  // corroborated task. LLM output may fill a missing/legacy task, but cannot
+  // silently replace a current heuristic observation.
+  let current_task = existing.current_task
+  let current_task_provenance = existing.current_task_provenance
+  if (extracted.current_task !== null) {
+    const preserveHeuristicTask = origin === "llm" &&
+      Boolean(existing.current_task) &&
+      existing.current_task_provenance?.extractor === "heuristic"
+    if (!preserveHeuristicTask) {
+      current_task = extracted.current_task
+      const evidence = origin === "llm"
+        ? (meta.provenanceEvidence ?? firstCandidateEvidence(meta.evidenceCandidates ?? {}))
+        : heuristicEvidenceFor({ decision: extracted.current_task }, meta.evidenceCandidates)
+      current_task_provenance = makeProvenance(meta, evidence)
+    }
+  }
+
+  // Heuristic active files are retained when an LLM result arrives. New LLM
+  // files may be added, but the model cannot erase a source-backed heuristic
+  // observation.
+  const oldFileMap = new Map(existing.active_files.map((f) => [f.path, f]))
+  const incomingFiles = extracted.active_files.map((f) => {
+    const old = oldFileMap.get(f.path)
+    const oldReason = old?.reason
     const isGeneric = f.reason === "read once" || f.reason.startsWith("edited ")
+    const evidence = origin === "llm"
+      ? (meta.provenanceEvidence ?? firstCandidateEvidence(meta.evidenceCandidates ?? {}))
+      : heuristicEvidenceFor(f, meta.evidenceCandidates)
     return {
       path: f.path,
       reason: oldReason && isGeneric ? oldReason : f.reason,
-      last_touched: meta.timestamp,
+      last_touched: origin === "llm" && old ? old.last_touched : meta.timestamp,
+      provenance: origin === "llm" && old?.provenance?.extractor === "heuristic"
+        ? old.provenance
+        : makeProvenance(meta, evidence),
     }
   })
+  const active_files = origin === "llm"
+    ? [
+        ...existing.active_files,
+        ...incomingFiles.filter((file) => !oldFileMap.has(file.path)),
+      ]
+    : incomingFiles
 
   // decisions: merge with exact topic match (NOT substring)
   const existingDecisions = existing.decisions.map((d) => ({ ...d })) // shallow clone
   const existingTopicMap = new Map<string, number>() // topic → index
 
   for (let i = 0; i < existingDecisions.length; i++) {
-    const normalized = existingDecisions[i].topic.toLowerCase().trim().replace(/\s+/g, " ")
+    const normalized = normalizedFact(existingDecisions[i].topic)
     existingTopicMap.set(normalized, i)
   }
 
   for (const newDec of extracted.decisions) {
-    const normalizedTopic = newDec.topic.toLowerCase().trim().replace(/\s+/g, " ")
+    const normalizedTopic = normalizedFact(newDec.topic)
     const existingIdx = existingTopicMap.get(normalizedTopic)
+
+    const evidence = origin === "llm"
+      ? llmEvidenceFor((newDec as { evidence_refs?: unknown }).evidence_refs, meta)
+      : heuristicEvidenceFor(newDec, meta.evidenceCandidates)
+    // Direct callers cannot bypass the evidence boundary by calling mergeMemory
+    // with an LLM-shaped fact. The normal extractor already performs the same
+    // check before this merge.
+    if (origin === "llm" && !evidence) continue
 
     const decision: Decision = {
       id: cryptoRandomUUID(),
@@ -998,13 +1279,27 @@ export function mergeMemory(
       git_sha: meta.gitSha ?? undefined,
       session_id: meta.sessionId,
       still_valid: true,
-      foundational: newDec.foundational ?? false,
+      // Foundational status is human-reviewed state. Both model and heuristic
+      // extraction may request it, but neither extraction path may promote it.
+      foundational: false,
+      foundational_requested: origin === "llm"
+        ? Boolean(newDec.foundational)
+        : Boolean(newDec.foundational) ||
+          Boolean((newDec as { foundational_requested?: unknown }).foundational_requested),
+      provenance: makeProvenance(meta, evidence ?? []),
     }
 
     if (existingIdx !== undefined) {
-      // Exact topic match → mark old as invalid, append new
-      if (typeof existingDecisions[existingIdx]?.id === "string") {
-        existingDecisions[existingIdx]!.still_valid = false
+      const old = existingDecisions[existingIdx]
+      const oldIsHeuristic = old?.provenance?.extractor === "heuristic" ||
+        old?.provenance?.confidence === "heuristic"
+      if (origin === "llm" && old?.still_valid && oldIsHeuristic) {
+        // Preserve a corroborated heuristic fact. A differing model claim is
+        // retained as an invalid audit fact; an equivalent claim is retained as
+        // an additional corroborated observation without erasing the heuristic.
+        decision.still_valid = normalizedFact(decision.decision) === normalizedFact(old.decision)
+      } else if (typeof old?.id === "string") {
+        old.still_valid = false
       }
       existingDecisions.push(decision)
     } else {
@@ -1014,19 +1309,19 @@ export function mergeMemory(
   }
 
   return {
-    version: 2,
+    ...existing,
+    version: 3,
     project_path: existing.project_path,
     last_updated: meta.timestamp,
     last_git_sha: meta.gitSha ?? existing.last_git_sha,
     last_session_id: meta.sessionId,
     current_task,
+    current_task_provenance,
     active_files,
     decisions: existingDecisions,
     blockers: extracted.blockers,
     next_steps: extracted.next_steps,
     recent_sessions: existing.recent_sessions ?? [],
-    llm_extraction_cache: existing.llm_extraction_cache,
-    llm_extraction_audits: existing.llm_extraction_audits,
   }
 }
 
@@ -1099,6 +1394,12 @@ export function pruneOld(mem: MemoryFile): MemoryFile {
     last_git_sha: mem.last_git_sha,
     last_session_id: mem.last_session_id,
     current_task: mem.current_task,
+    current_task_provenance: mem.current_task_provenance
+      ? {
+          ...mem.current_task_provenance,
+          evidence: [...(mem.current_task_provenance.evidence ?? [])],
+        }
+      : undefined,
     active_files: mem.active_files.map((f) => ({ ...f })),
     decisions: mem.decisions.map((d) => ({ ...d })),
     blockers: [...mem.blockers],
@@ -1116,6 +1417,10 @@ export function pruneOld(mem: MemoryFile): MemoryFile {
     })),
     llm_extraction_audits: mem.llm_extraction_audits
       ? boundedAuditMetadata(mem.llm_extraction_audits.map((audit) => ({ ...audit })))
+      : undefined,
+    model_health: mem.model_health?.map((health) => ({ ...health })),
+    llm_extraction_cache_quarantine: mem.llm_extraction_cache_quarantine
+      ? { ...mem.llm_extraction_cache_quarantine }
       : undefined,
   }
 

@@ -7,7 +7,24 @@
  */
 import { tool } from "@opencode-ai/plugin"
 import { readMemory, writeMemory } from "../memory/store"
-import { queryDecisions, getActiveFiles, getProjectState } from "../memory/reader"
+import {
+  queryDecisions,
+  getActiveFiles,
+  getProjectState,
+} from "../memory/reader"
+
+function decisionProvenanceLabel(value: { provenance?: {
+  source_session_id: string
+  source_audit_session_id?: string
+  confidence: string
+  evidence?: unknown[]
+} }): string {
+  const provenance = value.provenance
+  if (!provenance) return ""
+  return `source=${provenance.source_session_id}${provenance.source_audit_session_id
+    ? ` audit=${provenance.source_audit_session_id}`
+    : ""} confidence=${provenance.confidence} evidence=${provenance.evidence?.length ?? 0}`
+}
 
 // --- Inner functions (exported for testability) ---
 
@@ -22,7 +39,7 @@ export async function _recallDecision(
     const prefix = `Project: ${mem.project_path}\n`
     if (!hits.length) return `${prefix}No valid decisions matching "${args.query}".`
     return prefix + hits
-      .map((d) => `${d.topic}: ${d.decision} (SHA ${d.git_sha ?? "?"}, ${d.timestamp})`)
+      .map((d) => `${d.topic}: ${d.decision} (SHA ${d.git_sha ?? "?"}, ${d.timestamp})${d.provenance ? ` [${decisionProvenanceLabel(d)}]` : ""}`)
       .join("\n")
   } catch (e) {
     return `Error recalling decisions: ${String(e)}`
@@ -39,7 +56,7 @@ export async function _getActiveFiles(
     const active = getActiveFiles(mem)
     if (!active.length) return "No active files recorded."
     return `Project: ${mem.project_path}\n` + active
-      .map((f) => `${f.path} — ${f.reason}`)
+      .map((f) => `${f.path} — ${f.reason}${f.provenance ? ` [${decisionProvenanceLabel(f)}]` : ""}`)
       .join("\n")
   } catch (e) {
     return `Error getting active files: ${String(e)}`
@@ -61,7 +78,7 @@ export async function _getProjectState(
 
 export async function _recallPromote(
   args: { topic: string },
-  context: { worktree: string; directory: string },
+  context: { worktree: string; directory: string; sessionID?: string; sessionId?: string },
 ): Promise<string> {
   try {
     const mem = await readMemory({ worktree: context.worktree, directory: context.directory })
@@ -71,8 +88,21 @@ export async function _recallPromote(
     )
     if (!d) return `No decision with topic "${args.topic}".`
     d.foundational = true
+    d.foundational_requested = false
+    const reviewSession = context.sessionID ?? context.sessionId ?? d.session_id ?? "human-review"
+    d.provenance = {
+      ...(d.provenance ?? {
+        extractor: "legacy" as const,
+        source_session_id: d.session_id || "legacy",
+        confidence: "legacy" as const,
+        evidence: [],
+      }),
+      extractor: "human",
+      source_session_id: reviewSession,
+      confidence: "human-reviewed",
+    }
     await writeMemory({ worktree: context.worktree, directory: context.directory }, mem)
-    return `Promoted: ${d.topic}: ${d.decision}`
+    return `Promoted: ${d.topic}: ${d.decision}${d.provenance ? ` [${decisionProvenanceLabel(d)}]` : ""}`
   } catch (e) {
     return `Error promoting decision: ${String(e)}`
   }

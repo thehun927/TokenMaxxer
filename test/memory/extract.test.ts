@@ -8,7 +8,13 @@ import {
 } from "../../src/memory/extract-schema"
 import {
   buildCanonicalInput,
+  buildTranscriptEvidenceCandidateMap,
+  buildTranscriptEvidenceCandidates,
+  buildTranscriptEvidenceRefDigestMap,
   buildExtractionPrompt,
+  compressTranscript,
+  digestTranscriptEvidenceCandidate,
+  makeTranscriptEvidenceRef,
   makeExtractionCacheKey,
   serializeCanonicalInput,
   stableJson,
@@ -19,7 +25,7 @@ import type { TranscriptMessage } from "../../src/types"
 const validFacts = {
   current_task: "Build the API",
   active_files: [{ path: "src/api.ts", reason: "edited" }],
-  decisions: [{ topic: "database", decision: "Use Postgres" }],
+  decisions: [{ topic: "database", decision: "Use Postgres", evidence_refs: ["tr-evidence"] }],
   blockers: [],
   next_steps: ["Add tests"],
 }
@@ -61,9 +67,53 @@ describe("LLM extraction schema", () => {
       }).success,
     ).toBe(false)
     expect(
+      ExtractedFactsSchema.safeParse({
+        ...validFacts,
+        decisions: [{ topic: "database", decision: "Use Postgres" }],
+      }).success,
+    ).toBe(false)
+    expect(
+      ExtractedFactsSchema.safeParse({
+        ...validFacts,
+        decisions: [{ topic: "database", decision: "Use Postgres", evidence_refs: [] }],
+      }).success,
+    ).toBe(false)
+    expect(
+      ExtractedFactsSchema.safeParse({
+        ...validFacts,
+        decisions: [{
+          topic: "database",
+          decision: "Use Postgres",
+          evidence_refs: ["a", "b", "c", "d"],
+        }],
+      }).success,
+    ).toBe(false)
+    expect(
+      ExtractedFactsSchema.safeParse({
+        ...validFacts,
+        decisions: [{
+          topic: "database",
+          decision: "Use Postgres",
+          evidence_refs: ["a", "a"],
+        }],
+      }).success,
+    ).toBe(false)
+    expect(
       ExtractedFactsSchema.safeParse({ ...validFacts, assistant_text: "{}" }).success,
     ).toBe(false)
     expect(validateStructuredResult({ ...validFacts, next_steps: Array(6).fill("step") })).toBeNull()
+  })
+
+  it("publishes the required bounded evidence JSON Schema contract", () => {
+    const decisionSchema = ExtractedFactsJsonSchema.properties.decisions.items
+    expect(decisionSchema.properties.evidence_refs).toEqual({
+      type: "array",
+      minItems: 1,
+      maxItems: 3,
+      uniqueItems: true,
+      items: { type: "string", minLength: 1, maxLength: 128 },
+    })
+    expect(decisionSchema.required).toContain("evidence_refs")
   })
 })
 
@@ -99,6 +149,28 @@ describe("canonical extraction input", () => {
     }
     const withCache = buildCanonicalInput(messages, prior)
     const withoutCache = buildCanonicalInput(messages, { ...prior, llm_extraction_cache: undefined })
+    const withAuditAndCache = buildCanonicalInput(messages, {
+      ...prior,
+      llm_extraction_audits: [{
+        audit_session_id: "audit-operational",
+        source_session_id: "source-operational",
+        cache_key: "source:sha256:provider/model",
+        provider_id: "provider",
+        model_id: "model",
+        created_at: "2026-01-01T00:00:00.000Z",
+        terminal_outcome: "pending" as const,
+      }],
+      llm_extraction_cache_quarantine: {
+        count: 1,
+        reason: "operational-only",
+      },
+      model_health: [{
+        provider_id: "provider",
+        model_id: "model",
+        last_outcome: "success" as const,
+        failure_streak: 0,
+      }],
+    })
 
     expect(withCache.priorStateJson.length).toBeLessThanOrEqual(8_000)
     expect(() => JSON.parse(withCache.priorStateJson)).not.toThrow()
@@ -111,6 +183,47 @@ describe("canonical extraction input", () => {
     expect(withCache.fileCandidates[0]).toBe("src/file-00.ts")
     expect(withCache.fileCandidates).toEqual([...withCache.fileCandidates].sort())
     expect(withCache.sha256).toBe(withoutCache.sha256)
+    expect(withAuditAndCache.sha256).toBe(withoutCache.sha256)
+    expect(withAuditAndCache.priorStateJson).toBe(withoutCache.priorStateJson)
+  })
+
+  it("builds stable bounded evidence refs, candidates, and digest maps", () => {
+    const messages: TranscriptMessage[] = [
+      textMessage("user-source", "Use the stable API."),
+      textMessage("assistant-source", "We will use the stable API.", "assistant"),
+      {
+        info: { id: "tool-source", role: "assistant" },
+        parts: [{ type: "tool", tool: "read", state: { output: "tool output must not be evidence" } }],
+      },
+      textMessage("system-source", "system prose must not be evidence", "system"),
+    ]
+
+    const first = buildTranscriptEvidenceCandidates(messages)
+    const second = buildTranscriptEvidenceCandidates(messages.map((message) => ({
+      ...message,
+      info: { ...message.info, unrelated_metadata: "ignored" },
+    })))
+    const map = buildTranscriptEvidenceCandidateMap(messages)
+    const digestMap = buildTranscriptEvidenceRefDigestMap(messages)
+
+    expect(first).toEqual(second)
+    expect(first).toHaveLength(2)
+    expect(Object.keys(map)).toEqual(first.map((candidate) => candidate.ref))
+    expect(Object.keys(map).every((ref) => ref.length <= 128)).toBe(true)
+    expect(first.every((candidate) => candidate.ref.startsWith("tr-"))).toBe(true)
+    expect(JSON.stringify(map)).toContain("Use the stable API.")
+    expect(JSON.stringify(digestMap)).not.toContain("Use the stable API.")
+    expect(compressTranscript(messages)).not.toContain("user-source")
+    expect(compressTranscript(messages)).toContain(`[${first[0].ref}] [user]`)
+    expect(compressTranscript(messages)).toContain(`[${first[1].ref}] [assistant]`)
+    expect(compressTranscript(messages)).not.toContain("tool output must not be evidence")
+    expect(compressTranscript(messages)).not.toContain("system prose")
+    expect(digestMap).toEqual(Object.fromEntries(first.map((candidate) => [
+      candidate.ref,
+      candidate.digest,
+    ])))
+    expect(digestTranscriptEvidenceCandidate(first[0])).toBe(first[0].digest)
+    expect(makeTranscriptEvidenceRef("user-source")).toBe(first[0].ref)
   })
 
   it("is stable for equivalent object key order and matches SHA-256", () => {
@@ -180,8 +293,13 @@ describe("extraction cache identity and prompt", () => {
     )
     expect(prompt).toContain("use an empty array if no qualifying files")
     expect(prompt).toContain(
-      'decisions: must be an array of objects, each with required `{ "topic": "short subject", "decision": "explicit decision" }`; optional `rationale` and `foundational`',
+      'decisions: must be an array of objects, each with required `{ "topic": "short subject", "decision": "explicit decision", "evidence_refs": ["evidence ID"] }`',
     )
+    expect(prompt).toContain("evidence_refs")
+    expect(prompt).toContain("1–3 unique IDs")
+    expect(prompt).toContain("never raw quotes or excerpts")
+    expect(prompt).toContain("Never cite prior STATE.json, FILE CANDIDATES")
+    expect(prompt).toContain("model/audit prose")
     expect(prompt).toContain("otherwise use an empty array")
     for (const field of ExtractedFactsJsonSchema.required) {
       expect(prompt).toContain(`- ${field}:`)

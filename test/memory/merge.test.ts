@@ -237,4 +237,46 @@ describe("mergeMemory", () => {
     expect(d3!.still_valid).toBe(true)
     expect(d3!.decision).toBe("Use Vitest")
   })
+
+  it("does not let an LLM conflict displace a corroborated heuristic decision", () => {
+    const heuristic = makeDecision({
+      id: "heuristic-1",
+      provenance: {
+        extractor: "heuristic",
+        source_session_id: "session-heuristic",
+        confidence: "heuristic",
+        evidence: [{ kind: "heuristic-candidate", ref: "hc-1", digest: "a".repeat(64) }],
+      },
+    })
+    const existing = { ...emptyMemory("/test"), decisions: [heuristic] }
+    const extracted = makeExtracted({
+      decisions: [{
+        topic: "database",
+        decision: "Use MySQL instead",
+        evidence_refs: ["tr-1"],
+      } as never],
+    })
+
+    const result = mergeMemory(existing, extracted, {
+      ...meta,
+      origin: "llm",
+      auditSessionID: "audit-1",
+      evidenceCandidates: {
+        "tr-1": { kind: "transcript", ref: "tr-1", digest: "b".repeat(64) },
+      },
+    })
+
+    expect(result.decisions.find((d) => d.id === "heuristic-1")).toMatchObject({
+      still_valid: true,
+      provenance: { extractor: "heuristic" },
+    })
+    expect(result.decisions.find((d) => d.decision === "Use MySQL instead")).toMatchObject({
+      still_valid: false,
+      provenance: {
+        extractor: "llm",
+        source_audit_session_id: "audit-1",
+        confidence: "llm-corroborated",
+      },
+    })
+  })
 })

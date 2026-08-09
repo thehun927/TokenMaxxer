@@ -228,7 +228,8 @@ describe("_recallPromote", () => {
 
     expect(mem.decisions[0].foundational).toBe(true)
     expect(writeMemory).toHaveBeenCalledWith(mockContext, mem)
-    expect(result).toBe("Promoted: database: Use PostgreSQL")
+    expect(result).toContain("Promoted: database: Use PostgreSQL")
+    expect(result).toContain("confidence=human-reviewed")
   })
 
   it("with missing topic: returns error string", async () => {
@@ -264,7 +265,43 @@ describe("_recallPromote", () => {
     const result = await _recallPromote({ topic: "database" }, mockContext)
 
     expect(mem.decisions[0].foundational).toBe(true)
-    expect(result).toBe("Promoted: Database: Use PostgreSQL")
+    expect(result).toContain("Promoted: Database: Use PostgreSQL")
+    expect(result).toContain("confidence=human-reviewed")
+  })
+
+  it("records explicit human-review provenance and clears the request flag", async () => {
+    const mem = makeMemory({
+      decisions: [makeDecision({
+        foundational: false,
+        foundational_requested: true,
+        provenance: {
+          extractor: "llm",
+          source_session_id: "source-llm",
+          source_audit_session_id: "audit-llm",
+          confidence: "llm-corroborated",
+          evidence: [{ kind: "transcript", ref: "tr-1", digest: "a".repeat(64) }],
+        },
+      })],
+    })
+    vi.mocked(readMemory).mockResolvedValue(mem)
+
+    const result = await _recallPromote(
+      { topic: "database" },
+      { ...mockContext, sessionID: "human-review-session" },
+    )
+
+    expect(mem.decisions[0]).toMatchObject({
+      foundational: true,
+      foundational_requested: false,
+      provenance: {
+        extractor: "human",
+        source_session_id: "human-review-session",
+        source_audit_session_id: "audit-llm",
+        confidence: "human-reviewed",
+      },
+    })
+    expect(result).toContain("audit=audit-llm")
+    expect(result).toContain("evidence=1")
   })
 
   it("catches errors and returns error string", async () => {

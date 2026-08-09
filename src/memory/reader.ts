@@ -3,6 +3,27 @@
  */
 import type { MemoryFile, Decision, ActiveFile } from "./schema"
 
+function provenanceLabel(value: { provenance?: Decision["provenance"] }): string {
+  const provenance = value.provenance
+  if (!provenance) return "source=unknown confidence=unknown evidence=0"
+  return [
+    `source=${provenance.source_session_id}`,
+    ...(provenance.source_audit_session_id
+      ? [`audit=${provenance.source_audit_session_id}`]
+      : []),
+    `confidence=${provenance.confidence}`,
+    `evidence=${provenance.evidence?.length ?? 0}`,
+  ].join(" ")
+}
+
+export function formatDecisionProvenance(decision: Decision): string {
+  return provenanceLabel(decision)
+}
+
+export function formatActiveFileProvenance(file: ActiveFile): string {
+  return provenanceLabel(file)
+}
+
 /**
  * Query decisions from memory.
  * - If query is empty/undefined → return most recent N valid decisions sorted by timestamp desc.
@@ -46,9 +67,11 @@ export function getProjectState(mem: MemoryFile): string {
   return [
     `Project: ${mem.project_path}`,
     `Last: ${mem.last_updated} (SHA ${mem.last_git_sha ?? "?"})`,
-    `Task: ${mem.current_task ?? "—"}`,
-    `Active files: ${mem.active_files.map((f) => f.path).join(", ") || "none"}`,
-    `Decisions: ${validDecisions.map((d) => d.topic).join(", ") || "none"}`,
+    `Task: ${mem.current_task ?? "—"}${mem.current_task_provenance
+      ? ` (source=${mem.current_task_provenance.source_session_id} confidence=${mem.current_task_provenance.confidence} evidence=${mem.current_task_provenance.evidence?.length ?? 0})`
+      : ""}`,
+    `Active files: ${mem.active_files.map((f) => `${f.path} [${formatActiveFileProvenance(f)}]`).join(", ") || "none"}`,
+    `Decisions: ${validDecisions.map((d) => `${d.topic} [${formatDecisionProvenance(d)}]`).join(", ") || "none"}`,
     `Blockers: ${mem.blockers.join("; ") || "none"}`,
     `Next: ${mem.next_steps.join("; ") || "none"}`,
   ].join("\n")

@@ -18,6 +18,23 @@ export const ExtractedDecisionSchema = z
   .object({
     topic: z.string(),
     decision: z.string(),
+    /** References to labelled source-transcript candidates, never raw quotes. */
+    evidence_refs: z
+      .array(z.string().min(1).max(128))
+      .min(1)
+      .max(3)
+      // Keep the TypeScript boundary compatible with the legacy heuristic
+      // facts type; the runtime refinement and JSON Schema remain required.
+      .optional()
+      .superRefine((refs, ctx) => {
+        if (refs === undefined) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, message: "evidence refs are required" })
+          return
+        }
+        if (new Set(refs).size !== refs.length) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, message: "evidence refs must be unique" })
+        }
+      }),
     rationale: z.string().optional(),
     foundational: z.boolean().optional(),
   })
@@ -68,10 +85,17 @@ export const ExtractedFactsJsonSchema = {
         properties: {
           topic: { type: "string" },
           decision: { type: "string" },
+          evidence_refs: {
+            type: "array",
+            minItems: 1,
+            maxItems: 3,
+            uniqueItems: true,
+            items: { type: "string", minLength: 1, maxLength: 128 },
+          },
           rationale: { type: "string" },
           foundational: { type: "boolean" },
         },
-        required: ["topic", "decision"],
+        required: ["topic", "decision", "evidence_refs"],
       },
     },
     blockers: {

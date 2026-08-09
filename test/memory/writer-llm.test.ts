@@ -6,7 +6,11 @@ import { tmpdir } from "node:os"
 import { writeMemoryOnIdle } from "../../src/memory/writer"
 import { readMemory, writeMemory } from "../../src/memory/store"
 import { emptyMemory } from "../../src/memory/schema"
-import { buildCanonicalInput } from "../../src/memory/extract-prompt"
+import {
+  buildCanonicalInput,
+  buildTranscriptEvidenceCandidateMap,
+  makeTranscriptEvidenceRef,
+} from "../../src/memory/extract-prompt"
 import { makeExtractionCacheEntry } from "../../src/memory/extract-llm"
 import type { TranscriptMessage } from "../../src/types"
 
@@ -58,6 +62,11 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
     const memory = await readMemory({ worktree, directory: worktree })
     expect(memory?.recent_sessions).toEqual(["source-disabled"])
     expect(memory?.current_task).toContain("Implement the extraction")
+    expect(memory?.current_task_provenance).toMatchObject({
+      extractor: "heuristic",
+      source_session_id: "source-disabled",
+      confidence: "heuristic",
+    })
     expect(get).not.toHaveBeenCalled()
     expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
       body: expect.objectContaining({
@@ -128,7 +137,11 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
           structured: {
             current_task: "SDK extraction",
             active_files: [],
-            decisions: [{ topic: "transport", decision: "Use SDK v2" }],
+            decisions: [{
+              topic: "transport",
+              decision: "Use SDK v2",
+              evidence_refs: [makeTranscriptEvidenceRef("m2")],
+            }],
             blockers: [],
             next_steps: ["Run tests"],
           },
@@ -165,6 +178,19 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
     expect(memory?.recent_sessions).toEqual(["source-success"])
     expect(memory?.decisions.some((decision) => decision.topic === "transport")).toBe(true)
     expect(memory?.llm_extraction_cache).toHaveLength(1)
+    const accepted = memory?.decisions.find((decision) => decision.topic === "transport")
+    expect(accepted?.provenance).toMatchObject({
+      extractor: "llm",
+      source_session_id: "source-success",
+      source_audit_session_id: "audit-session",
+      confidence: "llm-corroborated",
+    })
+    expect(accepted?.provenance?.evidence).toHaveLength(1)
+    expect(memory?.llm_extraction_cache?.[0]?.provenance).toMatchObject({
+      extractor: "llm",
+      source_audit_session_id: "audit-session",
+      confidence: "llm-corroborated",
+    })
     const messages = appLog.mock.calls.map(([call]) => call.body.message)
     expect(messages).toEqual(expect.arrayContaining([
       "llm extraction model resolved",
@@ -188,11 +214,19 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
       blockers: [],
       next_steps: ["Cached next step"],
     }
+    const cachedEvidenceRef = makeTranscriptEvidenceRef("m1")
+    const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[cachedEvidenceRef]!
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
       sourceSessionID: "source-cache",
       canonicalInput: buildCanonicalInput(messages, prior),
       model,
       facts: cachedFacts,
+      auditSessionID: "audit-cache",
+      evidence: [{
+        kind: "transcript",
+        ref: cachedEvidenceRef,
+        digest: cachedEvidence.digest,
+      }],
     })]
     await writeMemory({ worktree, directory: worktree }, prior)
 
@@ -215,7 +249,8 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
     const memory = await readMemory({ worktree, directory: worktree })
     expect(create).not.toHaveBeenCalled()
     expect(prompt).not.toHaveBeenCalled()
-    expect(memory?.current_task).toBe("Cached task")
+    expect(memory?.current_task).toContain("Implement the extraction")
+    expect(memory?.current_task_provenance?.confidence).toBe("heuristic")
     expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
       body: expect.objectContaining({ message: "llm extraction cache hit" }),
     }))
@@ -258,5 +293,100 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
       }),
     }))
     expect(appLog.mock.calls.some(([call]) => call.body.message === "llm extraction diagnostic")).toBe(true)
+  })
+
+  it("rejects unknown evidence without merging or caching the LLM decision", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const prompt = vi.fn(async () => ({
+      data: {
+        info: {
+          structured: {
+            current_task: "SDK extraction",
+            active_files: [],
+            decisions: [{
+              topic: "transport",
+              decision: "Use SDK v2",
+              evidence_refs: ["tr-does-not-exist"],
+            }],
+            blockers: [],
+            next_steps: [],
+          },
+        },
+      },
+    }))
+    const appLog = vi.fn()
+    const v1 = {
+      app: { log: appLog },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: sourceMessages() })),
+        create: vi.fn(async () => ({ data: { id: "audit-rejected" } })),
+        prompt,
+      },
+    }
+
+    const outcome = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId: "source-rejected",
+    })
+
+    expect(outcome).toBe("llm-failed")
+    const memory = await readMemory({ worktree, directory: worktree })
+    expect(memory?.llm_extraction_cache).toBeUndefined()
+    expect(memory?.decisions.some((decision) => decision.provenance?.extractor === "llm")).toBe(false)
+    expect(memory?.decisions.some((decision) => decision.provenance?.extractor === "heuristic")).toBe(true)
+    expect(appLog.mock.calls.some(([call]) => (
+      call.body.message === "llm extraction diagnostic" &&
+      call.body.extra.kind === "evidence-rejected" &&
+      call.body.extra.reason === "unknown-reference"
+    ))).toBe(true)
+  })
+
+  it("records an LLM foundational request without auto-promoting it", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const ref = makeTranscriptEvidenceRef("m2")
+    const prompt = vi.fn(async () => ({
+      data: {
+        info: {
+          structured: {
+            current_task: null,
+            active_files: [],
+            decisions: [{
+              topic: "transport-policy",
+              decision: "Use SDK v2",
+              foundational: true,
+              evidence_refs: [ref],
+            }],
+            blockers: [],
+            next_steps: [],
+          },
+        },
+      },
+    }))
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: sourceMessages() })),
+        create: vi.fn(async () => ({ data: { id: "audit-foundational" } })),
+        prompt,
+      },
+    }
+
+    await expect(writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId: "source-foundational",
+    })).resolves.toBe("llm-success")
+
+    const memory = await readMemory({ worktree, directory: worktree })
+    const decision = memory?.decisions.find((candidate) => candidate.topic === "transport-policy")
+    expect(decision).toMatchObject({ foundational: false, foundational_requested: true })
+    expect(decision?.provenance?.confidence).toBe("llm-corroborated")
   })
 })

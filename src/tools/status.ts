@@ -8,6 +8,7 @@
 import { tool } from "@opencode-ai/plugin"
 import { readMemory, resolveProjectPath } from "../memory/store"
 import { getProjectQueueStatus } from "../memory/lock"
+import { getLLMEvidenceStats } from "../memory/extract-llm"
 import { safeRead } from "../util/fs"
 import { join } from "node:path"
 
@@ -35,6 +36,28 @@ export async function _tokenmaxxerStatus(
     const content = await safeRead(path)
     const size = content?.length ?? 0
     const queue = getProjectQueueStatus(project)
+    const evidenceStats = getLLMEvidenceStats()
+    const decisions = mem?.decisions ?? []
+    const acceptedLLM = decisions.filter((d) => d.provenance?.confidence === "llm-corroborated").length
+    const legacyFacts = decisions.filter((d) => d.provenance?.confidence === "legacy").length
+      + (mem?.active_files.filter((f) => f.provenance?.confidence === "legacy").length ?? 0)
+      + (mem?.current_task_provenance?.confidence === "legacy" ? 1 : 0)
+    const quarantined = mem?.llm_extraction_cache_quarantine?.count ?? 0
+    const provenanceSummary = mem
+      ? [
+          mem.current_task_provenance
+            ? `task source=${mem.current_task_provenance.source_session_id} confidence=${mem.current_task_provenance.confidence} evidence=${mem.current_task_provenance.evidence?.length ?? 0}`
+            : "task source=unknown confidence=unknown evidence=0",
+          ...mem.active_files.slice(0, 3).map((file) => (
+            `file:${file.path} source=${file.provenance?.source_session_id ?? "unknown"} confidence=${file.provenance?.confidence ?? "unknown"} evidence=${file.provenance?.evidence?.length ?? 0}`
+          )),
+          ...mem.decisions.slice(0, 3).map((decision) => (
+            `decision:${decision.topic} source=${decision.provenance?.source_session_id ?? "unknown"}${decision.provenance?.source_audit_session_id
+              ? ` audit=${decision.provenance.source_audit_session_id}`
+              : ""} confidence=${decision.provenance?.confidence ?? "unknown"} evidence=${decision.provenance?.evidence?.length ?? 0}`
+          )),
+        ].join("; ")
+      : "none"
 
     return [
       `Project: ${mem?.project_path ?? "none"}`,
@@ -47,6 +70,10 @@ export async function _tokenmaxxerStatus(
       `Queue depth: ${queue.queueDepth}`,
       `In-flight: ${queue.inFlight}`,
       `Last idle outcome: ${queue.lastOutcome ?? "none"}`,
+      `LLM evidence: ${acceptedLLM || evidenceStats.accepted} accepted, ${evidenceStats.rejected} rejected`,
+      `Legacy facts: ${legacyFacts}`,
+      `Quarantined cache rows: ${quarantined}`,
+      `Provenance: ${provenanceSummary}`,
     ].join("\n")
   } catch (e) {
     return `Error checking status: ${String(e)}`

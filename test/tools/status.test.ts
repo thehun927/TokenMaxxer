@@ -113,6 +113,36 @@ describe("_tokenmaxxerStatus", () => {
     expect(result).toContain("Last compaction: none")
   })
 
+  it("shows bounded provenance summaries without evidence text", async () => {
+    const evidence = [{ kind: "transcript", ref: "tr-1", digest: "a".repeat(64) }]
+    vi.mocked(readMemory).mockResolvedValue(makeMemory({
+      current_task_provenance: {
+        extractor: "llm",
+        source_session_id: "source-1",
+        source_audit_session_id: "audit-1",
+        confidence: "llm-corroborated",
+        evidence,
+      },
+      active_files: [{
+        ...makeMemory().active_files[0],
+        provenance: {
+          extractor: "heuristic",
+          source_session_id: "source-1",
+          confidence: "heuristic",
+          evidence,
+        },
+      }],
+    }))
+    vi.mocked(safeRead).mockResolvedValue("{}")
+
+    const result = await _tokenmaxxerStatus({}, mockContext)
+
+    expect(result).toContain("source=source-1")
+    expect(result).toContain("confidence=llm-corroborated")
+    expect(result).toContain("evidence=1")
+    expect(result).not.toContain("must not be stored")
+  })
+
   it("catches errors and returns error string", async () => {
     vi.mocked(readMemory).mockRejectedValue(new Error("disk failure"))
 
