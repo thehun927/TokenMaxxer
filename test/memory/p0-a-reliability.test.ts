@@ -7,10 +7,15 @@ import { writeMemoryOnIdle } from "../../src/memory/writer"
 import { pruneOld } from "../../src/memory/writer"
 import { readMemory, writeMemory } from "../../src/memory/store"
 import { emptyMemory, type LLMAuditMetadata } from "../../src/memory/schema"
-import { isPersistedRetainedExtractionSession, extractFactsLLM } from "../../src/memory/extract-llm"
+import {
+  isPersistedRetainedExtractionSession,
+  extractFactsLLM,
+  LLM_REQUEST_TIMEOUT_MS,
+} from "../../src/memory/extract-llm"
 import { resetHostStructuredContractGate } from "../../src/memory/llm-adapter"
 import { buildCanonicalInput } from "../../src/memory/extract-prompt"
 import { resetProjectQueues } from "../../src/memory/lock"
+import { MEMORY_MAX_BYTES, memorySizeBytes } from "../../src/memory/memory-size"
 import type { TranscriptMessage } from "../../src/types"
 
 const directories: string[] = []
@@ -72,7 +77,7 @@ afterEach(async () => {
 })
 
 describe("P0-A idle reliability", () => {
-  it("uses structured logging for an oversized direct memory write", async () => {
+  it("rejects an oversized direct memory write with structured logging", async () => {
     const project = await worktree()
     const appLog = vi.fn()
     const warn = vi.spyOn(console, "warn")
@@ -86,16 +91,47 @@ describe("P0-A idle reliability", () => {
       worktree: project,
       directory: project,
       client: { app: { log: appLog } },
-    }, oversized)).resolves.toBe(true)
+    }, oversized)).resolves.toBe(false)
 
     expect(warn).not.toHaveBeenCalled()
     expect(error).not.toHaveBeenCalled()
     expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
       body: expect.objectContaining({
-        level: "warn",
-        message: expect.stringContaining("STATE.json still"),
+        level: "error",
+        message: "tokenmaxxer: STATE.json write rejected: exceeds 8192-byte cap",
+        extra: expect.objectContaining({
+          bytes: expect.any(Number),
+          max_bytes: MEMORY_MAX_BYTES,
+        }),
       }),
     }))
+    expect(await readMemory({ worktree: project, directory: project })).toBeNull()
+  })
+
+  it("uses UTF-8 bytes and accepts exactly the cap but rejects one byte over", async () => {
+    const project = await worktree()
+    const seed = { ...emptyMemory(project), next_steps: [""] }
+    const exact = {
+      ...emptyMemory(project),
+      next_steps: ["x".repeat(MEMORY_MAX_BYTES - memorySizeBytes(seed))],
+    }
+    expect(memorySizeBytes(exact)).toBe(MEMORY_MAX_BYTES)
+    expect(await writeMemory({ worktree: project, directory: project }, exact)).toBe(true)
+
+    const crossing = {
+      ...exact,
+      next_steps: [`${exact.next_steps[0]}x`],
+    }
+    expect(memorySizeBytes(crossing)).toBe(MEMORY_MAX_BYTES + 1)
+    expect(await writeMemory({ worktree: project, directory: project }, crossing)).toBe(false)
+  })
+
+  it("accounts for multibyte UTF-8 content rather than JavaScript characters", () => {
+    const project = "/worktree"
+    const ascii = { ...emptyMemory(project), next_steps: ["a".repeat(128)] }
+    const multibyte = { ...emptyMemory(project), next_steps: ["é".repeat(128)] }
+
+    expect(memorySizeBytes(multibyte) - memorySizeBytes(ascii)).toBe(128)
   })
 
   it("coalesces concurrent same-source writes into one audit and cache", async () => {
@@ -194,6 +230,82 @@ describe("P0-A idle reliability", () => {
     expect(await writeMemory({ worktree: project, directory: project }, bounded)).toBe(true)
     const loaded = await readMemory({ worktree: project, directory: project })
     expect(loaded?.llm_extraction_audits).toHaveLength(20)
+  })
+
+  it("reclassifies stale pending audits before evicting disposable metadata", () => {
+    const now = Date.parse("2026-08-09T00:00:00.000Z")
+    const stale: LLMAuditMetadata = {
+      audit_session_id: "audit-stale",
+      source_session_id: "source-stale",
+      cache_key: "x".repeat(256),
+      provider_id: "p".repeat(256),
+      model_id: "m".repeat(256),
+      created_at: new Date(now - (2 * LLM_REQUEST_TIMEOUT_MS + 1)).toISOString(),
+      terminal_outcome: "pending",
+    }
+    const active: LLMAuditMetadata = {
+      ...stale,
+      audit_session_id: "audit-active",
+      source_session_id: "source-active",
+      created_at: new Date(now - 2 * LLM_REQUEST_TIMEOUT_MS).toISOString(),
+    }
+
+    const result = pruneOld({
+      ...emptyMemory("/worktree"),
+      llm_extraction_audits: [stale, active],
+      next_steps: ["x".repeat(10_000)],
+    }, undefined, now)
+
+    expect(result.llm_extraction_audits?.find((audit) => audit.audit_session_id === "audit-stale"))
+      .toBeUndefined()
+    expect(result.llm_extraction_audits?.find((audit) => audit.audit_session_id === "audit-active"))
+      .toMatchObject({ terminal_outcome: "pending" })
+  })
+
+  it("drops cache and health metadata before valid durable decisions", () => {
+    const memory = emptyMemory("/worktree")
+    memory.current_task = "Keep this current task"
+    memory.decisions = [{
+      id: "durable-1",
+      topic: "durable-topic",
+      decision: "Keep this valid decision",
+      timestamp: "2026-08-09T00:00:00.000Z",
+      session_id: "source",
+      still_valid: true,
+      foundational: false,
+    }]
+    memory.llm_extraction_cache = Array.from({ length: 10 }, (_, index) => ({
+      cache_key: `cache-${index}`,
+      source_session_id: "source",
+      canonical_input_sha256: "a".repeat(64),
+      provider_id: "provider",
+      model_id: "model",
+      completed_at: new Date(2026, 0, index + 1).toISOString(),
+      facts: {
+        current_task: null,
+        active_files: [],
+        decisions: [],
+        blockers: [],
+        next_steps: [],
+      },
+    }))
+    memory.model_health = Array.from({ length: 10 }, (_, index) => ({
+      provider_id: `provider-${index}`,
+      model_id: "model",
+      last_outcome: "success" as const,
+      failure_streak: 0,
+      last_outcome_at: new Date(2026, 0, index + 1).toISOString(),
+    }))
+    memory.llm_extraction_cache_quarantine = { count: 10, reason: "test" }
+    memory.next_steps = ["x".repeat(10_000)]
+
+    const result = pruneOld(memory, undefined, Date.parse("2026-08-09T00:00:00.000Z"))
+
+    expect(result.llm_extraction_cache).toHaveLength(0)
+    expect(result.model_health).toHaveLength(0)
+    expect(result.llm_extraction_cache_quarantine).toBeUndefined()
+    expect(result.decisions).toHaveLength(1)
+    expect(result.decisions[0]?.topic).toBe("durable-topic")
   })
 
   it("prunes oldest completed audit metadata before other state reductions", () => {

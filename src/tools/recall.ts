@@ -113,7 +113,8 @@ export async function _recallPromote(
         source_session_id: reviewSession,
         confidence: "human-reviewed",
       }
-      await writeMemory({ worktree: context.worktree, directory: context.directory }, mem)
+      const persisted = await writeMemory({ worktree: context.worktree, directory: context.directory }, mem)
+      if (persisted === false) return "Promotion was not persisted."
       return `Promoted: ${d.topic}: ${d.decision}${d.provenance ? ` [${decisionProvenanceLabel(d)}]` : ""}`
     })
   } catch (e) {

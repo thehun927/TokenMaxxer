@@ -1,7 +1,8 @@
 import { afterEach, describe, it, expect, vi } from "vitest"
 import { pruneOld } from "../../src/memory/writer"
 import { emptyMemory } from "../../src/memory/schema"
-import type { MemoryFile, Decision } from "../../src/memory/schema"
+import { LLM_REQUEST_TIMEOUT_MS } from "../../src/memory/extract-llm"
+import type { MemoryFile, Decision, LLMAuditMetadata } from "../../src/memory/schema"
 
 function makeDecision(overrides: Partial<Decision> = {}): Decision {
   return {
@@ -49,6 +50,29 @@ describe("pruneOld", () => {
     expect(result.project_path).toBe("/test")
     // Should be a clone, not the same reference
     expect(result).not.toBe(mem)
+  })
+
+  it("reclassifies a pending audit older than two request windows as failed", () => {
+    const now = Date.parse("2026-08-09T00:00:00.000Z")
+    const audit: LLMAuditMetadata = {
+      audit_session_id: "audit-stale",
+      source_session_id: "source-stale",
+      cache_key: "cache-stale",
+      provider_id: "provider",
+      model_id: "model",
+      created_at: new Date(now - (2 * LLM_REQUEST_TIMEOUT_MS + 1)).toISOString(),
+      terminal_outcome: "pending",
+    }
+
+    const result = pruneOld({
+      ...emptyMemory("/test"),
+      llm_extraction_audits: [audit],
+    }, undefined, now)
+
+    expect(result.llm_extraction_audits).toMatchObject([{
+      audit_session_id: "audit-stale",
+      terminal_outcome: "failed",
+    }])
   })
 
   it("drops still_valid: false decisions first", () => {

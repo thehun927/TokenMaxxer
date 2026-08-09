@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
+import { mkdtemp, rm } from "node:fs/promises"
+import { join } from "node:path"
+import { tmpdir } from "node:os"
 
 vi.mock("../../src/memory/store", () => ({
   readMemory: vi.fn(),
@@ -90,6 +93,17 @@ describe("_tokenmaxxerStatus", () => {
     expect(result).toContain("Last compaction: 2026-08-08T11:00:00.000Z")
   })
 
+  it("reports STATE.json size using UTF-8 bytes", async () => {
+    const content = '{"note":"café"}'
+    vi.mocked(readMemory).mockResolvedValue(makeMemory())
+    vi.mocked(safeRead).mockResolvedValue(content)
+
+    const result = await _tokenmaxxerStatus({}, mockContext)
+
+    expect(result).toContain(`STATE.json (${Buffer.byteLength(content, "utf8")} bytes)`)
+    expect(result).not.toContain(`STATE.json (${content.length} bytes)`)
+  })
+
   it("without memory: returns 'none' for fields", async () => {
     vi.mocked(readMemory).mockResolvedValue(null)
     vi.mocked(safeRead).mockResolvedValue(null)
@@ -169,11 +183,87 @@ describe("_tokenmaxxerStatus", () => {
 
     const result = await _tokenmaxxerStatus({}, mockContext)
 
-    expect(result).toContain("LLM candidates: 1")
-    expect(result).toContain("LLM selected: provider/model (automatic)")
-    expect(result).toContain("LLM variant: none")
+    expect(result).toContain("LLM candidates (process-wide): 1")
+    expect(result).toContain("LLM selected: provider/model (durable-health)")
+    expect(result).toContain("LLM variant (process-wide): none")
     expect(result).toContain("LLM health: timeout")
     expect(result).toContain("reason=timeout")
+  })
+
+  it("uses only each temporary project's durable model health", async () => {
+    const projectA = await mkdtemp(join(tmpdir(), "tokenmaxxer-status-a-"))
+    const projectB = await mkdtemp(join(tmpdir(), "tokenmaxxer-status-b-"))
+    try {
+      vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+      await getLLMConfig({
+        config: { get: vi.fn(async () => ({ data: { small_model: "global/model" } })) },
+        provider: { list: vi.fn(async () => ({ data: {
+          all: [{ id: "global", models: {
+            model: { tool_call: true, cost: { input: 0, output: 0 } },
+          } }],
+          connected: ["global"],
+        } })) },
+      }, projectA)
+
+      const memories = new Map([
+        [projectA, makeMemory({
+          project_path: projectA,
+          model_health: [{
+            provider_id: "project-a-provider",
+            model_id: "project-a-model",
+            last_outcome: "timeout",
+            failure_streak: 2,
+            last_outcome_at: "2026-08-08T12:00:00.000Z",
+            cooldown_until: "2026-08-08T12:30:00.000Z",
+            failure_reason: "project-a-timeout",
+          }],
+        })],
+        [projectB, makeMemory({
+          project_path: projectB,
+          model_health: [{
+            provider_id: "project-b-provider",
+            model_id: "project-b-model",
+            last_outcome: "validation-failure",
+            failure_streak: 1,
+            last_outcome_at: "2026-08-08T13:00:00.000Z",
+            failure_reason: "project-b-validation",
+          }],
+        })],
+      ])
+      vi.mocked(readMemory).mockImplementation(async ({ directory }) => memories.get(directory) ?? null)
+      vi.mocked(safeRead).mockResolvedValue("{}")
+
+      const statusA = await _tokenmaxxerStatus({}, {
+        worktree: projectA,
+        directory: projectA,
+      })
+      const statusB = await _tokenmaxxerStatus({}, {
+        worktree: projectB,
+        directory: projectB,
+      })
+
+      expect(statusA).toContain("LLM selected: project-a-provider/project-a-model (durable-health)")
+      expect(statusA).toContain("LLM health: timeout")
+      expect(statusA).toContain("reason=project-a-timeout")
+      expect(statusA).not.toContain("global/model")
+      expect(statusA).not.toContain("project-b-provider/project-b-model")
+      expect(statusA).not.toContain("project-b-validation")
+
+      expect(statusB).toContain("LLM selected: project-b-provider/project-b-model (durable-health)")
+      expect(statusB).toContain("LLM health: validation-failure")
+      expect(statusB).toContain("reason=project-b-validation")
+      expect(statusB).not.toContain("global/model")
+      expect(statusB).not.toContain("project-a-provider/project-a-model")
+      expect(statusB).not.toContain("project-a-timeout")
+
+      expect(statusA).toContain("LLM candidates (process-wide): 1")
+      expect(statusB).toContain("LLM candidates (process-wide): 1")
+    } finally {
+      await Promise.all([
+        rm(projectA, { recursive: true, force: true }),
+        rm(projectB, { recursive: true, force: true }),
+      ])
+    }
   })
 
   it("catches errors and returns error string", async () => {

@@ -174,6 +174,21 @@ export function sanitizeError(error: unknown): SanitizedError {
 // IDs for the lifetime of this plugin process so the event handler can ignore
 // those audit sessions instead of recursively extracting them.
 const retainedExtractionSessionIDs = new Set<string>()
+export const MAX_RETAINED_EXTRACTION_SESSION_IDS = 256
+
+function retainExtractionSession(sessionID: string): void {
+  retainedExtractionSessionIDs.add(sessionID)
+  while (retainedExtractionSessionIDs.size > MAX_RETAINED_EXTRACTION_SESSION_IDS) {
+    const oldest = retainedExtractionSessionIDs.values().next()
+    if (oldest.done) break
+    retainedExtractionSessionIDs.delete(oldest.value)
+  }
+}
+
+/** Test/process lifecycle reset; durable audit metadata is unaffected. */
+export function resetRetainedExtractionSessionIDs(): void {
+  retainedExtractionSessionIDs.clear()
+}
 
 /** One extraction transaction per project/source, including direct callers. */
 const extractionInFlight = new Map<string, Promise<ExtractedFacts | null>>()
@@ -877,7 +892,7 @@ async function extractFactsLLMOnce(
     extractionSessionID = created.value
     // Register before the first prompt so the audit session's idle event can
     // never re-enter extraction.
-    retainedExtractionSessionIDs.add(extractionSessionID)
+    retainExtractionSession(extractionSessionID)
 
     const audit: LLMAuditMetadata = {
       audit_session_id: extractionSessionID,

@@ -33,6 +33,7 @@ import {
   upsertExtractionCache,
   upsertModelHealth,
   MODEL_HEALTH_MAX_RECORDS,
+  LLM_REQUEST_TIMEOUT_MS,
   type EvidenceCandidate,
   type EvidenceCandidateMap,
   type LLMExtractionDiagnostic,
@@ -40,6 +41,7 @@ import {
 } from "./extract-llm"
 import { log } from "../util/log"
 import { beginMemoryActivity } from "./activity-state"
+import { MEMORY_MAX_BYTES, memorySizeBytes } from "./memory-size"
 
 const TRANSCRIPT_WINDOW = 50
 const MAX_DIAGNOSTIC_VALUE = 200
@@ -177,6 +179,7 @@ export type IdleWriteOutcome =
   | "cache-hit"
   | "llm-success"
   | "llm-failed"
+  | "write-failed"
   | "queue-failed"
 
 type IdleWriteOptions = {
@@ -253,7 +256,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     // Durable heuristic fallback. A failed state write cannot justify an
     // un-serialized prompt, so stop before model discovery in that case.
     const heuristicPersisted = await writeMemory({ worktree, directory, client }, pruned)
-    if (heuristicPersisted === false) return "heuristic-only"
+    if (heuristicPersisted === false) return "write-failed"
     await generateHeader(worktree, directory, pruned)
 
     if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
@@ -288,12 +291,13 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     })
     if (cachedEntry) {
       void log(client, "debug", "llm extraction cache hit")
-      await mergeAsyncFacts(opts, cachedEntry.facts, gitSha, sessionId, {
+      const merged = await mergeAsyncFacts(opts, cachedEntry.facts, gitSha, sessionId, {
         origin: "llm",
         auditSessionID: cachedEntry.provenance?.source_audit_session_id,
         evidenceCandidates: candidates,
         provenanceEvidence: cachedEntry.provenance?.evidence,
       })
+      if (!merged) return "llm-failed"
       void log(client, "info", "llm extraction facts merged")
       return "cache-hit"
     }
@@ -314,12 +318,13 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
         evidenceDigestMap: digests,
       })
       if (selectedCachedEntry) {
-        await mergeAsyncFacts(opts, selectedCachedEntry.facts, gitSha, sessionId, {
+        const merged = await mergeAsyncFacts(opts, selectedCachedEntry.facts, gitSha, sessionId, {
           origin: "llm",
           auditSessionID: selectedCachedEntry.provenance?.source_audit_session_id,
           evidenceCandidates: candidates,
           provenanceEvidence: selectedCachedEntry.provenance?.evidence,
         })
+        if (!merged) return "llm-failed"
         return "cache-hit"
       }
     }
@@ -380,12 +385,13 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       evidenceDigestMap: digests,
     })
     if (cacheAlreadyCommitted) {
-      await mergeAsyncFacts(opts, cacheAlreadyCommitted.facts, gitSha, sessionId, {
+      const merged = await mergeAsyncFacts(opts, cacheAlreadyCommitted.facts, gitSha, sessionId, {
         origin: "llm",
         auditSessionID: cacheAlreadyCommitted.provenance?.source_audit_session_id,
         evidenceCandidates: candidates,
         provenanceEvidence: cacheAlreadyCommitted.provenance?.evidence,
       })
+      if (!merged) return "llm-failed"
       return "cache-hit"
     }
 
@@ -495,7 +501,7 @@ async function mergeAsyncFacts(
   gitSha: string | null,
   sessionId: string,
   mergeOptions: MergeOptions,
-): Promise<void> {
+): Promise<boolean> {
   const latest = (await readMemory({ worktree: opts.worktree, directory: opts.directory }))
     ?? emptyMemory(opts.worktree)
   const merged = mergeMemory(latest, facts, {
@@ -505,8 +511,13 @@ async function mergeAsyncFacts(
     ...mergeOptions,
   })
   const finalMemory = pruneOld(recordRecentSession(merged, sessionId), opts.client)
-  await writeMemory({ worktree: opts.worktree, directory: opts.directory, client: opts.client }, finalMemory)
+  const persisted = await writeMemory(
+    { worktree: opts.worktree, directory: opts.directory, client: opts.client },
+    finalMemory,
+  )
+  if (!persisted) return false
   await generateHeader(opts.worktree, opts.directory, finalMemory)
+  return true
 }
 
 // ─── extractFactsHeuristic ───────────────────────────────────────────────────
@@ -1386,8 +1397,8 @@ export function recordRecentSession(mem: MemoryFile, sessionId: string): MemoryF
 
 // ─── pruneOld ────────────────────────────────────────────────────────────────
 
-const MAX_BYTES = 8192
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000
+const STALE_PENDING_AUDIT_AGE_MS = 2 * LLM_REQUEST_TIMEOUT_MS
 
 function removeOldestCompletedAudit(mem: MemoryFile): boolean {
   const audits = mem.llm_extraction_audits
@@ -1413,6 +1424,81 @@ function removeOldestCompletedAudit(mem: MemoryFile): boolean {
   return true
 }
 
+function removeOldestCacheEntry(mem: MemoryFile): boolean {
+  const entries = mem.llm_extraction_cache
+  if (!entries?.length) return false
+
+  let oldestIndex = 0
+  for (let index = 1; index < entries.length; index++) {
+    const current = entries[index]
+    const oldest = entries[oldestIndex]
+    if (current && oldest && (
+      current.completed_at.localeCompare(oldest.completed_at) < 0
+      || (current.completed_at === oldest.completed_at && index < oldestIndex)
+    )) {
+      oldestIndex = index
+    }
+  }
+
+  entries.splice(oldestIndex, 1)
+  return true
+}
+
+function removeOldestModelHealth(mem: MemoryFile): boolean {
+  const records = mem.model_health
+  if (!records?.length) return false
+
+  let oldestIndex = 0
+  for (let index = 1; index < records.length; index++) {
+    const current = records[index]
+    const oldest = records[oldestIndex]
+    if (current && oldest && (
+      (current.last_outcome_at ?? "").localeCompare(oldest.last_outcome_at ?? "") < 0
+      || (
+        (current.last_outcome_at ?? "") === (oldest.last_outcome_at ?? "")
+        && index < oldestIndex
+      )
+    )) {
+      oldestIndex = index
+    }
+  }
+
+  records.splice(oldestIndex, 1)
+  return true
+}
+
+function removeOldestRecentSession(mem: MemoryFile): boolean {
+  if (!mem.recent_sessions?.length) return false
+  mem.recent_sessions.shift()
+  return true
+}
+
+function reclassifyStalePendingAudits(
+  audits: LLMAuditMetadata[],
+  now: number,
+): LLMAuditMetadata[] {
+  return audits.map((audit) => {
+    const createdAt = new Date(audit.created_at).getTime()
+    const stale = audit.terminal_outcome === "pending"
+      && Number.isFinite(createdAt)
+      && now - createdAt > STALE_PENDING_AUDIT_AGE_MS
+    return stale ? { ...audit, terminal_outcome: "failed" } : audit
+  })
+}
+
+function removeDisposableMetadata(mem: MemoryFile): boolean {
+  if (removeOldestCompletedAudit(mem)) return true
+  if (removeOldestCacheEntry(mem)) return true
+  if (removeOldestModelHealth(mem)) return true
+
+  if (mem.llm_extraction_cache_quarantine) {
+    delete mem.llm_extraction_cache_quarantine
+    return true
+  }
+
+  return removeOldestRecentSession(mem)
+}
+
 function boundedModelHealth(memories: NonNullable<MemoryFile["model_health"]>): NonNullable<MemoryFile["model_health"]> {
   if (memories.length <= MODEL_HEALTH_MAX_RECORDS) return memories
   return memories
@@ -1427,11 +1513,11 @@ function boundedModelHealth(memories: NonNullable<MemoryFile["model_health"]>): 
 }
 
 /**
- * Prune a MemoryFile to fit within the 8KB cap.
+ * Prune a MemoryFile toward the 8KB cap.
  * Returns a NEW object (deep clone) — does not mutate input.
  * Full algorithm in docs/IMPLEMENTATION.md Appendix A.3.
  */
-export function pruneOld(mem: MemoryFile, client?: unknown): MemoryFile {
+export function pruneOld(mem: MemoryFile, client?: unknown, now = Date.now()): MemoryFile {
   // Deep clone (don't mutate input)
   const cloned: MemoryFile = {
     version: mem.version,
@@ -1462,7 +1548,10 @@ export function pruneOld(mem: MemoryFile, client?: unknown): MemoryFile {
       },
     })),
     llm_extraction_audits: mem.llm_extraction_audits
-      ? boundedAuditMetadata(mem.llm_extraction_audits.map((audit) => ({ ...audit })))
+      ? boundedAuditMetadata(reclassifyStalePendingAudits(
+          mem.llm_extraction_audits.map((audit) => ({ ...audit })),
+          now,
+        ))
       : undefined,
     model_health: mem.model_health
       ? boundedModelHealth(mem.model_health.map((health) => ({ ...health })))
@@ -1472,33 +1561,32 @@ export function pruneOld(mem: MemoryFile, client?: unknown): MemoryFile {
       : undefined,
   }
 
-  // Audit metadata is more important than disposable completed history. Drop
-  // oldest completed records while the state is oversized, but never discard
-  // pending guards before the later state reductions have run.
-  while (jsonSize(cloned) > MAX_BYTES && removeOldestCompletedAudit(cloned)) {
-    // Re-check after each bounded removal.
+  // Operational metadata is disposable before durable facts. Stale pending
+  // audits were reclassified above, so they are eligible for this same audit
+  // eviction pass while genuinely active guards remain protected.
+  while (jsonSize(cloned) > MEMORY_MAX_BYTES && removeDisposableMetadata(cloned)) {
+    // Re-check after each deterministic removal.
   }
 
   // 1. Check if within cap
-  if (jsonSize(cloned) <= MAX_BYTES) return cloned
+  if (jsonSize(cloned) <= MEMORY_MAX_BYTES) return cloned
 
   // 2. Remove all decisions where still_valid === false
   cloned.decisions = cloned.decisions.filter((d) => d.still_valid)
-  if (jsonSize(cloned) <= MAX_BYTES) return cloned
+  if (jsonSize(cloned) <= MEMORY_MAX_BYTES) return cloned
 
   // 3. Cap active_files at 8 entries (sort by last_touched desc, keep top 8)
   cloned.active_files = [...cloned.active_files]
     .sort((a, b) => b.last_touched.localeCompare(a.last_touched))
     .slice(0, 8)
-  if (jsonSize(cloned) <= MAX_BYTES) return cloned
+  if (jsonSize(cloned) <= MEMORY_MAX_BYTES) return cloned
 
   // 4. Remove decisions older than 30 days
-  const now = Date.now()
   cloned.decisions = cloned.decisions.filter((d) => {
     const ts = new Date(d.timestamp).getTime()
     return now - ts < THIRTY_DAYS_MS
   })
-  if (jsonSize(cloned) <= MAX_BYTES) return cloned
+  if (jsonSize(cloned) <= MEMORY_MAX_BYTES) return cloned
 
   // 5. Truncate current_task to 200 chars, reason to 100 chars
   if (cloned.current_task && cloned.current_task.length > 200) {
@@ -1508,24 +1596,16 @@ export function pruneOld(mem: MemoryFile, client?: unknown): MemoryFile {
     ...f,
     reason: f.reason.length > 100 ? f.reason.slice(0, 100) : f.reason,
   }))
-  if (jsonSize(cloned) <= MAX_BYTES) return cloned
+  if (jsonSize(cloned) <= MEMORY_MAX_BYTES) return cloned
 
   // 6. Keep only 10 most recent decisions
   cloned.decisions = [...cloned.decisions]
     .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
     .slice(0, 10)
-  if (jsonSize(cloned) <= MAX_BYTES) {
+  if (jsonSize(cloned) <= MEMORY_MAX_BYTES) {
     void log(client, "warn", "tokenmaxxer: pruned decisions to 10 most recent to fit 8KB cap")
     return cloned
   }
-
-  // Cache entries are disposable acceleration metadata. Remove the oldest
-  // entries before the final durable-state reductions so the existing 8KB
-  // invariant also applies after successful LLM extraction.
-  while (cloned.llm_extraction_cache?.length && jsonSize(cloned) > MAX_BYTES) {
-    cloned.llm_extraction_cache.shift()
-  }
-  if (jsonSize(cloned) <= MAX_BYTES) return cloned
 
   // 7. Last resort: keep only current_task + 5 most recent decisions
   cloned.decisions = [...cloned.decisions]
@@ -1535,7 +1615,7 @@ export function pruneOld(mem: MemoryFile, client?: unknown): MemoryFile {
   cloned.blockers = []
   cloned.next_steps = []
 
-  if (jsonSize(cloned) > MAX_BYTES) {
+  if (jsonSize(cloned) > MEMORY_MAX_BYTES) {
     void log(client, "error", "tokenmaxxer: STILL over 8KB after all pruning — truncating to current_task + 5 decisions")
   }
 
@@ -1544,7 +1624,7 @@ export function pruneOld(mem: MemoryFile, client?: unknown): MemoryFile {
 
 /** Measure serialized JSON size in bytes. */
 function jsonSize(mem: MemoryFile): number {
-  return JSON.stringify(mem).length
+  return memorySizeBytes(mem)
 }
 
 // ─── generateHeader ──────────────────────────────────────────────────────────

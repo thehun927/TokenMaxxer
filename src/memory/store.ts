@@ -10,8 +10,7 @@ import { join } from "node:path"
 import { createHash } from "node:crypto"
 import { homedir } from "node:os"
 import { log } from "../util/log"
-
-const MAX_BYTES = 8192
+import { MEMORY_MAX_BYTES, memorySizeBytes, serializeMemory } from "./memory-size"
 
 /**
  * Module-level cache keyed by worktree.
@@ -117,11 +116,18 @@ export async function writeMemory(
     return false
   }
   const path = memoryPath(project)
-  const json = JSON.stringify(validated.data, null, 2)
+  const json = serializeMemory(validated.data)
+  const bytes = memorySizeBytes(validated.data)
 
-  if (json.length > MAX_BYTES) {
-    // Should have been pruned before write — warn if still over
-    void log(client, "warn", `tokenmaxxer: STATE.json still ${json.length} bytes after pruning`)
+  if (bytes > MEMORY_MAX_BYTES) {
+    // The size limit is a hard storage invariant. Callers may try pruning
+    // first, but an unrepresentable state must never reach atomicWrite.
+    void log(client, "error", `tokenmaxxer: STATE.json write rejected: exceeds ${MEMORY_MAX_BYTES}-byte cap`, {
+      bytes,
+      max_bytes: MEMORY_MAX_BYTES,
+    })
+    cache.delete(project)
+    return false
   }
 
   try {

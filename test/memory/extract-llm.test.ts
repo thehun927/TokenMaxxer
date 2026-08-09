@@ -1,17 +1,24 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { mkdtemp, rm } from "node:fs/promises"
+import { join } from "node:path"
+import { tmpdir } from "node:os"
 
 import {
+  MAX_RETAINED_EXTRACTION_SESSION_IDS,
   corroborateLLMFacts,
   extractFactsLLM,
   getLLMConfig,
+  isPersistedRetainedExtractionSession,
   isRetainedExtractionSession,
   makeExtractionCacheEntry,
   parseSmallModel,
   readExtractionCache,
+  resetRetainedExtractionSessionIDs,
   upsertExtractionCache,
 } from "../../src/memory/extract-llm"
 import { buildCanonicalInput } from "../../src/memory/extract-prompt"
 import { emptyMemory } from "../../src/memory/schema"
+import { writeMemory } from "../../src/memory/store"
 import type { MemoryFile } from "../../src/memory/schema"
 import type { TranscriptMessage } from "../../src/types"
 
@@ -78,6 +85,7 @@ function liveInventoryModel(overrides: Record<string, unknown> = {}) {
 describe("v1 structured extraction", () => {
   beforeEach(() => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    resetRetainedExtractionSessionIDs()
   })
 
   it("parses the first provider/model separator", () => {
@@ -137,6 +145,8 @@ describe("v1 structured extraction", () => {
       { directory: "/worktree", ...evidenceOptions },
     )).resolves.toEqual(facts)
     expect(isRetainedExtractionSession("audit-1")).toBe(true)
+    resetRetainedExtractionSessionIDs()
+    expect(isRetainedExtractionSession("audit-1")).toBe(false)
 
     expect(create).toHaveBeenCalledWith(expect.objectContaining({
       body: {
@@ -155,6 +165,57 @@ describe("v1 structured extraction", () => {
         parts: [{ type: "text", text: expect.any(String) }],
       },
     }))
+  })
+
+  it("bounds retained sessions and falls back to the durable audit after eviction", async () => {
+    const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-retained-sessions-"))
+    try {
+      let nextAudit = 0
+      const create = vi.fn(async () => ({ data: { id: `audit-${nextAudit++}` } }))
+      const client = {
+        session: {
+          create,
+          prompt: vi.fn(async () => ({ data: { info: { structured: facts } } })),
+        },
+      }
+
+      for (let index = 0; index <= MAX_RETAINED_EXTRACTION_SESSION_IDS; index++) {
+        await expect(extractFactsLLM(
+          canonical(),
+          `source-${index}`,
+          "project",
+          client,
+          { enabled: true, model: { providerID: "provider", modelID: "model" } },
+          {
+            directory: project,
+            projectKey: project,
+            ...evidenceOptions,
+            onAuditCreated: async (audit) => {
+              if (audit.audit_session_id === "audit-0") {
+                await writeMemory(
+                  { worktree: project, directory: project },
+                  { ...emptyMemory(project), llm_extraction_audits: [audit] },
+                )
+              }
+              return true
+            },
+          },
+        )).resolves.toEqual(facts)
+      }
+
+      expect(create).toHaveBeenCalledTimes(MAX_RETAINED_EXTRACTION_SESSION_IDS + 1)
+      expect(isRetainedExtractionSession("audit-0")).toBe(false)
+      expect(isRetainedExtractionSession("audit-1")).toBe(true)
+      expect(isRetainedExtractionSession("audit-256")).toBe(true)
+      expect(await isPersistedRetainedExtractionSession({
+        sessionID: "audit-0",
+        worktree: project,
+        directory: project,
+      })).toBe(true)
+    } finally {
+      resetRetainedExtractionSessionIDs()
+      await rm(project, { recursive: true, force: true })
+    }
   })
 
   it("binds the host session receiver for create and prompt", async () => {

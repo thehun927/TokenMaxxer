@@ -11,7 +11,6 @@ import { getProjectQueueStatus } from "../memory/lock"
 import {
   getLLMEvidenceStats,
   getLastLLMModelResolution,
-  getModelHealth,
 } from "../memory/extract-llm"
 import { safeRead } from "../util/fs"
 import { join } from "node:path"
@@ -38,22 +37,22 @@ export async function _tokenmaxxerStatus(
     const project = resolveProjectPath(context.worktree, context.directory)
     const path = join(project, ".opencode", "memory", "STATE.json")
     const content = await safeRead(path)
-    const size = content?.length ?? 0
+    const size = content === null ? 0 : Buffer.byteLength(content, "utf8")
     const queue = getProjectQueueStatus(project)
     const evidenceStats = getLLMEvidenceStats()
     const decisions = mem?.decisions ?? []
-    const acceptedLLM = decisions.filter((d) => d.provenance?.confidence === "llm-corroborated").length
     const legacyFacts = decisions.filter((d) => d.provenance?.confidence === "legacy").length
       + (mem?.active_files.filter((f) => f.provenance?.confidence === "legacy").length ?? 0)
       + (mem?.current_task_provenance?.confidence === "legacy" ? 1 : 0)
     const quarantined = mem?.llm_extraction_cache_quarantine?.count ?? 0
     const resolution = getLastLLMModelResolution()
-    const selectedHealth = mem && resolution.selected_provider && resolution.selected_model
-      ? getModelHealth(mem, {
-          providerID: resolution.selected_provider,
-          modelID: resolution.selected_model,
-        })
-      : undefined
+    // Health rows are appended/reloaded in recency order by the durable
+    // writer. Do not use the process-global model resolution to identify this
+    // project's selected model or health.
+    const selectedHealth = [...(mem?.model_health ?? [])].reverse()[0]
+    const selectedModel = selectedHealth
+      ? `${selectedHealth.provider_id}/${selectedHealth.model_id}`
+      : "none"
     const provenanceSummary = mem
       ? [
           mem.current_task_provenance
@@ -81,15 +80,13 @@ export async function _tokenmaxxerStatus(
       `Queue depth: ${queue.queueDepth}`,
       `In-flight: ${queue.inFlight}`,
       `Last idle outcome: ${queue.lastOutcome ?? "none"}`,
-      `LLM evidence: ${acceptedLLM || evidenceStats.accepted} accepted, ${evidenceStats.rejected} rejected`,
+      `LLM evidence (process-wide): ${evidenceStats.accepted} accepted, ${evidenceStats.rejected} rejected`,
       `Legacy facts: ${legacyFacts}`,
       `Quarantined cache rows: ${quarantined}`,
-      `LLM candidates: ${resolution.candidate_count}`,
-      `LLM selected: ${resolution.selected_provider && resolution.selected_model
-        ? `${resolution.selected_provider}/${resolution.selected_model}`
-        : "none"} (${resolution.selection})`,
-      `LLM variant: ${resolution.variant ?? "none"}`,
-      `LLM health: ${selectedHealth?.last_outcome ?? "none"} cooldown=${selectedHealth?.cooldown_until ?? "none"} reason=${selectedHealth?.failure_reason ?? resolution.reason ?? "none"}`,
+      `LLM candidates (process-wide): ${resolution.candidate_count}`,
+      `LLM selected: ${selectedModel} (${selectedHealth ? "durable-health" : "none"})`,
+      `LLM variant (process-wide): ${resolution.variant ?? "none"}`,
+      `LLM health: ${selectedHealth?.last_outcome ?? "none"} cooldown=${selectedHealth?.cooldown_until ?? "none"} reason=${selectedHealth?.failure_reason ?? "none"}`,
       `Provenance: ${provenanceSummary}`,
     ].join("\n")
   } catch (e) {
