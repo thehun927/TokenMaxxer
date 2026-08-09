@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest"
+import { afterEach, describe, it, expect, vi } from "vitest"
 import { pruneOld } from "../../src/memory/writer"
 import { emptyMemory } from "../../src/memory/schema"
 import type { MemoryFile, Decision } from "../../src/memory/schema"
@@ -25,6 +25,10 @@ function makeActiveFile(path: string): { path: string; reason: string; last_touc
 }
 
 describe("pruneOld", () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
   it("does not mutate input", () => {
     const orig = emptyMemory("/test")
     const input: MemoryFile = {
@@ -127,6 +131,37 @@ describe("pruneOld", () => {
     }
   })
 
+  it("uses structured logging for the ten-decision pruning diagnostic", () => {
+    const warn = vi.spyOn(console, "warn")
+    const error = vi.spyOn(console, "error")
+    const appLog = vi.fn()
+    const mem: MemoryFile = {
+      ...emptyMemory("/test"),
+      decisions: [],
+      active_files: [],
+    }
+
+    for (let i = 0; i < 100; i++) {
+      mem.decisions.push(makeDecision({
+        id: `big-${i}`,
+        decision: "x".repeat(500),
+        timestamp: new Date().toISOString(),
+      }))
+    }
+
+    const result = pruneOld(mem, { app: { log: appLog } })
+
+    expect(result.decisions).toHaveLength(10)
+    expect(warn).not.toHaveBeenCalled()
+    expect(error).not.toHaveBeenCalled()
+    expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.objectContaining({
+        level: "warn",
+        message: "tokenmaxxer: pruned decisions to 10 most recent to fit 8KB cap",
+      }),
+    }))
+  })
+
   it("drops decisions older than 30 days", () => {
     const oldDate = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString()
     const recentDate = new Date().toISOString()
@@ -173,6 +208,9 @@ describe("pruneOld", () => {
   })
 
   it("last resort truncation keeps only current_task + 5 decisions", () => {
+    const warn = vi.spyOn(console, "warn")
+    const error = vi.spyOn(console, "error")
+    const appLog = vi.fn()
     const mem: MemoryFile = {
       ...emptyMemory("/test"),
       decisions: [],
@@ -191,7 +229,7 @@ describe("pruneOld", () => {
         makeDecision({
           id: `decision-${i}`,
           topic: `topic-${i}-with-very-long-description-for-bloat-purposes`,
-          decision: `Decision number ${i} that contains a very long description to ensure each entry is very large ${"x".repeat(1000 + i)}`,
+          decision: `Decision number ${i} that contains a very long description to ensure each entry is very large ${"x".repeat(2000 + i)}`,
           rationale: `y`.repeat(200),
           timestamp: new Date(Date.now() - (50 - i) * 10000).toISOString(),
           still_valid: true,
@@ -199,7 +237,7 @@ describe("pruneOld", () => {
       )
     }
 
-    const result = pruneOld(mem)
+    const result = pruneOld(mem, { app: { log: appLog } })
 
     // All pruning steps should have been triggered.
     // After step 2 (drop still_valid:false), step 3 (cap active_files),
@@ -207,5 +245,13 @@ describe("pruneOld", () => {
     // if still over 8KB → step 7 last resort: 5 decisions only.
     // With our large decisions, 10 should still be >8KB.
     expect(result.decisions.length).toBeLessThanOrEqual(5)
+    expect(warn).not.toHaveBeenCalled()
+    expect(error).not.toHaveBeenCalled()
+    expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.objectContaining({
+        level: "error",
+        message: "tokenmaxxer: STILL over 8KB after all pruning — truncating to current_task + 5 decisions",
+      }),
+    }))
   })
 })

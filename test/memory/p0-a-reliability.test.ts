@@ -65,12 +65,39 @@ function clientFor(
 
 afterEach(async () => {
   vi.unstubAllEnvs()
+  vi.restoreAllMocks()
   resetHostStructuredContractGate()
   resetProjectQueues()
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
 })
 
 describe("P0-A idle reliability", () => {
+  it("uses structured logging for an oversized direct memory write", async () => {
+    const project = await worktree()
+    const appLog = vi.fn()
+    const warn = vi.spyOn(console, "warn")
+    const error = vi.spyOn(console, "error")
+    const oversized = {
+      ...emptyMemory(project),
+      next_steps: ["x".repeat(9_000)],
+    }
+
+    await expect(writeMemory({
+      worktree: project,
+      directory: project,
+      client: { app: { log: appLog } },
+    }, oversized)).resolves.toBe(true)
+
+    expect(warn).not.toHaveBeenCalled()
+    expect(error).not.toHaveBeenCalled()
+    expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("STATE.json still"),
+      }),
+    }))
+  })
+
   it("coalesces concurrent same-source writes into one audit and cache", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
     const project = await worktree()

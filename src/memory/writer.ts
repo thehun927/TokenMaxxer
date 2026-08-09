@@ -243,11 +243,11 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       origin: "heuristic",
       evidenceCandidates: candidates,
     })
-    const pruned = pruneOld(recordRecentSession(merged, sessionId))
+    const pruned = pruneOld(recordRecentSession(merged, sessionId), client)
 
     // Durable heuristic fallback. A failed state write cannot justify an
     // un-serialized prompt, so stop before model discovery in that case.
-    const heuristicPersisted = await writeMemory({ worktree, directory }, pruned)
+    const heuristicPersisted = await writeMemory({ worktree, directory, client }, pruned)
     if (heuristicPersisted === false) return "heuristic-only"
     await generateHeader(worktree, directory, pruned)
 
@@ -326,7 +326,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       extractionAuditSessionID = audit.audit_session_id
       const latest = (await readMemory({ worktree, directory })) ?? afterHeuristic
       const guarded = upsertAuditMetadata(latest, audit)
-      return writeMemory({ worktree, directory }, pruneOld(guarded))
+      return writeMemory({ worktree, directory, client }, pruneOld(guarded, client))
     }
     const persistTerminal = async (
       auditSessionID: string,
@@ -335,7 +335,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       const latest = await readMemory({ worktree, directory })
       if (!latest) return
       const updated = setAuditTerminalOutcome(latest, auditSessionID, outcome)
-      await writeMemory({ worktree, directory }, pruneOld(updated))
+      await writeMemory({ worktree, directory, client }, pruneOld(updated, client))
     }
 
     void log(client, "debug", "llm extraction audit session requested")
@@ -357,7 +357,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
           const latest = await readMemory({ worktree, directory })
           if (!latest) return
           const updated = upsertModelHealth(latest, report)
-          await writeMemory({ worktree, directory }, pruneOld(updated))
+          await writeMemory({ worktree, directory, client }, pruneOld(updated, client))
         },
       },
     )
@@ -419,8 +419,8 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
           }),
         )
       : recordRecentSession(mergedLLM, sessionId)
-    const finalMemory = pruneOld(withCache)
-    const committed = await writeMemory({ worktree, directory }, finalMemory)
+    const finalMemory = pruneOld(withCache, client)
+    const committed = await writeMemory({ worktree, directory, client }, finalMemory)
     if (committed === false) return "llm-failed"
     await generateHeader(worktree, directory, finalMemory)
     void log(client, "info", "llm extraction facts merged")
@@ -499,8 +499,8 @@ async function mergeAsyncFacts(
     timestamp: new Date().toISOString(),
     ...mergeOptions,
   })
-  const finalMemory = pruneOld(recordRecentSession(merged, sessionId))
-  await writeMemory({ worktree: opts.worktree, directory: opts.directory }, finalMemory)
+  const finalMemory = pruneOld(recordRecentSession(merged, sessionId), opts.client)
+  await writeMemory({ worktree: opts.worktree, directory: opts.directory, client: opts.client }, finalMemory)
   await generateHeader(opts.worktree, opts.directory, finalMemory)
 }
 
@@ -1435,7 +1435,7 @@ function boundedModelHealth(memories: NonNullable<MemoryFile["model_health"]>): 
  * Returns a NEW object (deep clone) — does not mutate input.
  * Full algorithm in docs/IMPLEMENTATION.md Appendix A.3.
  */
-export function pruneOld(mem: MemoryFile): MemoryFile {
+export function pruneOld(mem: MemoryFile, client?: unknown): MemoryFile {
   // Deep clone (don't mutate input)
   const cloned: MemoryFile = {
     version: mem.version,
@@ -1519,7 +1519,7 @@ export function pruneOld(mem: MemoryFile): MemoryFile {
     .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
     .slice(0, 10)
   if (jsonSize(cloned) <= MAX_BYTES) {
-    console.warn("tokenmaxxer: pruned decisions to 10 most recent to fit 8KB cap")
+    void log(client, "warn", "tokenmaxxer: pruned decisions to 10 most recent to fit 8KB cap")
     return cloned
   }
 
@@ -1540,7 +1540,7 @@ export function pruneOld(mem: MemoryFile): MemoryFile {
   cloned.next_steps = []
 
   if (jsonSize(cloned) > MAX_BYTES) {
-    console.error("tokenmaxxer: STILL over 8KB after all pruning — truncating to current_task + 5 decisions")
+    void log(client, "error", "tokenmaxxer: STILL over 8KB after all pruning — truncating to current_task + 5 decisions")
   }
 
   return cloned

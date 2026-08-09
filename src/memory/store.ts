@@ -9,6 +9,7 @@ import type { MemoryFile } from "./schema"
 import { join } from "node:path"
 import { createHash } from "node:crypto"
 import { homedir } from "node:os"
+import { log } from "../util/log"
 
 const MAX_BYTES = 8192
 
@@ -105,7 +106,7 @@ export async function readMemory({
  * Never throws — catches and logs on failure.
  */
 export async function writeMemory(
-  { worktree, directory }: { worktree: string; directory: string },
+  { worktree, directory, client }: { worktree: string; directory: string; client?: unknown },
   mem: MemoryFile,
 ): Promise<boolean> {
   const project = resolveProjectPath(worktree, directory)
@@ -120,7 +121,7 @@ export async function writeMemory(
 
   if (json.length > MAX_BYTES) {
     // Should have been pruned before write — warn if still over
-    console.warn(`tokenmaxxer: STATE.json still ${json.length} bytes after pruning`)
+    void log(client, "warn", `tokenmaxxer: STATE.json still ${json.length} bytes after pruning`)
   }
 
   try {
