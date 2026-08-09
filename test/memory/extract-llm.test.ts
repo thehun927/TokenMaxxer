@@ -30,8 +30,13 @@ function canonical() {
   return buildCanonicalInput(messages, emptyMemory("/worktree"))
 }
 
-function providerResponse(all: unknown[]) {
-  return { data: { all } }
+function providerResponse(all: unknown[], connected?: unknown) {
+  return {
+    data: {
+      all,
+      ...(connected !== undefined ? { connected } : {}),
+    },
+  }
 }
 
 function inventoryModel(overrides: Record<string, unknown> = {}) {
@@ -346,6 +351,21 @@ describe("v1 structured extraction", () => {
     expect(list).toHaveBeenCalledWith({ query: { directory: "/worktree" } })
   })
 
+  it("rejects an explicit model from a provider that is not connected", async () => {
+    const list = vi.fn(async () => providerResponse([
+      { id: "unconnected", models: { model: inventoryModel() } },
+      { id: "connected", models: { other: inventoryModel() } },
+    ], ["connected"]))
+
+    await expect(getLLMConfig({
+      config: { get: vi.fn(async () => ({ data: { small_model: "unconnected/model" } })) },
+      provider: { list },
+    }, "/worktree")).resolves.toEqual({
+      enabled: false,
+      reason: "provider is not connected",
+    })
+  })
+
   it("attaches an explicit none variant when provider metadata exposes it", async () => {
     const list = vi.fn(async () => providerResponse([
       {
@@ -440,6 +460,36 @@ describe("v1 structured extraction", () => {
     }, "/worktree")).resolves.toEqual({
       enabled: true,
       model: { providerID: "providerB", modelID: "none", variant: "none" },
+    })
+  })
+
+  it("filters automatic discovery to connected providers", async () => {
+    const list = vi.fn(async () => providerResponse([
+      { id: "unconnected", models: { free: inventoryModel() } },
+      { id: "connected", models: { free: inventoryModel() } },
+    ], ["connected"]))
+
+    await expect(getLLMConfig({
+      config: { get: vi.fn(async () => ({ data: {} })) },
+      provider: { list },
+    }, "/worktree")).resolves.toEqual({
+      enabled: true,
+      model: { providerID: "connected", modelID: "free" },
+    })
+  })
+
+  it("reports when connected providers have no suitable free model", async () => {
+    const list = vi.fn(async () => providerResponse([
+      { id: "connected", models: { paid: inventoryModel({ cost: { input: 1, output: 0 } }) } },
+      { id: "unconnected", models: { free: inventoryModel() } },
+    ], ["connected"]))
+
+    await expect(getLLMConfig({
+      config: { get: vi.fn(async () => ({ data: {} })) },
+      provider: { list },
+    }, "/worktree")).resolves.toEqual({
+      enabled: false,
+      reason: "no connected provider has a suitable free tool model",
     })
   })
 

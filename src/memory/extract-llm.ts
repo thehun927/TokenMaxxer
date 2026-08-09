@@ -133,6 +133,17 @@ type ProviderInventoryEntry = {
   models: Record<string, unknown>
 }
 
+type ProviderInventory = {
+  providers: ProviderInventoryEntry[]
+  /** Present only when the host returned a valid connected-provider list. */
+  connected?: string[]
+}
+
+type ConfiguredModelResolution = {
+  model?: SmallModel
+  reason?: string
+}
+
 type ModelDiscoveryResult = {
   model?: SmallModel
   reason: string
@@ -149,16 +160,28 @@ function readConfiguredModel(result: unknown): SmallModel | undefined {
   return parseSmallModel(typeof smallModel === "string" ? smallModel : undefined)
 }
 
-function readProviderInventory(result: unknown): ProviderInventoryEntry[] | undefined {
+function readProviderInventory(result: unknown): ProviderInventory | undefined {
   if (!isRecord(result) || result.error != null || !isRecord(result.data)) return undefined
   if (!Array.isArray(result.data.all)) return undefined
 
   // Array iteration preserves the API's provider order; Object.entries below
   // preserves each provider's model object order.
-  return result.data.all.flatMap((value) => {
+  const providers = result.data.all.flatMap((value) => {
     if (!isRecord(value) || typeof value.id !== "string" || !isRecord(value.models)) return []
     return [{ id: value.id, models: value.models }]
   })
+
+  let connected: string[] | undefined
+  if ("connected" in result.data) {
+    if (
+      Array.isArray(result.data.connected) &&
+      result.data.connected.every((providerID): providerID is string => typeof providerID === "string")
+    ) {
+      connected = result.data.connected
+    }
+  }
+
+  return { providers, connected }
 }
 
 function isFreeToolCallingModel(value: unknown): boolean {
@@ -186,24 +209,28 @@ async function resolveConfiguredModelVariant(
   client: V1ClientLike,
   directory: string,
   model: SmallModel,
-): Promise<SmallModel> {
-  if (!client.provider?.list) return model
+): Promise<ConfiguredModelResolution> {
+  if (!client.provider?.list) return { model }
 
   try {
-    const providers = readProviderInventory(
+    const inventory = readProviderInventory(
       await client.provider.list({ query: { directory } }),
     )
-    if (!providers) return model
+    if (!inventory) return { model }
 
-    const provider = providers.find((candidate) => candidate.id === model.providerID)
-    if (!provider) return model
+    if (inventory.connected !== undefined && !inventory.connected.includes(model.providerID)) {
+      return { reason: "provider is not connected" }
+    }
+
+    const provider = inventory.providers.find((candidate) => candidate.id === model.providerID)
+    if (!provider) return { model }
     const inventoryModel = Object.entries(provider.models).find(([modelKey, value]) => (
       modelKey === model.modelID || (isRecord(value) && value.id === model.modelID)
     ))?.[1]
-    return withInventoryVariant(model, inventoryModel)
+    return { model: withInventoryVariant(model, inventoryModel) }
   } catch {
     // An explicit model remains valid when optional inventory lookup fails.
-    return model
+    return { model }
   }
 }
 
@@ -218,13 +245,14 @@ async function discoverFreeSmallModel(
   if (!client.provider?.list) return { reason: "model inventory is unavailable" }
 
   try {
-    const providers = readProviderInventory(
+    const inventory = readProviderInventory(
       await client.provider.list({ query: { directory } }),
     )
-    if (!providers) return { reason: "model inventory response is malformed" }
+    if (!inventory) return { reason: "model inventory response is malformed" }
 
     let firstEligible: SmallModel | undefined
-    for (const provider of providers) {
+    for (const provider of inventory.providers) {
+      if (inventory.connected !== undefined && !inventory.connected.includes(provider.id)) continue
       for (const [modelID, model] of Object.entries(provider.models)) {
         if (!modelID || !isFreeToolCallingModel(model)) continue
         const valueModelID = isRecord(model) && typeof model.id === "string" && model.id.length > 0
@@ -244,7 +272,11 @@ async function discoverFreeSmallModel(
     if (firstEligible) {
       return { model: firstEligible, reason: "eligible model discovered" }
     }
-    return { reason: "no eligible free model found" }
+    return {
+      reason: inventory.connected !== undefined
+        ? "no connected provider has a suitable free tool model"
+        : "no eligible free model found",
+    }
   } catch {
     // Discovery is optional. A failed request leaves heuristic persistence as
     // the only fallback.
@@ -275,12 +307,14 @@ export async function getLLMConfig(
     }
   }
 
-  // A syntactically valid explicit override is authoritative and does not
-  // need to be present in the provider inventory.
+  // A syntactically valid explicit override is authoritative for model choice;
+  // a valid connected-provider list may still reject an unavailable provider.
   if (configuredModel) {
+    const resolved = await resolveConfiguredModelVariant(client, directory, configuredModel)
+    if (resolved.reason) return { enabled: false, reason: resolved.reason }
     return {
       enabled: true,
-      model: await resolveConfiguredModelVariant(client, directory, configuredModel),
+      model: resolved.model,
     }
   }
 

@@ -164,10 +164,10 @@ OpenCode installation:
    structured-extraction example is `opencode/north-mini-code-free` when the
    host lists it; this is not a permanent availability or quality claim.
 2. If `small_model` is absent or malformed, tokenmaxxer reads the host provider
-   inventory from `data.all[].models`, keeps only active, tool-callable models
-   whose declared cost is zero and that provide an explicit `none` reasoning
-   variant, and uses the first eligible candidate in the host provider-list and
-   model-map order.
+   inventory from connected providers in `data.all[].models`, keeps only active,
+   tool-callable models whose declared cost is zero and that provide an explicit
+   `none` reasoning variant, and uses the first eligible candidate in the host
+   provider-list and model-map order.
 3. If no such candidate works, it uses heuristics only. Automatic discovery
    never falls back to a paid model, including a paid Anthropic model. Provider
    and model names are not hardcoded.
@@ -177,6 +177,25 @@ reasoning variant. Dynamic discovery therefore prefers eligible zero-cost,
 tool-callable models that provide that variant. This avoids providers that
 reject forced tool choice while thinking mode is active. If no eligible model
 with a working `none` variant exists, the fallback remains heuristic-only.
+
+An OpenCode model listing is not an unauthenticated-use promise. Listed
+OpenCode Zen/free models still require an available, connected provider
+credential. If a model request returns `401`, authenticate and verify the
+provider before enabling extraction:
+
+```bash
+opencode auth login
+```
+
+Complete the OpenCode/Zen provider flow, then confirm the connection with:
+
+```bash
+opencode auth list
+```
+
+Auto-discovery selects models only from connected providers. An explicit
+`small_model` that is listed but unavailable or not authenticated falls back to
+heuristic extraction rather than being replaced with another model.
 
 Extraction uses the host `PluginInput` v1 client transport; it does not create
 a separate SDK-v2 bridge. The generated client types omit JSON-schema fields
@@ -192,7 +211,8 @@ This selection policy makes no permanent claim about which model is best.
 ### List and configure models
 
 List the models available to the OpenCode installation that is running the
-plugin:
+plugin. The list describes inventory; it does not prove that a free model is
+unauthenticated or currently usable:
 
 ```bash
 opencode models
