@@ -24,8 +24,6 @@ export interface ExtractedFacts {
 export interface TokenmaxxerOptions {
   /** Kill switch for compaction prompt replacement. false = inject durable block via context only. */
   compactionPrompt: boolean
-  /** Memory isolation key: "worktree" (default, single-repo) or "directory" (monorepo sub-packages) */
-  memoryKey: "worktree" | "directory"
 }
 
 /** A session transcript message as returned by client.session.messages() */

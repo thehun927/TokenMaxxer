@@ -353,11 +353,6 @@ export function buildTranscriptEvidenceRefDigestMap(
   return digests
 }
 
-// Short aliases keep the corroboration boundary discoverable without making
-// callers reconstruct the candidate map from the prompt string.
-export const buildEvidenceCandidateMap = buildTranscriptEvidenceCandidateMap
-export const buildEvidenceRefDigestMap = buildTranscriptEvidenceRefDigestMap
-
 /**
  * Keep only labelled text from the last 20 eligible messages. Tool parts and
  * their outputs are deliberately omitted from the transcript sent to the LLM.

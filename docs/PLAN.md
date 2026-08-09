@@ -18,7 +18,7 @@
 
 **Architecture (two layers, both pure plugin):**
 1. **Compaction-quality hook** — `experimental.session.compacting` injects structured durable state + replaces the compaction prompt with a schema-constrained one. Targets the actual pain.
-2. **Per-project durable memory** — written on `session.idle` and read by pull-based custom tools (`recall_*`). Server memory work is silent: it is not injected into the composer or system prompt. Keyed by project `worktree`/`directory` for multi-project isolation. Optional vector index behind `search_kb` as a v2 if the structured memory exceeds ~4KB.
+2. **Per-project durable memory** — written on `session.idle` and read by pull-based custom tools (`recall_*`). Server memory work is silent: it is not injected into the composer or system prompt. Memory is keyed by the resolved project path: `worktree` for a normal repository, with `directory` used only when OpenCode reports an unusable worktree such as `/`. The historical vector/search-v2 idea below was not shipped and is not a current promise.
 
 **Success criteria:**
 - After compaction fires, the model can correctly answer "what were we doing, which files, what decisions are locked in?" without re-reading files.
@@ -200,7 +200,7 @@ export type ActiveFile = z.infer<typeof ActiveFileSchema>
 
 export const MemoryFileSchema = z.object({
   version: z.literal(1),
-  project_path: z.string(),             // the worktree/directory key
+  project_path: z.string(),             // the resolved project path
   last_updated: z.string().iso(),
   last_git_sha: z.string().optional(),
   last_session_id: z.string().optional(),
@@ -214,7 +214,7 @@ export type MemoryFile = z.infer<typeof MemoryFileSchema>
 ```
 
 **Design rules:**
-- Capped size. Hard cap: 8KB on disk. Writer (§4.2) enforces by pruning oldest decisions with `still_valid: true` that haven't been touched in N sessions. If cap exceeded regularly → that's the trigger to consider v2 vector index.
+- Capped size. Hard cap: 8KB on disk. Writer (§4.2) enforces by pruning oldest decisions with `still_valid: true` that haven't been touched in N sessions. The historical vector/search-v2 proposal is not shipped or promised if the cap is reached.
 - Every entry is timestamped + git-SHA'd so the model (and the user) can detect staleness. The compaction prompt and recall tools are instructed to surface the SHA so the model doesn't hallucinate continuity on a stale file.
 - `still_valid` flips to `false` when a newer decision on the same `topic` is recorded. Reader filters them out by default but keeps them for audit.
 - **Schema migration: add a `migrate(v1→vN)` step in `readMemory`.** The `version: 1` literal is in the schema but no loader-side migration is defined. When the schema changes, old `STATE.json` files will fail zod validation and the user loses their memory. Add a small migration table now even if v1 is the only version.
@@ -224,6 +224,12 @@ export type MemoryFile = z.infer<typeof MemoryFileSchema>
 ## 4. Layer 1 — Compaction-quality hook (build first, highest value)
 
 ### 4.1 The hook wiring (`src/index.ts`)
+
+> **Historical, superseded example:** the `session.created`/
+> `injectHeaderOnCreate` branch shown below was an early injection proposal and
+> was not shipped. The server target now keeps memory silent; only the
+> compaction and `session.idle` paths are live.
+
 ```ts
 import type { Plugin } from "@opencode-ai/plugin"
 import { buildCompactionPrompt } from "./compaction/prompt"
@@ -338,10 +344,17 @@ Manual but structured:
 ## 5. Layer 2 — Per-project durable memory
 
 ### 5.1 Memory store (`src/memory/store.ts`)
-- Location decision: store at `<worktree>/.opencode/memory/STATE.json` (per-project, can be committed or gitignored per user preference). Global fallback `~/.config/opencode/memory/<sha(worktree)>/STATE.json` if `<worktree>` is read-only. Prefer the worktree path — it's the natural isolation key and survives across sessions on the same checkout.
+- Location: store at `<worktree>/.opencode/memory/STATE.json` for a valid
+  worktree. When OpenCode reports an unusable worktree (for example `/` in a
+  non-git directory), resolve the project to `directory`; this is fallback
+  behavior, not a configurable directory-scoping mode. A read-only project
+  path falls back to `~/.config/opencode/memory/<sha(project)>/STATE.json`.
 - Read: `readMemory({ worktree, directory })` → `MemoryFile | null`. Caches in a module-level Map keyed by worktree; invalidated on write.
 
-> **CORRECTED — `worktree` is the *git worktree root*, not the session CWD.** `ctx.worktree` is the parent project's git worktree root. For monorepos where you `cd` into a sub-package and run opencode from there, all sub-packages share the same `worktree` and therefore the same `STATE.json`. For monorepo users, the isolation key should be `ctx.directory` (the session CWD), not `ctx.worktree`. Decision for v1: use `worktree` as the primary key, with a config option `memory.key: "worktree" | "directory"` to switch. Default `"worktree"` matches the simpler single-repo case most users will have.
+> **Resolved project key:** `worktree` is the git worktree root, not the
+> session CWD. A valid worktree is the primary isolation key. `directory` is
+> supplied to resolve non-git or otherwise unusable worktrees; there is no
+> `memory.key` or directory-mode configuration.
 
 - Write: `writeMemory({ worktree, directory }, mem)` — atomic write (temp file + rename). Enforces the 8KB cap by calling `pruneOld(mem)`.
 
@@ -675,10 +688,13 @@ The model can also call a new `recall_promote(topic)` tool (added to `recall.ts`
 3. Assert: the 2 foundational + 3 recent = 5 are full-fidelity; 5 most recent of the rest appear in `## Older decisions` one-line format; the remaining 40 are not in the block.
 4. Pass: block size is bounded under ~2KB even with 50 decisions seeded.
 
-**M5 (conditional, only if structured memory exceeds 8KB regularly) — v2 vector index:**
+**Historical, non-shipped M5 proposal — v2 vector/search index:**
+
+This section is retained as design history only. It is not a roadmap or a
+promise to add vector search when the 8KB cap is reached.
 - Add `search_kb` tool backed by a per-project vector store (e.g. `orama` or sqlite-vec — embedded, no server)
 - Index: `STATE.json` content + (optionally) codebase files
-- This is the embeddings path. Do NOT build it unless M2-M3 prove insufficient — it's the highest-effort, highest-maintenance piece.
+- This was the proposed embeddings path; it was not implemented and carries no current build recommendation.
 
 ---
 

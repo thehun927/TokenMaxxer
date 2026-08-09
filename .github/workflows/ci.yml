@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Clean install
+        run: npm ci
+
+      - name: Run full test suite
+        run: npm test
+
+      - name: Type-check TypeScript
+        run: npx tsc --noEmit
+
+      - name: Build distribution
+        run: npm run build
+
+      - name: Verify self-contained bundles
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, statSync } from "node:fs";
+
+          const bundles = ["dist/index.js", "dist/tui.js"];
+          const generatedChunkImport = /(?:\bfrom\s+|\bimport\s*\()\s*["'](?:\.\/|\.\.\/)/;
+
+          for (const file of bundles) {
+            if (statSync(file).size === 0) {
+              throw new Error(`${file} is empty`);
+            }
+
+            const source = readFileSync(file, "utf8");
+            if (generatedChunkImport.test(source)) {
+              throw new Error(`${file} contains a generated chunk import`);
+            }
+          }
+          NODE
+
+      - name: Validate installer syntax
+        run: bash -n install.sh

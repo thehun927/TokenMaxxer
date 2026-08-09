@@ -36,13 +36,3 @@ export async function getMtime(path: string): Promise<number | null> {
     return null
   }
 }
-
-/** Get file size in bytes, or null if the file doesn't exist. */
-export async function getSize(path: string): Promise<number | null> {
-  try {
-    const s = await stat(path)
-    return s.size
-  } catch {
-    return null
-  }
-}

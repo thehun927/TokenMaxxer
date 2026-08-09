@@ -127,9 +127,6 @@ export function getProjectQueueStatus(project: string): ProjectQueueStatus {
   }
 }
 
-/** Alias useful to callers that want the generic queue terminology. */
-export const getQueueStatus = getProjectQueueStatus
-
 /** Test/process lifecycle reset; it carries no persisted state. */
 export function resetProjectQueues(): void {
   queues.clear()

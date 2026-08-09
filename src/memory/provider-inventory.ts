@@ -346,9 +346,6 @@ export function normalizeProviderInventory(value: unknown): NormalizedProviderIn
   }
 }
 
-/** Alias kept for callers that prefer an explicit decode verb. */
-export const decodeProviderInventory = normalizeProviderInventory
-
 export function hasVariant(model: NormalizedProviderModel, variant: string): boolean {
   return model.variants.includes(variant)
 }

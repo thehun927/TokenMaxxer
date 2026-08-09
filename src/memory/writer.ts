@@ -10,7 +10,7 @@ import type {
   Evidence,
   Provenance,
 } from "./schema"
-import type { ExtractedFacts, TranscriptMessage, TranscriptPart } from "../types"
+import type { ExtractedFacts, TranscriptMessage } from "../types"
 import { readMemory, writeMemory, emptyMemory, resolveProjectPath } from "./store"
 import { enqueueProjectJob, setProjectQueueOutcome } from "./lock"
 import { getCurrentGitSha } from "../util/git"
@@ -1120,19 +1120,6 @@ function stripCodeBlocks(text: string): string {
     })
     .join("\n")
   return stripped
-}
-
-/** Extract text from a tool part's output for decision scanning. */
-function extractToolOutputText(part: TranscriptPart): string | null {
-  if (part.type !== "tool") return null
-  const state = (part as { state?: { output?: string; error?: string } }).state
-  if (!state) return null
-
-  // The output field is a string in the real transcript
-  if (typeof state.output === "string") return state.output
-  if (typeof state.error === "string") return state.error
-
-  return null
 }
 
 // ─── markReferencedDecisions ─────────────────────────────────────────────────

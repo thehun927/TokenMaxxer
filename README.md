@@ -65,6 +65,14 @@ Session 2 (new): model calls get_project_state
   → "You have a prior decision: use Postgres (SHA abc1234, 2026-08-08)"
 ```
 
+### Tracked single-file distribution
+
+The repository tracks the built server and TUI artifacts in `dist/`. The build
+uses `--no-splitting`, so `dist/index.js` and `dist/tui.js` are each a
+self-contained target with no generated chunk files to copy alongside it.
+They retain imports only for host/runtime packages supplied by OpenCode or the
+installation's configured dependencies.
+
 ### Silent server target and separate TUI target
 
 The server target (`dist/index.js`) is silent: memory work never writes text to
@@ -95,18 +103,22 @@ curl -fsSL https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/install.
 Restart opencode after installation. Both server layers are then active in all
 projects — no per-project config required.
 
+The one-liner downloads the tracked `dist/index.js`, `dist/tui.js`, and
+launcher artifacts directly; it does not require a local build or model
+configuration for installation.
+
 - **Layer 1** (compaction hook) fires on every `/compact`
 - **Layer 2** (memory + tools) silently writes `STATE.json` on session idle; it does not write to the composer
 - **7 custom tools** are registered and available to the agent in every session
 
-### Manual install
+### Manual install from the tracked artifacts
 
 ```bash
 git clone https://github.com/thehun927/TokenMaxxer.git
-cd TokenMaxxer && npm install && npm run build
+cd TokenMaxxer
 mkdir -p ~/.config/opencode/plugins
-cp dist/index.js ~/.config/opencode/plugins/tokenmaxxer.js       # server target, global (all projects)
-cp dist/tui.js ~/.config/opencode/plugins/tokenmaxxer-tui.js     # TUI target, global (all projects)
+cp dist/index.js ~/.config/opencode/plugins/tokenmaxxer.js       # tracked server target, global (all projects)
+cp dist/tui.js ~/.config/opencode/plugins/tokenmaxxer-tui.js     # tracked TUI target, global (all projects)
 # or: cp dist/index.js .opencode/plugins/tokenmaxxer.js       # local (single project)
 ```
 
@@ -407,9 +419,9 @@ src/
 ## Development
 
 ```bash
-npm install          # Install dev deps (vitest, tsup, typescript, zod, @opencode-ai/plugin)
+npm ci                # Install dev deps (vitest, tsup, typescript, zod, @opencode-ai/plugin)
 npm test            # Run the test suite
-npm run build       # Build to dist/index.js (ESM)
+npm run build        # Rebuild the tracked single-file server and TUI targets
 npx tsc --noEmit    # Type check
 ```
 

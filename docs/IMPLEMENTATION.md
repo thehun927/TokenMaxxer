@@ -348,10 +348,9 @@ export interface ExtractedFacts {
   next_steps: string[]
 }
 
-// Plugin options (read from opencode.json "tokenmaxxer" key, or env)
+// Plugin options (read from the environment)
 export interface TokenmaxxerOptions {
   compactionPrompt: boolean     // kill switch, default true
-  memoryKey: "worktree" | "directory"  // default "worktree"
 }
 ```
 
@@ -362,10 +361,13 @@ import type { TokenmaxxerOptions } from "./types"
 export function loadOptions(ctx: any): TokenmaxxerOptions {
   return {
     compactionPrompt: process.env.TOKENMAXXER_NO_PROMPT !== "1",
-    memoryKey: "worktree",
   }
 }
 ```
+
+There is no directory-mode configuration. Runtime memory resolution uses the
+OpenCode `worktree` when it is usable and falls back to `directory` only for an
+unusable worktree such as `/` in a non-git directory.
 
 > **Kill switch:** `TOKENMAXXER_NO_PROMPT=1` env var or `tokenmaxxer.compaction_prompt: false` in config skips prompt replacement but still injects the durable block via `output.context`. This is the rollback path if the schema-constrained prompt makes things worse mid-session.
 
@@ -1055,9 +1057,10 @@ The runtime version check in `src/index.ts` (§4.2) warns on mismatch.
 
 ---
 
-## 10. Milestone M7 — Vector index (conditional, only if 8KB cap is hit regularly)
+## 10. Historical M7 proposal — Vector/search index (not shipped)
 
-Follow PLAN.md M5. Do not build unless M2-M5 prove insufficient.
+This retained proposal is not a current roadmap or a promise to add vector
+search if the 8KB cap is hit. Follow PLAN.md M5 only as historical context.
 
 ---
 
@@ -1256,7 +1259,7 @@ export function createMockClient(overrides?: Partial<any>) {
 | M4 | Efficiency tools + status | 0.5 day | M3 |
 | M5 | Bounded durable block | 0.5 day | M4 |
 | M6 | Package & polish | 0.5 day | M5 |
-| M7 | Vector index (conditional) | — | M6, only if 8KB hit |
+| M7 | Historical vector/search proposal (not shipped) | — | Not scheduled |
 
 **Changes from PLAN.md:**
 - Phase 0 spike added (resolve blocking unknowns first).

@@ -8,6 +8,5 @@ export function loadOptions(_ctx: unknown): TokenmaxxerOptions {
     // Kill switch: set TOKENMAXXER_NO_PROMPT=1 to skip prompt replacement,
     // still inject durable block via output.context
     compactionPrompt: process.env.TOKENMAXXER_NO_PROMPT !== "1",
-    memoryKey: "worktree",
   }
 }

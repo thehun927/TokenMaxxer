@@ -217,11 +217,6 @@ export async function isPersistedRetainedExtractionSession(args: {
   }
 }
 
-/** Bounded extraction lifecycle diagnostics for local status consumers. */
-export function getLLMExtractionInFlightCount(): number {
-  return extractionInFlight.size
-}
-
 /** Bounded process-local evidence counters for the status tool. */
 export function getLLMEvidenceStats(): {
   accepted: number
