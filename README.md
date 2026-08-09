@@ -160,14 +160,23 @@ When enabled, tokenmaxxer resolves the extraction model from the user's
 OpenCode installation:
 
 1. If `small_model` is a valid `provider/model` string in the host config, it
-   is the explicit model override.
+   is the explicit model override. The current recommended explicit
+   structured-extraction example is `opencode/north-mini-code-free` when the
+   host lists it; this is not a permanent availability or quality claim.
 2. If `small_model` is absent or malformed, tokenmaxxer reads the host provider
    inventory from `data.all[].models`, keeps only active, tool-callable models
-   whose declared cost is zero, and uses the first eligible candidate in the
-   host provider-list and model-map order.
-3. If no such candidate exists, it uses heuristics only. Automatic discovery
+   whose declared cost is zero and that provide an explicit `none` reasoning
+   variant, and uses the first eligible candidate in the host provider-list and
+   model-map order.
+3. If no such candidate works, it uses heuristics only. Automatic discovery
    never falls back to a paid model, including a paid Anthropic model. Provider
    and model names are not hardcoded.
+
+Structured extraction uses the selected available model's explicit `none`
+reasoning variant. Dynamic discovery therefore prefers eligible zero-cost,
+tool-callable models that provide that variant. This avoids providers that
+reject forced tool choice while thinking mode is active. If no eligible model
+with a working `none` variant exists, the fallback remains heuristic-only.
 
 Extraction uses the host `PluginInput` v1 client transport; it does not create
 a separate SDK-v2 bridge. The generated client types omit JSON-schema fields
@@ -194,11 +203,13 @@ To select one exact model, copy its provider and model IDs into the top-level
 
 ```jsonc
 {
-  "small_model": "provider/model"
+  "small_model": "opencode/north-mini-code-free"
 }
 ```
 
-The value must be the exact `provider/model` identifier shown by OpenCode.
+The value must be the exact `provider/model` identifier shown by OpenCode. The
+North Mini value is an example for the current host inventory, not a promise
+that the model will remain available or provide a permanent quality advantage.
 With a valid override, tokenmaxxer does not replace it with an automatically
 discovered model. Remove it (or correct it) to use free-model discovery.
 

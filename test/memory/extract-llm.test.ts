@@ -43,6 +43,16 @@ function inventoryModel(overrides: Record<string, unknown> = {}) {
   }
 }
 
+function liveInventoryModel(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "live-model",
+    name: "Live Small Free",
+    capabilities: { toolcall: true },
+    cost: { input: 0, output: 0 },
+    ...overrides,
+  }
+}
+
 describe("v1 structured extraction", () => {
   beforeEach(() => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
@@ -115,6 +125,32 @@ describe("v1 structured extraction", () => {
     )).resolves.toEqual(facts)
     expect(session.create).toHaveBeenCalledTimes(1)
     expect(session.prompt).toHaveBeenCalledTimes(1)
+  })
+
+  it("sends a selected variant as a top-level prompt body field", async () => {
+    const prompt = vi.fn(async () => ({ data: { info: { structured: facts } } }))
+    const client = {
+      session: {
+        create: vi.fn(async () => ({ data: { id: "audit-variant" } })),
+        prompt,
+      },
+    }
+
+    await expect(extractFactsLLM(
+      canonical(),
+      "source-variant",
+      "project",
+      client,
+      { enabled: true, model: { providerID: "provider", modelID: "model", variant: "none" } },
+      { directory: "/worktree" },
+    )).resolves.toEqual(facts)
+
+    expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
+      body: expect.objectContaining({
+        model: { providerID: "provider", modelID: "model" },
+        variant: "none",
+      }),
+    }))
   })
 
   it("does not create a session for a validated cache hit", async () => {
@@ -295,7 +331,9 @@ describe("v1 structured extraction", () => {
   })
 
   it("uses a valid configured provider/model override without discovery", async () => {
-    const list = vi.fn()
+    const list = vi.fn(async () => providerResponse([
+      { id: "configured", models: { model: inventoryModel() } },
+    ]))
     const get = vi.fn(async () => ({ data: { small_model: "configured/model" } }))
     await expect(getLLMConfig({
       config: { get },
@@ -305,7 +343,26 @@ describe("v1 structured extraction", () => {
       model: { providerID: "configured", modelID: "model" },
     })
     expect(get).toHaveBeenCalledWith({ query: { directory: "/worktree" } })
-    expect(list).not.toHaveBeenCalled()
+    expect(list).toHaveBeenCalledWith({ query: { directory: "/worktree" } })
+  })
+
+  it("attaches an explicit none variant when provider metadata exposes it", async () => {
+    const list = vi.fn(async () => providerResponse([
+      {
+        id: "configured",
+        models: {
+          model: liveInventoryModel({ id: "model", variants: { none: {} } }),
+        },
+      },
+    ]))
+
+    await expect(getLLMConfig({
+      config: { get: vi.fn(async () => ({ data: { small_model: "configured/model" } })) },
+      provider: { list },
+    }, "/worktree")).resolves.toEqual({
+      enabled: true,
+      model: { providerID: "configured", modelID: "model", variant: "none" },
+    })
   })
 
   it("discovers the first eligible free model in provider and model order", async () => {
@@ -349,6 +406,40 @@ describe("v1 structured extraction", () => {
     }, "/worktree")).resolves.toEqual({
       enabled: true,
       model: { providerID: "eligible", modelID: "omittedStatus" },
+    })
+  })
+
+  it("prefers a live model with a none variant over earlier eligible models", async () => {
+    const list = vi.fn(async () => providerResponse([
+      {
+        id: "providerA",
+        models: {
+          ordinary: liveInventoryModel({ id: "ordinary", status: "active" }),
+        },
+      },
+      {
+        id: "providerB",
+        models: {
+          thinking: liveInventoryModel({
+            id: "thinking",
+            status: "active",
+            variants: { thinking: {} },
+          }),
+          none: liveInventoryModel({
+            id: "none",
+            status: "active",
+            variants: { none: {} },
+          }),
+        },
+      },
+    ]))
+
+    await expect(getLLMConfig({
+      config: { get: vi.fn(async () => ({ data: {} })) },
+      provider: { list },
+    }, "/worktree")).resolves.toEqual({
+      enabled: true,
+      model: { providerID: "providerB", modelID: "none", variant: "none" },
     })
   })
 

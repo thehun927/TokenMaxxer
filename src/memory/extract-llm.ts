@@ -20,6 +20,7 @@ import { buildExtractionPrompt, makeExtractionCacheKey } from "./extract-prompt"
 export interface SmallModel {
   providerID: string
   modelID: string
+  variant?: string
 }
 
 export interface LLMExtractionConfig {
@@ -118,6 +119,7 @@ type StructuredPromptParameters = {
     model: SmallModel
     parts: Array<{ type: "text"; text: string }>
     format: { type: "json_schema"; schema: Record<string, unknown> }
+    variant?: string
   }
 }
 
@@ -162,9 +164,47 @@ function readProviderInventory(result: unknown): ProviderInventoryEntry[] | unde
 function isFreeToolCallingModel(value: unknown): boolean {
   if (!isRecord(value)) return false
   if (value.status !== undefined && value.status !== "active") return false
-  if (value.tool_call !== true) return false
+  const toolCalling = value.tool_call === true || (
+    isRecord(value.capabilities) && value.capabilities.toolcall === true
+  )
+  if (!toolCalling) return false
   if (!isRecord(value.cost)) return false
   return value.cost.input === 0 && value.cost.output === 0
+}
+
+function readNoneVariant(value: unknown): "none" | undefined {
+  if (!isRecord(value) || !isRecord(value.variants)) return undefined
+  return isRecord(value.variants.none) ? "none" : undefined
+}
+
+function withInventoryVariant(model: SmallModel, inventoryModel: unknown): SmallModel {
+  const variant = readNoneVariant(inventoryModel)
+  return variant ? { ...model, variant } : model
+}
+
+async function resolveConfiguredModelVariant(
+  client: V1ClientLike,
+  directory: string,
+  model: SmallModel,
+): Promise<SmallModel> {
+  if (!client.provider?.list) return model
+
+  try {
+    const providers = readProviderInventory(
+      await client.provider.list({ query: { directory } }),
+    )
+    if (!providers) return model
+
+    const provider = providers.find((candidate) => candidate.id === model.providerID)
+    if (!provider) return model
+    const inventoryModel = Object.entries(provider.models).find(([modelKey, value]) => (
+      modelKey === model.modelID || (isRecord(value) && value.id === model.modelID)
+    ))?.[1]
+    return withInventoryVariant(model, inventoryModel)
+  } catch {
+    // An explicit model remains valid when optional inventory lookup fails.
+    return model
+  }
 }
 
 /**
@@ -183,19 +223,27 @@ async function discoverFreeSmallModel(
     )
     if (!providers) return { reason: "model inventory response is malformed" }
 
+    let firstEligible: SmallModel | undefined
     for (const provider of providers) {
       for (const [modelID, model] of Object.entries(provider.models)) {
         if (!modelID || !isFreeToolCallingModel(model)) continue
         const valueModelID = isRecord(model) && typeof model.id === "string" && model.id.length > 0
           ? model.id
           : modelID
-        return {
-          model: { providerID: provider.id, modelID: valueModelID },
-          reason: "eligible model discovered",
+        const candidate = withInventoryVariant(
+          { providerID: provider.id, modelID: valueModelID },
+          model,
+        )
+        if (candidate.variant === "none") {
+          return { model: candidate, reason: "eligible model discovered" }
         }
+        firstEligible ??= candidate
       }
     }
 
+    if (firstEligible) {
+      return { model: firstEligible, reason: "eligible model discovered" }
+    }
     return { reason: "no eligible free model found" }
   } catch {
     // Discovery is optional. A failed request leaves heuristic persistence as
@@ -229,7 +277,12 @@ export async function getLLMConfig(
 
   // A syntactically valid explicit override is authoritative and does not
   // need to be present in the provider inventory.
-  if (configuredModel) return { enabled: true, model: configuredModel }
+  if (configuredModel) {
+    return {
+      enabled: true,
+      model: await resolveConfiguredModelVariant(client, directory, configuredModel),
+    }
+  }
 
   const discovered = await discoverFreeSmallModel(client, directory)
   return discovered.model
@@ -367,12 +420,16 @@ export async function extractFactsLLM(
     path: { id: extractionSessionID },
     query: { directory: options?.directory ?? "" },
     body: {
-      model: config.model,
+      model: {
+        providerID: config.model.providerID,
+        modelID: config.model.modelID,
+      },
       parts: [{ type: "text", text: buildExtractionPrompt(canonicalInput) }],
       format: {
         type: "json_schema",
         schema: ExtractedFactsJsonSchema,
       },
+      ...(config.model.variant !== undefined ? { variant: config.model.variant } : {}),
     },
   }
 
