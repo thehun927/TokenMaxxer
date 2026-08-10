@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import type { PluginInput, ToolContext } from "@opencode-ai/plugin"
 
 const { writeMemoryOnIdle, buildDurableBlock } = vi.hoisted(() => {
   return {
@@ -17,6 +18,22 @@ import { TokenmaxxerPlugin } from "../src/index"
 import { extractFactsLLM } from "../src/memory/extract-llm"
 import { buildCanonicalInput } from "../src/memory/extract-prompt"
 import { emptyMemory } from "../src/memory/schema"
+import { registerEfficiencyTools } from "../src/tools/efficiency"
+
+/**
+ * The v1.18.15 minimum-contract `ToolContext` shape (PR 4 §10.1): the tool
+ * runtime never carries a client — the SDK client is injected by closure.
+ */
+const toolContext: ToolContext = {
+  sessionID: "session-1",
+  messageID: "message-1",
+  agent: "build",
+  directory: "/workspace/project",
+  worktree: "/workspace/project",
+  abort: new AbortController().signal,
+  metadata() {},
+  async ask() {},
+}
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -152,5 +169,78 @@ describe("plugin initialization", () => {
     expect(writeMemoryOnIdle).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: "normal-session",
     }))
+  })
+})
+
+// ─── PR 4 §12 F — minimum package / compile contract (Waves 2/6/7) ──────────
+// The plugin must inject `PluginInput.client` into efficiency registration and
+// never rely on a client invented on `ToolContext`. These fixtures fail today
+// because `registerEfficiencyTools()` takes no client and the wrappers read
+// `(context as any).client`.
+describe("PR 4 §12 F — client injection into efficiency registration", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it("45. plugin initialization passes the legitimate client into efficiency registration", async () => {
+    const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-client-inject-"))
+    try {
+      const fileRead = vi.fn(async () => ({ data: { content: "line1\nline2\nline3" } }))
+      const client = {
+        file: { read: fileRead },
+        app: { log: vi.fn() },
+      }
+      // v1.18.15 minimum PluginInput shape: client, project, directory,
+      // worktree, experimental_workspace, serverUrl, $.
+      const input = {
+        client: client as unknown as PluginInput["client"],
+        project: { id: "p1", worktree: project, time: { created: Date.now() } },
+        directory: project,
+        worktree: project,
+        experimental_workspace: { register: vi.fn() },
+        serverUrl: new URL("http://127.0.0.1:4096"),
+        $: {} as PluginInput["$"],
+      } satisfies PluginInput
+
+      const hooks = await TokenmaxxerPlugin(input)
+      const invocationContext = { ...toolContext, directory: project, worktree: project }
+      const result = await hooks.tool!.head_files!.execute(
+        { paths: ["a.ts"], lines: 5 },
+        invocationContext,
+      )
+
+      // The legitimate initializer client, not a context-invented one, serves
+      // the read — and it carries the invocation directory.
+      expect(fileRead).toHaveBeenCalled()
+      expect(fileRead).toHaveBeenCalledWith({ query: { path: "a.ts", directory: project } })
+      expect(result).toContain("line1")
+    } finally {
+      await rm(project, { recursive: true, force: true })
+    }
+  })
+
+  it("registerEfficiencyTools requires the initializer client (ToolContext.client is not a legitimate source)", async () => {
+    const registrationRead = vi.fn(async () => ({ data: { content: "from-registration" } }))
+    const registrationClient = { file: { read: registrationRead } }
+    // Planned Wave 2 signature: registerEfficiencyTools(client: HostClient).
+    // The cast documents the boundary for the current zero-argument signature.
+    const registerWithClient = registerEfficiencyTools as (
+      client: unknown,
+    ) => ReturnType<typeof registerEfficiencyTools>
+    const registered = registerWithClient(registrationClient)
+    const sneaky = {
+      ...toolContext,
+      // A model-controlled context must NOT be able to smuggle a client in.
+      client: { file: { read: vi.fn(async () => ({ data: { content: "from-context" } })) } },
+    } as unknown as ToolContext
+
+    const result = await registered.tool.head_files.execute(
+      { paths: ["a.ts"], lines: 5 },
+      sneaky,
+    )
+
+    expect(registrationRead).toHaveBeenCalled()
+    expect(result).toContain("from-registration")
+    expect(result).not.toContain("from-context")
   })
 })

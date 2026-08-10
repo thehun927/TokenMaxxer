@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { spawn } from "node:child_process"
 import { access, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
@@ -22,6 +22,7 @@ import {
   makeTranscriptEvidenceRef,
 } from "../../src/memory/extract-prompt"
 import { makeExtractionCacheEntry } from "../../src/memory/extract-llm"
+import { resetHostStructuredContractGate } from "../../src/memory/llm-adapter"
 import type { TranscriptMessage } from "../../src/types"
 
 const WORKER = join(
@@ -770,5 +771,115 @@ describe("Wave 4 deferred — LLM prompt is not held under the lock", () => {
     const memory = await readMemory({ worktree, directory: worktree })
     const ids = memory?.decisions.map((d) => d.id) ?? []
     expect(ids).toContain("fact-child")
+  })
+})
+
+// ─── PR 4 §12 E — unsupported-host graceful degradation (Wave 5) ────────────
+// With LLM enabled and a host health version below the verified minimum
+// (1.18.14), heuristic memory must still be committed while the optional
+// structured path (audit session + structured prompt + LLM provenance) stays
+// at zero. The current gate compares only major/minor, so 1.18.14 is treated
+// as verified and the structured path runs; these fixtures fail until Wave 5.
+describe("PR 4 §12 E — unsupported-host graceful degradation", () => {
+  beforeEach(() => {
+    resetHostStructuredContractGate()
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+  })
+
+  afterEach(() => {
+    resetHostStructuredContractGate()
+  })
+
+  /** Fake v1 client with a `global.health` probe and recording audit/prompt. */
+  function llmClient(healthVersion: string) {
+    const create = vi.fn(async () => ({ data: { id: "audit-unsupported" } }))
+    const prompt = vi.fn(async () => ({
+      data: {
+        info: {
+          structured: {
+            current_task: "SDK extraction",
+            active_files: [],
+            decisions: [{
+              topic: "transport",
+              decision: "Use SDK v2",
+              evidence_refs: [makeTranscriptEvidenceRef("m2")],
+            }],
+            blockers: [],
+            next_steps: [],
+          },
+        },
+      },
+    }))
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: sourceMessages() })),
+        create,
+        prompt,
+      },
+      global: {
+        health: vi.fn(async () => ({ data: { healthy: true, version: healthVersion } })),
+      },
+    }
+    return { v1, create, prompt }
+  }
+
+  it("35-38. unsupported host (1.18.14) commits heuristics and never opens the structured path", async () => {
+    const worktree = await makeWorktree()
+    const { v1, create, prompt } = llmClient("1.18.14")
+
+    const outcome = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId: "source-unsupported",
+    })
+
+    // 35. Heuristic STATE is committed (the persisted file retains the
+    // heuristic facts, and the heuristic task provenance survives).
+    const memory = await readMemory({ worktree, directory: worktree })
+    expect(memory?.current_task).toContain("Implement the extraction")
+    expect(memory?.current_task_provenance).toMatchObject({
+      extractor: "heuristic",
+      source_session_id: "source-unsupported",
+      confidence: "heuristic",
+    })
+    expect(memory?.recent_sessions).toContain("source-unsupported")
+
+    // 36. No retained audit session is created.
+    expect(create).not.toHaveBeenCalled()
+    // 37. No structured prompt is sent.
+    expect(prompt).not.toHaveBeenCalled()
+    // 38. No LLM/human-reviewed decision provenance is minted from the
+    // skipped optional path.
+    expect(memory?.decisions.some((d) => d.provenance?.extractor === "llm")).toBe(false)
+    expect(memory?.decisions.some((d) => d.provenance?.confidence === "llm-corroborated")).toBe(false)
+    // The writer returns the nonfatal heuristic fallback outcome.
+    expect(outcome).toBe("heuristic-only")
+  })
+
+  it("39. supported host (1.18.15) follows the existing optional structured-extraction path unchanged", async () => {
+    const worktree = await makeWorktree()
+    const { v1, create, prompt } = llmClient("1.18.15")
+
+    const outcome = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId: "source-supported",
+    })
+
+    expect(outcome).toBe("llm-success")
+    expect(create).toHaveBeenCalledTimes(1)
+    expect(prompt).toHaveBeenCalledTimes(1)
+    const memory = await readMemory({ worktree, directory: worktree })
+    expect(memory?.decisions.some((d) => d.topic === "transport")).toBe(true)
+    expect(memory?.decisions.find((d) => d.topic === "transport")?.provenance)
+      .toMatchObject({
+        extractor: "llm",
+        source_session_id: "source-supported",
+        confidence: "llm-corroborated",
+      })
   })
 })

@@ -130,3 +130,109 @@ describe("host v1 structured-output adapter", () => {
     })
   })
 })
+
+// ─── PR 4 §12 D — host version / structured gate (Wave 4) ───────────────────
+// The current adapter compares only major/minor (`MINIMUM_HOST_CONTRACT =
+// "1.18"`), so `1.18.14` and prerelease versions wrongly pass the gate. Wave 4
+// compares the full stable tuple against the shared `src/host/contract.ts`
+// policy; these fixtures then go green.
+describe("PR 4 §12 D — full-version structured host gate", () => {
+  beforeEach(() => resetHostStructuredContractGate())
+
+  function gateFor(version: string) {
+    return getHostStructuredContractGate({
+      global: { health: vi.fn(async () => ({ data: { healthy: true, version } })) },
+    })
+  }
+
+  it("24. health reports 1.18.14 -> rejected as unsupported-version", async () => {
+    await expect(gateFor("1.18.14")).resolves.toMatchObject({
+      allowed: false,
+      source: "health",
+      reason: "unsupported-version",
+      hostVersion: "1.18.14",
+    })
+  })
+
+  it("25. health reports 1.18.15 -> accepted", async () => {
+    await expect(gateFor("1.18.15")).resolves.toMatchObject({
+      allowed: true,
+      source: "health",
+      reason: "verified",
+      hostVersion: "1.18.15",
+    })
+  })
+
+  it("26. health reports a later stable 1.x -> accepted", async () => {
+    await expect(gateFor("1.999.0")).resolves.toMatchObject({
+      allowed: true,
+      source: "health",
+      reason: "verified",
+      hostVersion: "1.999.0",
+    })
+  })
+
+  it("27. health reports 2.0.0 -> rejected", async () => {
+    await expect(gateFor("2.0.0")).resolves.toMatchObject({
+      allowed: false,
+      source: "health",
+      reason: "unsupported-version",
+      hostVersion: "2.0.0",
+    })
+  })
+
+  it("28. malformed version -> rejected", async () => {
+    for (const version of ["", "abc", "v1.18.15"]) {
+      resetHostStructuredContractGate()
+      await expect(gateFor(version)).resolves.toMatchObject({
+        allowed: false,
+        reason: "unsupported-version",
+      })
+    }
+  })
+
+  it("29. prerelease version -> rejected under the initial policy", async () => {
+    await expect(gateFor("1.18.15-rc.1")).resolves.toMatchObject({
+      allowed: false,
+      reason: "unsupported-version",
+    })
+  })
+
+  it("30. healthy !== true -> rejected", async () => {
+    resetHostStructuredContractGate()
+    await expect(getHostStructuredContractGate({
+      global: { health: vi.fn(async () => ({ data: { healthy: false, version: "1.18.15" } })) },
+    })).resolves.toMatchObject({ allowed: false, reason: "unhealthy" })
+  })
+
+  it("31. malformed health envelope -> rejected", async () => {
+    resetHostStructuredContractGate()
+    await expect(getHostStructuredContractGate({
+      global: { health: vi.fn(async () => ({ data: { version: "1.18.15" } })) },
+    })).resolves.toMatchObject({ allowed: false, reason: "malformed-health" })
+  })
+
+  it("32. health request throws -> rejected", async () => {
+    resetHostStructuredContractGate()
+    await expect(getHostStructuredContractGate({
+      global: { health: vi.fn(async () => { throw new Error("health probe failed") }) },
+    })).resolves.toMatchObject({ allowed: false, reason: "health-request-failed" })
+  })
+
+  it("33. health surface absent -> accepted as pinned-compatibility", async () => {
+    resetHostStructuredContractGate()
+    await expect(getHostStructuredContractGate({})).resolves.toEqual({
+      allowed: true,
+      source: "pinned-compatibility",
+      reason: "health-surface-unavailable",
+    })
+  })
+
+  it("34. gate result is process-cached", async () => {
+    const health = vi.fn(async () => ({ data: { healthy: true, version: "1.18.15" } }))
+    const first = await getHostStructuredContractGate({ global: { health } })
+    const second = await getHostStructuredContractGate({ global: { health } })
+    expect(first).toEqual(second)
+    expect(health).toHaveBeenCalledTimes(1)
+  })
+})

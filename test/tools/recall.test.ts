@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
+import { tool } from "@opencode-ai/plugin"
 
 vi.mock("../../src/memory/store", () => ({
   readMemory: vi.fn(),
@@ -27,12 +28,13 @@ import { queryDecisions, getActiveFiles, getProjectState } from "../../src/memor
 import { loadAndMigrate } from "../../src/memory/migrate"
 import { enqueueProjectJob, resetProjectQueues } from "../../src/memory/lock"
 import { requestFoundationalReview } from "../../src/memory/decision-review"
-import type { MemoryFile } from "../../src/memory/schema"
+import { MAX_IDENTIFIER, type MemoryFile } from "../../src/memory/schema"
 import {
   _recallDecision,
   _getActiveFiles,
   _getProjectState,
   _recallPromote,
+  registerTools,
 } from "../../src/tools/recall"
 
 // Helpers for building test data
@@ -1084,5 +1086,59 @@ describe("PR 3 wave-10 — deterministic duplicate-ID repair across the recall t
     const target = post?.decisions.find((d) => d.id === "dup")
     expect(target?.foundational_requested).toBe(true)
     expect(target?.foundational).toBe(false)
+  })
+})
+
+// ─── PR 4 §12 B — model-callable argument bounds (Wave 3) ───────────────────
+// The schemas below are reconstructed from the REGISTERED tools' actual `args`
+// shapes via `tool.schema.object(...)` (the SDK `tool()` does not expose a
+// parsed top-level schema). Wave 3 adds `.max()`/`.int()`/`.min()` bounds;
+// until then every over-limit / non-integer value parses successfully and
+// these fixtures fail.
+describe("PR 4 §12 B — recall argument bounds", () => {
+  const ctx = { worktree: "/home/user/my-project", directory: "/home/user/my-project" }
+  const recallDecisionSchema = tool.schema.object(
+    registerTools(ctx).tool.recall_decision.args,
+  )
+  const recallPromoteSchema = tool.schema.object(
+    registerTools(ctx).tool.recall_promote.args,
+  )
+
+  it("8. recall query length exactly 256 is accepted", () => {
+    expect(recallDecisionSchema.safeParse({ query: "a".repeat(256) }).success).toBe(true)
+  })
+
+  it("9. recall query length 257 is rejected by schema", () => {
+    expect(recallDecisionSchema.safeParse({ query: "a".repeat(257) }).success).toBe(false)
+  })
+
+  it("10. recall limit 1 and 25 are accepted", () => {
+    expect(recallDecisionSchema.safeParse({ limit: 1 }).success).toBe(true)
+    expect(recallDecisionSchema.safeParse({ limit: 25 }).success).toBe(true)
+  })
+
+  it("11. recall limits 0, 26, negative, fractional, and Infinity are rejected", () => {
+    expect(recallDecisionSchema.safeParse({ limit: 0 }).success).toBe(false)
+    expect(recallDecisionSchema.safeParse({ limit: 26 }).success).toBe(false)
+    expect(recallDecisionSchema.safeParse({ limit: -1 }).success).toBe(false)
+    expect(recallDecisionSchema.safeParse({ limit: 1.5 }).success).toBe(false)
+    expect(recallDecisionSchema.safeParse({ limit: Infinity }).success).toBe(false)
+  })
+
+  it("12. review-request decision_id exactly MAX_IDENTIFIER accepted; MAX_IDENTIFIER + 1 rejected", () => {
+    expect(
+      recallPromoteSchema.safeParse({ decision_id: "x".repeat(MAX_IDENTIFIER) }).success,
+    ).toBe(true)
+    expect(
+      recallPromoteSchema.safeParse({ decision_id: "x".repeat(MAX_IDENTIFIER + 1) }).success,
+    ).toBe(false)
+  })
+
+  it("13. review-request topic at its max accepted; max + 1 rejected", () => {
+    // Wave 3 pins decisionTopicChars = 256 = MAX_IDENTIFIER (TOOL_LIMITS).
+    expect(recallPromoteSchema.safeParse({ topic: "t".repeat(MAX_IDENTIFIER) }).success).toBe(true)
+    expect(
+      recallPromoteSchema.safeParse({ topic: "t".repeat(MAX_IDENTIFIER + 1) }).success,
+    ).toBe(false)
   })
 })
