@@ -24,6 +24,7 @@ vi.mock("../../src/memory/reader", async (importOriginal) => {
 
 import { readMemory, writeMemory, mutateMemory, resolveProjectPath } from "../../src/memory/store"
 import { queryDecisions, getActiveFiles, getProjectState } from "../../src/memory/reader"
+import { loadAndMigrate } from "../../src/memory/migrate"
 import { enqueueProjectJob, resetProjectQueues } from "../../src/memory/lock"
 import { requestFoundationalReview } from "../../src/memory/decision-review"
 import type { MemoryFile } from "../../src/memory/schema"
@@ -993,5 +994,95 @@ describe("PR 3 wave-9 — review-request duplicate-ID refusal and shared helper 
       })
       scenario.assertHelper(helperResult.kind)
     }
+  })
+})
+
+// ─── PR 3 wave-10 — deterministic duplicate-ID repair across the transaction ─
+// The oracle re-review: `_recallPromote`'s `mutateMemory` performs a fresh
+// `bypassCache: true` disk re-read under the lock. An ID exposed by
+// `recall_decision` from a duplicate legacy state must repair to the SAME
+// deterministic ID on that re-read, or the exact-ID path reports not-found.
+describe("PR 3 wave-10 — deterministic duplicate-ID repair across the recall transaction", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetProjectQueues()
+  })
+
+  it("5. recall_decision ID from a duplicate legacy state survives _recallPromote's fresh disk re-read", async () => {
+    const realReader = await vi.importActual<typeof import("../../src/memory/reader")>("../../src/memory/reader")
+    vi.mocked(queryDecisions).mockImplementation((mem, query, limit) =>
+      realReader.queryDecisions(mem, query, limit),
+    )
+
+    // A duplicate legacy state: two rows share "dup"; the canonical (oldest)
+    // row is the authority for the topic.
+    const rawDuplicateState = {
+      version: 3,
+      project_path: "/home/user/my-project",
+      last_updated: "2026-08-08T12:00:00.000Z",
+      active_files: [],
+      decisions: [
+        {
+          id: "dup", topic: "database", decision: "Use PostgreSQL", timestamp: "2026-08-01T10:00:00.000Z",
+          session_id: "s1", still_valid: true, foundational: false, foundational_requested: false,
+          provenance: {
+            extractor: "llm", source_session_id: "s1", source_audit_session_id: "audit-s1",
+            confidence: "llm-corroborated",
+            evidence: [{ kind: "transcript", ref: "tr-1", digest: "a".repeat(64) }],
+          },
+        },
+        {
+          id: "dup", topic: "database", decision: "Use PostgreSQL", timestamp: "2026-08-07T10:00:00.000Z",
+          session_id: "s2", still_valid: true, foundational: false, foundational_requested: false,
+          provenance: {
+            extractor: "llm", source_session_id: "s2", source_audit_session_id: "audit-s2",
+            confidence: "llm-corroborated",
+            evidence: [{ kind: "transcript", ref: "tr-2", digest: "b".repeat(64) }],
+          },
+        },
+      ],
+      blockers: [],
+      next_steps: [],
+      recent_sessions: [],
+    }
+    const rawJson = JSON.stringify(rawDuplicateState)
+    const repaired = loadAndMigrate(JSON.parse(rawJson))
+    expect(repaired).not.toBeNull()
+    if (!repaired) throw new Error("expected repaired memory")
+
+    // recall_decision reads the repaired state and exposes the canonical ID.
+    vi.mocked(readMemory).mockResolvedValue(structuredClone(repaired))
+    const recall = await _recallDecision({ query: "database", limit: 10 }, mockContext)
+    expect(recall).toContain("id=dup")
+
+    // _recallPromote's transaction performs a FRESH disk re-read (bypassCache)
+    // that repairs the same raw bytes again; the deterministic repair must
+    // yield the SAME canonical ID so the exact-ID review request commits.
+    vi.mocked(mutateMemory).mockImplementation(async (_args, mutate) => {
+      const fresh = loadAndMigrate(JSON.parse(rawJson))
+      if (!fresh) throw new Error("expected fresh repaired memory")
+      const action = mutate(structuredClone(fresh), {
+        status: "ok",
+        memory: fresh,
+        source: "project",
+        path: "/state.json",
+        sizeBytes: 0,
+        revision: fresh.revision,
+      })
+      if (action.kind === "noop") {
+        return { status: "noop", value: action.value, revision: fresh.revision }
+      }
+      vi.mocked(readMemory).mockResolvedValue(action.memory)
+      return { status: "committed", value: action.value, revision: fresh.revision + 1 }
+    })
+
+    const promote = await _recallPromote({ decision_id: "dup" }, mockContext)
+    expect(promote).toContain("Foundational review requested for dup")
+
+    // The committed state carries the review request on the canonical row.
+    const post = await readMemory({ worktree: mockContext.worktree, directory: mockContext.directory })
+    const target = post?.decisions.find((d) => d.id === "dup")
+    expect(target?.foundational_requested).toBe(true)
+    expect(target?.foundational).toBe(false)
   })
 })

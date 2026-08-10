@@ -238,7 +238,9 @@ function resolveConflictingNonHumans(group: Decision[], authorities: Decision[])
  * When reconstructed, the read view re-applies the same quarantine state the
  * valid-row pass applies (`still_valid=false`, reciprocal `conflicts_with`,
  * durable flag on the humans) and emits one conflict record, deduplicated by
- * topic.
+ * topic. Rows the valid-row pass already selected for the quarantined topic
+ * are invalidated here; `resolveDecisionAuthorities` purges them from the
+ * returned authority list afterwards (wave-10 Blocker 1).
  */
 function resolveDurableHumanConflicts(
   all: Decision[],
@@ -291,6 +293,16 @@ function resolveDurableHumanConflicts(
  * output. The returned `decisions` array contains copies of every input
  * decision, with reconciled `still_valid`/`conflicts_with`/`superseded_by`
  * state applied for the read view.
+ *
+ * Wave-10 (Blocker 1): the returned `authorities` array is defensively
+ * filtered AFTER the durable conflict reconstruction pass so every authority
+ * satisfies `still_valid === true` AND its normalized topic is NOT under a
+ * `conflicting-human-foundational` quarantine. The reconstruction can mark
+ * automated rows in a quarantined topic `still_valid=false` after the valid-row
+ * pass already selected them; such rows must never be returned as authorities,
+ * otherwise an upgraded pre-Wave-9 state would expose an automated decision as
+ * the project's authority while simultaneously reporting an unresolved
+ * protected human conflict.
  */
 export function resolveDecisionAuthorities(
   decisions: readonly Decision[],
@@ -337,5 +349,17 @@ export function resolveDecisionAuthorities(
   // persisted in a non-authoritative form (post-reconciliation `still_valid=false`).
   resolveDurableHumanConflicts(all, conflicts)
 
-  return { decisions: all, authorities, conflicts }
+  // Wave-10 (Blocker 1): the reconstruction quarantines the ENTIRE topic —
+  // including automated rows the first pass already selected (their
+  // `still_valid` is now false in `all`). Purge those rows from the returned
+  // authority list so a conflicting-human-foundational topic reports ZERO
+  // automated authorities (the reader invariant).
+  const conflictedTopics = new Set(
+    conflicts.map((c) => normalizeDecisionTopic(c.normalized_topic)),
+  )
+  const finalAuthorities = authorities.filter(
+    (a) => a.still_valid === true && !conflictedTopics.has(normalizeDecisionTopic(a.topic)),
+  )
+
+  return { decisions: all, authorities: finalAuthorities, conflicts }
 }

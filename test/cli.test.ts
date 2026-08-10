@@ -561,3 +561,55 @@ describe("PR 3 wave-9 — CLI duplicate-ID and display→confirmation TOCTOU", (
     expect(target.provenance?.extractor).not.toBe("human")
   })
 })
+
+// ─── PR 3 wave-10 — deterministic duplicate-ID repair end-to-end CLI ─────────
+// The oracle re-review: an ID listed by `decisions` from a duplicate legacy
+// STATE must survive the `promote` transaction's `bypassCache: true` re-read.
+describe("PR 3 wave-10 — deterministic duplicate-ID repair end-to-end CLI", () => {
+  it("43. decisions lists the canonical authority ID from a duplicate legacy STATE and promote <id> survives the transaction re-read", async () => {
+    // A pre-PR3 legacy STATE with two rows sharing one id. `writeMemory`
+    // rejects duplicate IDs (v3 uniqueness invariant), so seed the file
+    // directly exactly as such a legacy file could exist on disk.
+    const duplicateState = {
+      version: 3,
+      project_path: project,
+      last_updated: "2026-08-08T12:00:00.000Z",
+      active_files: [],
+      decisions: [
+        mkDecision({
+          id: "dup", topic: "auth", decision: "Use JWT", timestamp: "2026-08-01T00:00:00Z",
+          provenance: llmProv, foundational_requested: true,
+        }),
+        mkDecision({
+          id: "dup", topic: "auth", decision: "Use JWT", timestamp: "2026-08-02T00:00:00Z",
+          provenance: llmProv,
+        }),
+      ],
+      blockers: [],
+      next_steps: [],
+      recent_sessions: [],
+    }
+    await mkdir(dirname(statePath), { recursive: true })
+    await writeFile(statePath, JSON.stringify(duplicateState, null, 2))
+
+    // `decisions` lists the canonical (oldest) authority ID — the preserved "dup".
+    const listIo = makeIo()
+    await runCli(["decisions"], { project, io: listIo })
+    const listOut = stdoutOf(listIo)
+    expect(listOut).toContain("[id=dup")
+
+    // `promote <id>` with the exact-ID confirmation succeeds: the deterministic
+    // repair in the transaction's bypass-cache re-read yields the same ID.
+    const promoteIo = makeIo("dup")
+    const result = await runCli(["promote", "dup"], { project, io: promoteIo })
+    expect(result.kind).toBe("promoted")
+
+    const state = await readState()
+    const target = state.decisions.find((d) => d.id === "dup")
+    expect(target?.foundational).toBe(true)
+    expect(target?.foundational_requested).toBe(false)
+    expect(target?.human_review?.channel).toBe("interactive-cli")
+    expect(target?.provenance?.extractor).toBe("human")
+    expect(target?.provenance?.confidence).toBe("human-reviewed")
+  })
+})

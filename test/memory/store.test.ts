@@ -11,6 +11,7 @@ import {
   projectMemoryPath,
 } from "../../src/memory/paths"
 import { emptyMemory } from "../../src/memory/schema"
+import { resolveDecisionAuthorities } from "../../src/memory/decision-authority"
 import { pruneOld } from "../../src/memory/writer"
 import { atomicWrite } from "../../src/util/fs"
 
@@ -532,5 +533,80 @@ describe("mutateMemory (PR 2 §8)", () => {
     const read = await readMemoryState({ worktree: project, directory: project })
     expect(read.status).toBe("ok")
     if (read.status === "ok") expect(read.revision).toBe(6)
+  })
+})
+
+// ─── PR 3 wave-10 — deterministic duplicate-ID repair across transactions ────
+// The oracle re-review: an ID exposed by a read-only load must survive the
+// transaction's `bypassCache: true` re-read. Because `loadAndMigrate` never
+// persists the duplicate-ID repair, determinism is what keeps the same raw
+// bytes repairing to the same canonical ID on every load.
+describe("PR 3 wave-10 — deterministic duplicate-ID repair across transactions", () => {
+  it("readMemoryState exposes a repaired authority ID that survives mutateMemory's bypass-cache re-read", async () => {
+    const project = await makeWorktree()
+    const path = projectMemoryPath(project)
+    // A raw duplicate-ID legacy state: two rows share "dup"; the canonical
+    // (oldest) row is the authority and is marked for foundational review.
+    const rawState = {
+      version: 3,
+      project_path: project,
+      last_updated: "2026-08-08T12:00:00.000Z",
+      active_files: [],
+      decisions: [
+        {
+          id: "dup", topic: "auth", decision: "Use JWT", timestamp: "2026-08-01T00:00:00.000Z",
+          session_id: "s1", still_valid: true, foundational: false, foundational_requested: true,
+          provenance: {
+            extractor: "llm", source_session_id: "s1", source_audit_session_id: "audit-s1",
+            confidence: "llm-corroborated", evidence: [],
+          },
+        },
+        {
+          id: "dup", topic: "auth", decision: "Use JWT", timestamp: "2026-08-02T00:00:00.000Z",
+          session_id: "s2", still_valid: true, foundational: false, foundational_requested: false,
+          provenance: {
+            extractor: "llm", source_session_id: "s2", source_audit_session_id: "audit-s2",
+            confidence: "llm-corroborated", evidence: [],
+          },
+        },
+      ],
+      blockers: [],
+      next_steps: [],
+      recent_sessions: [],
+    }
+    await writeState(path, JSON.stringify(rawState, null, 2))
+
+    const read = await readMemoryState({ worktree: project, directory: project })
+    expect(read.status).toBe("ok")
+    if (read.status !== "ok") throw new Error("expected ok state")
+    const authorityId = resolveDecisionAuthorities(read.memory.decisions).authorities[0]!.id
+    // The canonical winner keeps the old shared ID.
+    expect(authorityId).toBe("dup")
+
+    let targetFound = false
+    const result = await mutateMemory(
+      { worktree: project, directory: project },
+      (memory) => {
+        const target = memory.decisions.find((d) => d.id === authorityId)
+        if (!target) return { kind: "noop", value: "missing" }
+        targetFound = true
+        return {
+          kind: "commit",
+          memory: {
+            ...memory,
+            decisions: memory.decisions.map((d) =>
+              d.id === authorityId ? { ...d, foundational_requested: true } : d,
+            ),
+          },
+          value: "ok",
+        }
+      },
+    )
+
+    // The transaction's bypass-cache re-read repaired the SAME raw bytes to the
+    // SAME canonical ID, so the exact-ID targeting resolved and committed.
+    expect(result.status).toBe("committed")
+    expect(targetFound).toBe(true)
+    if (result.status === "committed") expect(result.revision).toBe(1)
   })
 })

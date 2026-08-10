@@ -194,6 +194,12 @@ function quarantinedHumanConflicts(
   const humanIdsByTopic = new Map<string, string[]>()
   for (const decision of decisions) {
     if (decision.human_conflict_quarantined !== true) continue
+    // Wave-10 (Concern A): the durable marker is only meaningful on a real
+    // trusted-human tuple. A malformed but schema-valid row carrying the flag
+    // without human provenance must not be able to freeze a topic into human
+    // quarantine — `resolveDecisionAuthorities` already filters via
+    // `isHumanTrustRow`, so the merge helper must enforce the same boundary.
+    if (!isHumanTrustRow(decision)) continue
     const key = normalizeDecisionTopic(decision.topic)
     const ids = humanIdsByTopic.get(key)
     if (ids) ids.push(decision.id)

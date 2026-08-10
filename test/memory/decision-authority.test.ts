@@ -18,7 +18,10 @@ import {
 } from "../../src/memory/decision-authority"
 import type { Decision } from "../../src/memory/schema"
 import { emptyMemory, MemoryFileSchema } from "../../src/memory/schema"
+import type { MemoryFile } from "../../src/memory/schema"
 import { loadAndMigrate } from "../../src/memory/migrate"
+import { queryDecisions, getProjectState } from "../../src/memory/reader"
+import { mergeDecisions } from "../../src/memory/merge"
 import {
   requestFoundationalReview,
   confirmFoundationalReview,
@@ -445,5 +448,130 @@ describe("PR 3 wave-9 — decision-review duplicate-ID refusal", () => {
     // The plan requires the candidate to be still_valid === false; a valid
     // linked row is not a supersession candidate.
     expect(mutation.kind).toBe("not-linked")
+  })
+})
+
+// ─── PR 3 wave-10 — second-pass authority purge (Blocker 1) ──────────────────
+// The oracle re-review: durable conflict reconstruction can invalidate a
+// previously selected automated row without removing it from the returned
+// `authorities` array. The final authority list must be defensively filtered to
+// `still_valid === true` AND not in a conflicting-human-foundational topic.
+describe("PR 3 wave-10 — second-pass authority purge", () => {
+  function humanRow(id: string, decision: string, timestamp: string, overrides: Record<string, unknown> = {}): Decision {
+    return mkDecision({
+      id,
+      topic: "auth",
+      decision,
+      timestamp,
+      foundational: true,
+      foundational_requested: false,
+      human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00Z" },
+      provenance: humanProv,
+      ...overrides,
+    })
+  }
+
+  function memWith(...decisions: Decision[]): MemoryFile {
+    return { ...emptyMemory("/test"), decisions }
+  }
+
+  function quarantinedHumansPlusAutomation(): { humanA: Decision; humanB: Decision; autoC: Decision } {
+    const humanA = humanRow("human-a", "Use JWT", "2026-08-01T00:00:00Z", {
+      still_valid: false,
+      human_conflict_quarantined: true,
+      conflicts_with: ["human-b"],
+    })
+    const humanB = humanRow("human-b", "Use OAuth2", "2026-08-02T00:00:00Z", {
+      still_valid: false,
+      human_conflict_quarantined: true,
+      conflicts_with: ["human-a"],
+    })
+    const autoC = mkDecision({
+      id: "auto-c", topic: "auth", decision: "Use SAML", timestamp: "2026-08-03T00:00:00Z",
+      still_valid: true, foundational: false, provenance: heuristicProv,
+    })
+    return { humanA, humanB, autoC }
+  }
+
+  it("1. two persisted conflicting humans + one raw-valid automated row → zero authorities, one conflict", () => {
+    const { humanA, humanB, autoC } = quarantinedHumansPlusAutomation()
+    const res = resolveDecisionAuthorities([humanA, humanB, autoC])
+    expect(res.authorities).toHaveLength(0)
+    expect(res.conflicts).toHaveLength(1)
+    expect(res.conflicts[0]!.kind).toBe("conflicting-human-foundational")
+    expect(res.conflicts[0]!.normalized_topic).toBe("auth")
+    const aRow = res.decisions.find((d) => d.id === "human-a")
+    const bRow = res.decisions.find((d) => d.id === "human-b")
+    expect(aRow?.human_conflict_quarantined).toBe(true)
+    expect(bRow?.human_conflict_quarantined).toBe(true)
+    // The automated row is invalidated and linked to the conflicting humans.
+    const cRow = res.decisions.find((d) => d.id === "auto-c")
+    expect(cRow?.still_valid).toBe(false)
+    expect(cRow?.conflicts_with).toEqual(["human-a", "human-b"])
+  })
+
+  it("2. queryDecisions returns zero entries for the quarantined topic", () => {
+    const { humanA, humanB, autoC } = quarantinedHumansPlusAutomation()
+    const hits = queryDecisions(memWith(humanA, humanB, autoC), "auth", 10)
+    expect(hits).toHaveLength(0)
+  })
+
+  it("3. getProjectState shows the conflict but no decision authority for that topic", () => {
+    const { humanA, humanB, autoC } = quarantinedHumansPlusAutomation()
+    const state = getProjectState(memWith(humanA, humanB, autoC))
+    expect(state).toMatch(/Decision conflicts: auth/)
+    expect(state).toContain("human-foundational conflict")
+    // No automated authority is listed for the quarantined topic.
+    expect(state).toMatch(/Decisions: none/)
+    expect(state).not.toMatch(/Decisions:.*auth/)
+  })
+
+  it("4. mergeDecisions persists all three rows non-authoritative and the next reload still yields zero authorities", () => {
+    const { humanA, humanB, autoC } = quarantinedHumansPlusAutomation()
+    const merged = mergeDecisions([humanA, humanB, autoC], [], {
+      sessionId: "sess-merge",
+      timestamp: "2026-08-10T00:00:00.000Z",
+    })
+    for (const d of merged) {
+      expect(d.still_valid).toBe(false)
+    }
+
+    // Persist + reload (pure read path): the durable markers survive and the
+    // read view still reports zero authorities and one conflict.
+    const migrated = loadAndMigrate(memWith(...merged))
+    expect(migrated).not.toBeNull()
+    const res = resolveDecisionAuthorities(migrated!.decisions)
+    expect(res.authorities).toHaveLength(0)
+    expect(res.conflicts).toHaveLength(1)
+    expect(res.conflicts[0]!.normalized_topic).toBe("auth")
+  })
+})
+
+// ─── PR 3 wave-10 — non-blocking Concern A ──────────────────────────────────
+// The durable `human_conflict_quarantined` marker must only be trusted on real
+// human trust tuples. A malformed but schema-valid state carrying the flag on
+// heuristic rows must not manufacture a human conflict.
+describe("PR 3 wave-10 — merge marker trust (Concern A)", () => {
+  it("two heuristic rows with human_conflict_quarantined=true do NOT produce a human conflict", () => {
+    const h1 = mkDecision({
+      id: "h-1", topic: "auth", decision: "Use JWT", timestamp: "2026-08-01T00:00:00Z",
+      still_valid: true, human_conflict_quarantined: true, provenance: heuristicProv,
+    })
+    const h2 = mkDecision({
+      id: "h-2", topic: "auth", decision: "Use OAuth2", timestamp: "2026-08-02T00:00:00Z",
+      still_valid: true, human_conflict_quarantined: true, provenance: heuristicProv,
+    })
+    const merged = mergeDecisions([h1, h2], [{ topic: "auth", decision: "Use SAML" }], {
+      sessionId: "sess-a",
+      timestamp: "2026-08-10T00:00:00.000Z",
+    })
+    // The incoming observation is treated as an ordinary heuristic decision:
+    // it becomes a valid authority, NOT a quarantined-topic conflict candidate.
+    const incoming = merged.find((d) => d.decision === "Use SAML")
+    expect(incoming?.still_valid).toBe(true)
+    expect(incoming?.conflicts_with).toBeUndefined()
+    // No human conflict is derived from the flagged heuristic rows.
+    const res = resolveDecisionAuthorities(merged)
+    expect(res.conflicts).toHaveLength(0)
   })
 })

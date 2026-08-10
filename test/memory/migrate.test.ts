@@ -381,7 +381,7 @@ describe("PR 3 wave-9 — duplicate decision-ID repair", () => {
     }
   }
 
-  it("assigns fresh UUIDs to every duplicate and updates all lineage references to the winner", () => {
+  it("assigns a deterministic derived ID to every non-winner duplicate and preserves the canonical winner's ID and lineage", () => {
     const result = loadAndMigrate(v3StateWith([
       {
         id: "dup", topic: "database", decision: "Use Postgres", timestamp: "2026-08-01T00:00:00.000Z",
@@ -401,26 +401,28 @@ describe("PR 3 wave-9 — duplicate decision-ID repair", () => {
 
     expect(result).not.toBeNull()
     const ids = result!.decisions.map((d) => d.id)
-    // All IDs are unique and the old shared ID is gone.
+    // All IDs are unique.
     expect(new Set(ids).size).toBe(ids.length)
-    expect(ids).not.toContain("dup")
 
     const dbRows = result!.decisions.filter((d) => d.topic === "database")
     expect(dbRows).toHaveLength(2)
     // The deterministically-oldest row ("Use Postgres", timestamp asc) is the
-    // canonical winner and receives a fresh UUID.
+    // canonical winner and KEEPS the old shared ID (wave-10 deterministic
+    // repair), so lineage references to "dup" continue to resolve to it.
     const winner = dbRows.find((d) => d.decision === "Use Postgres")!
-    expect(winner.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+    expect(winner.id).toBe("dup")
     expect(winner.topic).toBe("database")
     expect(winner.decision).toBe("Use Postgres")
     expect(winner.session_id).toBe("s1")
-    // Semantic fields are preserved on the non-winner duplicate too.
+    // The non-winner duplicate receives a deterministic bounded derived ID
+    // (UUID-shaped digest) instead of a fresh random UUID.
     const loser = dbRows.find((d) => d.decision === "Use MySQL")!
+    expect(loser.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
     expect(loser.session_id).toBe("s2")
     expect(loser.still_valid).toBe(true)
 
-    // Every lineage reference that pointed at the old shared ID now points at
-    // the kept (winner) row's fresh ID.
+    // Every lineage reference that pointed at the old shared ID is preserved
+    // and now uniquely identifies the canonical winner.
     const hist = result!.decisions.find((d) => d.id === "hist")!
     expect(hist.conflicts_with).toEqual([winner.id])
     expect(hist.superseded_by).toBe(winner.id)
@@ -497,5 +499,166 @@ describe("PR 3 wave-9 — duplicate decision-ID repair", () => {
     // The duplicate reference inside conflicts_with is rewritten to the winner;
     // unrelated references are preserved.
     expect(cand.conflicts_with).toEqual([winner.id, "other"])
+  })
+})
+
+// ─── PR 3 wave-10 — deterministic duplicate-ID repair (Blocker 2) ────────────
+// The oracle re-review: `loadAndMigrate` is deliberately pure (it never
+// persists a migration on read), so the duplicate-ID repair must be a pure
+// function of the input bytes. The same on-disk state must produce the same
+// repaired IDs on every load, or an ID exposed by `decisions`/`recall_decision`
+// could not be acted on by the transaction's `bypassCache: true` re-read.
+describe("PR 3 wave-10 — deterministic duplicate-ID repair", () => {
+  const llmProvision = (source: string) => ({
+    extractor: "llm" as const,
+    source_session_id: source,
+    source_audit_session_id: `audit-${source}`,
+    confidence: "llm-corroborated" as const,
+    evidence: [] as never[],
+  })
+  const humanProvision = {
+    extractor: "human" as const,
+    source_session_id: "s-human",
+    confidence: "human-reviewed" as const,
+    evidence: [] as never[],
+  }
+
+  function v3StateWith(decisions: unknown[]): Record<string, unknown> {
+    return {
+      version: 3,
+      project_path: "/test/project",
+      last_updated: "2026-08-08T12:00:00.000Z",
+      last_git_sha: "abc123",
+      last_session_id: "session-v3",
+      active_files: [],
+      decisions,
+      blockers: [],
+      next_steps: [],
+      recent_sessions: [],
+    }
+  }
+
+  it("1. repairing the same raw duplicate bytes twice yields identical IDs and lineage", () => {
+    const raw = v3StateWith([
+      {
+        id: "dup", topic: "database", decision: "Use Postgres", timestamp: "2026-08-01T00:00:00.000Z",
+        session_id: "s1", still_valid: true, foundational_requested: true, provenance: llmProvision("s1"),
+      },
+      {
+        id: "dup", topic: "database", decision: "Use MySQL", timestamp: "2026-08-02T00:00:00.000Z",
+        session_id: "s2", still_valid: true, provenance: llmProvision("s2"),
+      },
+      {
+        id: "hist", topic: "auth", decision: "Use JWT", timestamp: "2026-08-03T00:00:00.000Z",
+        session_id: "s3", still_valid: false,
+        conflicts_with: ["dup"], superseded_by: "dup", derived_from_decision_id: "dup",
+        provenance: llmProvision("s3"),
+      },
+    ])
+
+    const first = loadAndMigrate(JSON.parse(JSON.stringify(raw)))!
+    const second = loadAndMigrate(JSON.parse(JSON.stringify(raw)))!
+    // Byte-for-byte identical output: the pure read path must repair the same
+    // input to the same IDs every time.
+    expect(JSON.stringify(first)).toBe(JSON.stringify(second))
+    expect(first.decisions.map((d) => d.id)).toEqual(second.decisions.map((d) => d.id))
+
+    const ids = first.decisions.map((d) => d.id)
+    expect(new Set(ids).size).toBe(ids.length)
+    // The canonical winner keeps the old shared ID; non-winners get derived IDs.
+    expect(first.decisions.find((d) => d.decision === "Use Postgres")!.id).toBe("dup")
+    expect(first.decisions.find((d) => d.decision === "Use MySQL")!.id).not.toBe("dup")
+    // Rewritten lineage is identical across the two loads.
+    const hist1 = first.decisions.find((d) => d.id === "hist")!
+    const hist2 = second.decisions.find((d) => d.id === "hist")!
+    expect(hist1.superseded_by).toBe(hist2.superseded_by)
+    expect(hist1.derived_from_decision_id).toBe(hist2.derived_from_decision_id)
+    expect(hist1.conflicts_with).toEqual(hist2.conflicts_with)
+  })
+
+  it("2. a duplicate group with human_review on any row demotes the whole group, canonical winner included", () => {
+    const result = loadAndMigrate(v3StateWith([
+      {
+        id: "dup", topic: "database", decision: "Use Postgres", timestamp: "2026-08-01T00:00:00.000Z",
+        session_id: "s1", still_valid: true, foundational: true,
+        human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00.000Z" },
+        provenance: humanProvision,
+      },
+      {
+        id: "dup", topic: "database", decision: "Use MySQL", timestamp: "2026-08-02T00:00:00.000Z",
+        session_id: "s2", still_valid: true, foundational: true,
+        human_review: { channel: "interactive-cli", reviewed_at: "2026-08-02T00:00:00.000Z" },
+        provenance: humanProvision,
+      },
+    ]))
+
+    expect(result).not.toBeNull()
+    const rows = result!.decisions.filter((d) => d.topic === "database")
+    expect(rows).toHaveLength(2)
+    const ids = result!.decisions.map((d) => d.id)
+    expect(new Set(ids).size).toBe(ids.length)
+    // The canonical winner ("Use Postgres", oldest) keeps the old ID and is
+    // demoted like every other row in the group.
+    const winner = rows.find((d) => d.decision === "Use Postgres")!
+    expect(winner.id).toBe("dup")
+    for (const d of rows) {
+      // No row may be silently treated as the confirmed review target, and a
+      // deterministic re-read must observe the same demotion.
+      expect(d.foundational).toBe(false)
+      expect(d.foundational_requested).toBe(true)
+      expect((d as { human_review?: unknown }).human_review).toBeUndefined()
+      expect(d.provenance?.extractor).toBe("legacy")
+      expect(d.provenance?.confidence).toBe("legacy")
+    }
+  })
+
+  it("3. lineage references to the old shared ID are preserved and point at the canonical winner", () => {
+    const result = loadAndMigrate(v3StateWith([
+      {
+        id: "dup", topic: "database", decision: "Use Postgres", timestamp: "2026-08-01T00:00:00.000Z",
+        session_id: "s1", still_valid: false, provenance: llmProvision("s1"),
+      },
+      {
+        id: "dup", topic: "database", decision: "Use MySQL", timestamp: "2026-08-02T00:00:00.000Z",
+        session_id: "s2", still_valid: true, provenance: llmProvision("s2"),
+      },
+      {
+        id: "hist", topic: "database", decision: "Use SQLite", timestamp: "2026-08-03T00:00:00.000Z",
+        session_id: "s3", still_valid: false,
+        conflicts_with: ["dup", "other"], superseded_by: "dup", derived_from_decision_id: "dup",
+        provenance: llmProvision("s3"),
+      },
+    ]))
+
+    expect(result).not.toBeNull()
+    const winner = result!.decisions.find((d) => d.decision === "Use Postgres")!
+    expect(winner.id).toBe("dup")
+    const hist = result!.decisions.find((d) => d.id === "hist")!
+    // References to the canonical winner are unchanged (it kept its old ID);
+    // unrelated references are preserved.
+    expect(hist.conflicts_with).toEqual(["dup", "other"])
+    expect(hist.superseded_by).toBe("dup")
+    expect(hist.derived_from_decision_id).toBe("dup")
+  })
+
+  it("4. an overlong legacy ID is repaired deterministically within MAX_IDENTIFIER", () => {
+    const longId = "x".repeat(300)
+    const state = v3StateWith([
+      {
+        id: longId, topic: "database", decision: "Use Postgres", timestamp: "2026-08-01T00:00:00.000Z",
+        session_id: "s1", still_valid: true, foundational_requested: true, provenance: llmProvision("s1"),
+      },
+    ])
+
+    const first = loadAndMigrate(JSON.parse(JSON.stringify(state)))!
+    const second = loadAndMigrate(JSON.parse(JSON.stringify(state)))!
+    expect(first).not.toBeNull()
+    // The overlong ID is re-identified to a bounded deterministic digest.
+    expect(first.decisions[0]!.id.length).toBeLessThanOrEqual(256)
+    expect(first.decisions[0]!.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
+    // Deterministic across repeated read-only loads.
+    expect(first.decisions[0]!.id).toBe(second.decisions[0]!.id)
+    expect(first.decisions[0]!.decision).toBe("Use Postgres")
+    expect(first.decisions[0]!.session_id).toBe("s1")
   })
 })

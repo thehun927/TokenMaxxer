@@ -7,10 +7,11 @@
  * filesystem behavior and can therefore leave the prior file untouched when
  * this function returns null.
  */
-import { randomUUID } from "node:crypto"
+import { createHash } from "node:crypto"
 import {
   CacheQuarantineMetadataSchema,
   LLMExtractionCacheEntrySchema,
+  MAX_IDENTIFIER,
   MemoryFileSchema,
   type MemoryFile,
   type Provenance,
@@ -105,24 +106,39 @@ function migrateActiveFile(value: unknown, fallbackSource: unknown): unknown {
 }
 
 /**
- * PR 3 wave-9 (Blocker 2) — deterministic duplicate-decision-ID repair.
+ * PR 3 wave-9/10 (Blocker 2) — deterministic duplicate-decision-ID repair.
  *
  * Pre-PR3 files may contain two rows sharing one `id` because uniqueness was
  * never enforced. Since the stable decision ID is the human-review trust
  * address, a single confirmation token must never be able to upgrade two rows.
  * On load we repair such files deterministically:
  *
- *  - every row in a duplicate-ID group receives a fresh UUID v4 `id`, keeping
- *    its semantic fields (topic/decision/rationale/evidence/session);
  *  - the deterministically-oldest row (timestamp asc, then lexical ID asc) is
- *    the canonical "winner";
- *  - any `superseded_by` / `conflicts_with` / `derived_from_decision_id`
- *    reference that pointed at the old shared ID is rewritten to point at the
- *    winner's fresh ID;
- *  - if ANY row in the group carries `human_review`, ALL rows in the group are
- *    demoted to `foundational=false` + `foundational_requested=true` (legacy
- *    repair) so the human must re-confirm against the resolved unique row —
- *    one duplicate is never silently treated as the confirmed review target.
+ *    the canonical "winner" and KEEPS its old shared ID, so existing lineage
+ *    references (`superseded_by` / `conflicts_with` /
+ *    `derived_from_decision_id`) to the old ID naturally continue to point at
+ *    the canonical winner with no rewrite;
+ *  - every other row in a duplicate group receives a deterministic derived ID:
+ *    a fixed-length 36-char digest (SHA-256 of the old ID + a stable group
+ *    ordinal + a domain separator), chosen over a sequential
+ *    `${oldId}-dup-${ordinal}` form because it is always within
+ *    `MAX_IDENTIFIER` regardless of legacy ID length and immune to any
+ *    characters appearing in a legacy ID;
+ *  - an overlong legacy ID (> `MAX_IDENTIFIER`, which pre-wave-9 v3 allowed)
+ *    is repaired with the same digest (ordinal 0) so such files still load
+ *    instead of being rejected by the v3 ID bound (wave-10 Concern B);
+ *  - if ANY row in a duplicate group carries `human_review`, ALL rows in the
+ *    group (the canonical winner included) are demoted to
+ *    `foundational=false` + `foundational_requested=true` (legacy repair) so
+ *    the human must re-confirm against the resolved unique row — one duplicate
+ *    is never silently treated as the confirmed review target, and a
+ *    deterministic re-read observes the same demotion.
+ *
+ * Because `loadAndMigrate` is pure (it never persists the migration on a
+ * read), the repair MUST be a pure function of the input bytes. No
+ * `randomUUID()` may appear here: the same on-disk state must produce the same
+ * repaired IDs on every load, or an ID exposed by `decisions`/`recall_decision`
+ * could not be acted on by the transaction's `bypassCache: true` re-read.
  */
 function repairDuplicateDecisionIds(decisions: unknown[]): unknown[] {
   const rows = decisions.map((value) => (isRecord(value) ? { ...value } : value))
@@ -137,13 +153,17 @@ function repairDuplicateDecisionIds(decisions: unknown[]): unknown[] {
     else byId.set(id, [row])
   }
 
+  // old ID -> replacement ID. Only populated when a row's old ID is actually
+  // being removed (overlong IDs). For a non-overlong duplicate group the
+  // canonical winner preserves the old ID, so references to it need no rewrite.
   const idRewrite = new Map<string, string>()
 
   for (const [id, group] of byId) {
-    if (group.length < 2) continue
+    const overlong = id.length > MAX_IDENTIFIER
+    if (group.length < 2 && !overlong) continue
 
-    // Deterministic winner: oldest timestamp asc, then lexical ID asc.
-    const winner = group.slice().sort((a, b) => {
+    // Deterministic order: oldest timestamp asc, then lexical ID asc.
+    const sorted = group.slice().sort((a, b) => {
       const ta = Date.parse(typeof a.timestamp === "string" ? a.timestamp : "")
       const tb = Date.parse(typeof b.timestamp === "string" ? b.timestamp : "")
       const aOk = Number.isFinite(ta)
@@ -152,14 +172,10 @@ function repairDuplicateDecisionIds(decisions: unknown[]): unknown[] {
       if (aOk && !bOk) return -1
       if (!aOk && bOk) return 1
       return String(a.id).localeCompare(String(b.id))
-    })[0]!
+    })
+    const winner = sorted[0]!
 
-    for (const row of group) {
-      row.id = randomUUID()
-    }
-    idRewrite.set(id, String(winner.id))
-
-    if (group.some((row) => row.human_review !== undefined)) {
+    if (group.length >= 2 && group.some((row) => row.human_review !== undefined)) {
       for (const row of group) {
         row.foundational = false
         row.foundational_requested = true
@@ -180,11 +196,23 @@ function repairDuplicateDecisionIds(decisions: unknown[]): unknown[] {
         }
       }
     }
+
+    // Canonical winner keeps its old ID unless that ID is overlong (wave-10
+    // Concern B); every non-winner duplicate receives a deterministic derived
+    // ID keyed on its stable sorted ordinal within the group.
+    sorted.forEach((row, index) => {
+      if (row === winner && !overlong) return
+      row.id = derivedDecisionId(id, index)
+    })
+
+    if (overlong) {
+      idRewrite.set(id, String(winner.id))
+    }
   }
 
   if (idRewrite.size === 0) return rows
 
-  // Rewrite lineage references that pointed at a now-removed duplicate ID.
+  // Rewrite lineage references that pointed at a now-removed overlong ID.
   for (const row of rows) {
     if (!isRecord(row)) continue
     for (const field of ["superseded_by", "derived_from_decision_id"] as const) {
@@ -202,6 +230,20 @@ function repairDuplicateDecisionIds(decisions: unknown[]): unknown[] {
   }
 
   return rows
+}
+
+/**
+ * Deterministic derived decision ID for a non-canonical duplicate (or an
+ * overlong legacy ID). Returns a fixed-length 36-char UUID-shaped digest of the
+ * old ID plus a stable group ordinal, so the result is always within
+ * `MAX_IDENTIFIER` regardless of the legacy ID's length or characters.
+ */
+function derivedDecisionId(oldId: string, ordinal: number): string {
+  const ordinalTag = ordinal.toString(36).padStart(2, "0")
+  const digest = createHash("sha256")
+    .update(`tokenmaxxer-pr3-migrate:v1:${oldId}:${ordinalTag}`)
+    .digest("hex")
+  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`
 }
 
 function migrateCurrentTask(data: RawRecord, fallbackSource: unknown): RawRecord {
@@ -323,10 +365,12 @@ export function loadAndMigrate(raw: unknown): MemoryFile | null {
     }
   }
 
-  // PR 3 wave-9 (Blocker 2) — repair duplicate decision IDs before the v3
-  // schema's uniqueness invariant rejects the file. Fresh IDs are assigned to
-  // every duplicate and lineage references are rewritten to the canonical
-  // (deterministically-oldest) row.
+  // PR 3 wave-9/10 (Blocker 2) — repair duplicate decision IDs before the v3
+  // schema's uniqueness invariant rejects the file. The repair is a pure,
+  // deterministic function of the input bytes (the canonical oldest row keeps
+  // its old ID; non-winners receive deterministic derived IDs; overlong legacy
+  // IDs are re-identified to the v3 bound), so every read-only load produces
+  // the same repaired IDs and lineage references.
   if (Array.isArray(data.decisions)) {
     data = {
       ...data,
