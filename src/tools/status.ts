@@ -6,14 +6,12 @@
  * index.ts can update the timestamp when the compaction hook fires.
  */
 import { tool } from "@opencode-ai/plugin"
-import { readMemory, resolveProjectPath } from "../memory/store"
+import { readMemoryState, resolveProjectPath } from "../memory/store"
 import { getProjectQueueStatus } from "../memory/lock"
 import {
   getLLMEvidenceStats,
   getLastLLMModelResolution,
 } from "../memory/extract-llm"
-import { safeRead } from "../util/fs"
-import { join } from "node:path"
 
 // --- Module-level state (updated by index.ts) ---
 
@@ -30,14 +28,12 @@ export async function _tokenmaxxerStatus(
   context: { worktree: string; directory: string },
 ): Promise<string> {
   try {
-    const mem = await readMemory({
+    const result = await readMemoryState({
       worktree: context.worktree,
       directory: context.directory,
     })
+    const mem = result.memory
     const project = resolveProjectPath(context.worktree, context.directory)
-    const path = join(project, ".opencode", "memory", "STATE.json")
-    const content = await safeRead(path)
-    const size = content === null ? 0 : Buffer.byteLength(content, "utf8")
     const queue = getProjectQueueStatus(project)
     const evidenceStats = getLLMEvidenceStats()
     const decisions = mem?.decisions ?? []
@@ -71,7 +67,9 @@ export async function _tokenmaxxerStatus(
 
     return [
       `Project: ${mem?.project_path ?? "none"}`,
-      `Memory file: ${path} (${size} bytes)`,
+      `Memory file: ${result.path ?? "none"} (${result.sizeBytes} bytes)`,
+      `Memory source: ${result.source ?? "none"}`,
+      `Memory revision: ${result.revision}`,
       `Decisions: ${mem?.decisions.length ?? 0} (${mem?.decisions.filter((d) => d.still_valid).length ?? 0} valid)`,
       `Active files: ${mem?.active_files.length ?? 0}`,
       `Last updated: ${mem?.last_updated ?? "never"}`,

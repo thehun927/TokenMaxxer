@@ -163,6 +163,8 @@ export type LLMAuditMetadata = z.infer<typeof LLMAuditMetadataSchema>
 
 const MemoryFileBaseSchema = z.object({
   version: z.literal(3),
+  /** Monotonic logical freshness signal. Additive: existing STATE files load with revision 0. */
+  revision: z.number().int().nonnegative().default(0),
   project_path: z.string(),
   last_updated: z.string().datetime({ offset: true }).or(z.string()), // ISO 8601
   last_git_sha: z.string().optional(),
@@ -236,6 +238,7 @@ export type MemoryFile = Omit<
 export function emptyMemory(worktree: string): MemoryFile {
   return {
     version: 3,
+    revision: 0,
     project_path: worktree,
     last_updated: new Date().toISOString(),
     active_files: [],

@@ -117,4 +117,27 @@ describe("MemoryFile v3 bounded schemas", () => {
       active_files: [{ ...validActiveFile, provenance: undefined }],
     }))).toBeNull()
   })
+
+  it("emptyMemory starts at revision 0", () => {
+    const memory = emptyMemory("/project")
+    expect(memory.revision).toBe(0)
+  })
+
+  it("parses a v3 STATE object without revision and defaults it to 0", () => {
+    const raw = {
+      version: 3,
+      project_path: "/project",
+      last_updated: "2026-08-09T00:00:00.000Z",
+      active_files: [validActiveFile],
+      decisions: [validDecision],
+      blockers: [],
+      next_steps: [],
+      recent_sessions: [],
+      current_task: "Keep the migration readable",
+      current_task_provenance: legacyProvenance,
+    }
+    expect("revision" in raw).toBe(false)
+    const parsed = MemoryFileSchema.parse(raw)
+    expect(parsed.revision).toBe(0)
+  })
 })

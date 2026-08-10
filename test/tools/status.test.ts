@@ -4,16 +4,11 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 
 vi.mock("../../src/memory/store", () => ({
-  readMemory: vi.fn(),
+  readMemoryState: vi.fn(),
   resolveProjectPath: vi.fn((worktree: string, directory: string) => directory),
 }))
 
-vi.mock("../../src/util/fs", () => ({
-  safeRead: vi.fn(),
-}))
-
-import { readMemory } from "../../src/memory/store"
-import { safeRead } from "../../src/util/fs"
+import { readMemoryState } from "../../src/memory/store"
 import {
   _tokenmaxxerStatus,
   lastCompactionTimestamp,
@@ -67,6 +62,22 @@ const mockContext = {
   directory: "/home/user/my-project",
 }
 
+// Build a MemoryReadResult for the mocked readMemoryState.
+function statusResult(
+  memory: Record<string, unknown> | null,
+  overrides: Record<string, unknown> = {},
+) {
+  const statePath = join(mockContext.directory, ".opencode", "memory", "STATE.json")
+  return {
+    memory,
+    source: memory ? "project" : null,
+    path: memory ? statePath : null,
+    sizeBytes: 0,
+    revision: 0,
+    ...overrides,
+  }
+}
+
 describe("_tokenmaxxerStatus", () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -76,8 +87,7 @@ describe("_tokenmaxxerStatus", () => {
   })
 
   it("with memory: returns formatted status with counts", async () => {
-    vi.mocked(readMemory).mockResolvedValue(makeMemory())
-    vi.mocked(safeRead).mockResolvedValue('{"version":1}')
+    vi.mocked(readMemoryState).mockResolvedValue(statusResult(makeMemory(), { sizeBytes: 13 }))
     setLastCompaction("2026-08-08T11:00:00.000Z")
 
     const result = await _tokenmaxxerStatus({}, mockContext)
@@ -95,8 +105,9 @@ describe("_tokenmaxxerStatus", () => {
 
   it("reports STATE.json size using UTF-8 bytes", async () => {
     const content = '{"note":"café"}'
-    vi.mocked(readMemory).mockResolvedValue(makeMemory())
-    vi.mocked(safeRead).mockResolvedValue(content)
+    vi.mocked(readMemoryState).mockResolvedValue(statusResult(makeMemory(), {
+      sizeBytes: Buffer.byteLength(content, "utf8"),
+    }))
 
     const result = await _tokenmaxxerStatus({}, mockContext)
 
@@ -105,8 +116,7 @@ describe("_tokenmaxxerStatus", () => {
   })
 
   it("without memory: returns 'none' for fields", async () => {
-    vi.mocked(readMemory).mockResolvedValue(null)
-    vi.mocked(safeRead).mockResolvedValue(null)
+    vi.mocked(readMemoryState).mockResolvedValue(statusResult(null))
 
     const result = await _tokenmaxxerStatus({}, mockContext)
 
@@ -120,8 +130,7 @@ describe("_tokenmaxxerStatus", () => {
   })
 
   it("lastCompactionTimestamp not set: shows 'none'", async () => {
-    vi.mocked(readMemory).mockResolvedValue(makeMemory())
-    vi.mocked(safeRead).mockResolvedValue("{}")
+    vi.mocked(readMemoryState).mockResolvedValue(statusResult(makeMemory(), { sizeBytes: 2 }))
     // lastCompactionTimestamp was reset to null in beforeEach
 
     const result = await _tokenmaxxerStatus({}, mockContext)
@@ -131,7 +140,7 @@ describe("_tokenmaxxerStatus", () => {
 
   it("shows bounded provenance summaries without evidence text", async () => {
     const evidence = [{ kind: "transcript", ref: "tr-1", digest: "a".repeat(64) }]
-    vi.mocked(readMemory).mockResolvedValue(makeMemory({
+    vi.mocked(readMemoryState).mockResolvedValue(statusResult(makeMemory({
       current_task_provenance: {
         extractor: "llm",
         source_session_id: "source-1",
@@ -148,8 +157,7 @@ describe("_tokenmaxxerStatus", () => {
           evidence,
         },
       }],
-    }))
-    vi.mocked(safeRead).mockResolvedValue("{}")
+    }), { sizeBytes: 2 }))
 
     const result = await _tokenmaxxerStatus({}, mockContext)
 
@@ -170,7 +178,7 @@ describe("_tokenmaxxerStatus", () => {
         connected: ["provider"],
       } })) },
     }, "/home/user/my-project")
-    vi.mocked(readMemory).mockResolvedValue(makeMemory({ model_health: [{
+    vi.mocked(readMemoryState).mockResolvedValue(statusResult(makeMemory({ model_health: [{
       provider_id: "provider",
       model_id: "model",
       last_outcome: "timeout",
@@ -178,8 +186,7 @@ describe("_tokenmaxxerStatus", () => {
       last_outcome_at: "2026-08-08T12:00:00.000Z",
       cooldown_until: "2026-08-08T12:30:00.000Z",
       failure_reason: "timeout",
-    }] }))
-    vi.mocked(safeRead).mockResolvedValue("{}")
+    }] }), { sizeBytes: 2 }))
 
     const result = await _tokenmaxxerStatus({}, mockContext)
 
@@ -230,8 +237,9 @@ describe("_tokenmaxxerStatus", () => {
           }],
         })],
       ])
-      vi.mocked(readMemory).mockImplementation(async ({ directory }) => memories.get(directory) ?? null)
-      vi.mocked(safeRead).mockResolvedValue("{}")
+      vi.mocked(readMemoryState).mockImplementation(async ({ directory }) =>
+        statusResult(memories.get(directory) ?? null)
+      )
 
       const statusA = await _tokenmaxxerStatus({}, {
         worktree: projectA,
@@ -267,7 +275,7 @@ describe("_tokenmaxxerStatus", () => {
   })
 
   it("catches errors and returns error string", async () => {
-    vi.mocked(readMemory).mockRejectedValue(new Error("disk failure"))
+    vi.mocked(readMemoryState).mockRejectedValue(new Error("disk failure"))
 
     const result = await _tokenmaxxerStatus({}, mockContext)
 

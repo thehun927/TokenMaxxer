@@ -1,102 +1,201 @@
 /**
  * Memory store — read/write STATE.json with caching, corruption recovery,
  * and global fallback for read-only worktrees.
+ *
+ * Authoritative reads go through `readFileResult`, which distinguishes
+ * "missing" from "unreadable".  A read error is never silently treated as a
+ * missing file and never authorizes empty-memory initialization.
  */
+import { readFileResult, safeRead, getMtime, atomicWrite } from "../util/fs"
+import type { FileReadResult } from "../util/fs"
+import { resolveProjectPath, projectMemoryPath, globalMemoryPath } from "./paths"
 import { loadAndMigrate } from "./migrate"
-import { atomicWrite, safeRead, getMtime } from "../util/fs"
 import { emptyMemory, MemoryFileSchema } from "./schema"
 import type { MemoryFile } from "./schema"
-import { join } from "node:path"
-import { createHash } from "node:crypto"
-import { homedir } from "node:os"
 import { log } from "../util/log"
 import { MEMORY_MAX_BYTES, memorySizeBytes, serializeMemory } from "./memory-size"
 
-/**
- * Module-level cache keyed by worktree.
- * Includes mtime for multi-instance cache invalidation.
- */
-const cache = new Map<string, { mem: MemoryFile | null; mtime: number }>()
+export type MemorySource = "project" | "global"
 
-/** Path to STATE.json within a worktree. */
-function memoryPath(worktree: string): string {
-  return join(worktree, ".opencode", "memory", "STATE.json")
+export type MemoryReadResult = {
+  memory: MemoryFile | null
+  source: MemorySource | null
+  path: string | null
+  sizeBytes: number
+  revision: number
 }
 
-/** Fallback global path when worktree is read-only. */
-function globalPath(worktree: string): string {
-  // Simple hash: hex-encode the first 16 chars of worktree path
-  const hash = createHash("sha256").update(worktree).digest("hex").slice(0, 16)
-  return join(homedir(), ".config", "opencode", "memory", hash, "STATE.json")
-}
+/** A single candidate file's cached read outcome plus its invalidation mtime. */
+type CacheEntry = { mtime: number | null; readResult: FileReadResult }
 
 /**
- * Resolve the effective project path for memory storage.
- * `worktree` is the git worktree root, but in non-git directories opencode
- * sets it to "/" (root), which is not writable. Fall back to `directory`
- * (the session CWD) when worktree is "/" or otherwise invalid.
+ * Module-level cache keyed by the resolved project path.
+ * Tracks BOTH candidates (local + global) so a change to either file
+ * invalidates the cached selection, not merely a change to the selected one.
  */
-export function resolveProjectPath(worktree: string, directory: string): string {
-  if (!worktree || worktree === "/" || worktree === "") {
-    return directory
-  }
-  return worktree
+type CacheValue = {
+  local: CacheEntry | null
+  global: CacheEntry | null
+  selected: MemoryReadResult
 }
 
+const cache = new Map<string, CacheValue>()
+
+/** Classification of one candidate after reading, parsing, and migrating. */
+type Candidate =
+  | { kind: "memory"; memory: MemoryFile; sizeBytes: number; revision: number }
+  | { kind: "error"; code?: string }
+  | { kind: "none" }
+
 /**
- * Read the memory file for a worktree.
- * Returns null if no memory file exists.
- * If the file is corrupt, backs it up and returns emptyMemory.
+ * Turn a raw typed read into a candidate:
+ *  - missing → none
+ *  - error (unreadable) → explicit error state, never treated as missing
+ *  - ok + parseable + valid → memory
+ *  - ok + corrupt (bad JSON or invalid shape) → backed up and treated as none
  */
-export async function readMemory({
-  worktree,
-  directory,
-}: {
-  worktree: string
-  directory: string
-}): Promise<MemoryFile | null> {
-  const project = resolveProjectPath(worktree, directory)
-  const path = memoryPath(project)
-  const mtime = await getMtime(path)
-
-  // Cache check with mtime invalidation (fixes multi-instance incoherence)
-  const cached = cache.get(project)
-  if (cached && mtime !== null && cached.mtime === mtime) {
-    return cached.mem
-  }
-  if (cached && mtime === null && cached.mem === null) {
-    // File still doesn't exist — cached null is valid
-    return null
-  }
-
-  const raw = await safeRead(path)
-  if (raw === null) {
-    cache.set(project, { mem: null, mtime: mtime ?? 0 })
-    return null
-  }
+async function candidateFrom(path: string, result: FileReadResult): Promise<Candidate> {
+  if (result.kind === "missing") return { kind: "none" }
+  if (result.kind === "error") return { kind: "error", code: result.code }
 
   let parsed: unknown
   try {
-    parsed = JSON.parse(raw)
+    parsed = JSON.parse(result.content)
   } catch {
-    // Corrupt JSON — back up and return empty
-    await backupCorrupt(path, raw)
-    const empty = emptyMemory(project)
-    cache.set(project, { mem: empty, mtime: mtime ?? 0 })
-    return empty
+    await backupCorrupt(path, result.content)
+    return { kind: "none" }
   }
 
   const mem = loadAndMigrate(parsed)
   if (mem === null) {
-    // Valid JSON but invalid shape — back up and return empty
-    await backupCorrupt(path, raw)
-    const empty = emptyMemory(project)
-    cache.set(project, { mem: empty, mtime: mtime ?? 0 })
-    return empty
+    await backupCorrupt(path, result.content)
+    return { kind: "none" }
   }
 
-  cache.set(project, { mem, mtime: mtime ?? 0 })
-  return mem
+  return {
+    kind: "memory",
+    memory: mem,
+    sizeBytes: Buffer.byteLength(result.content, "utf8"),
+    // `MemoryFile` models the construction input shape, where the zod
+    // `default(0)` makes `revision` optional. `loadAndMigrate` always applies
+    // the default, so `?? 0` is a pure type-level guard.
+    revision: mem.revision ?? 0,
+  }
+}
+
+function resultFromCandidate(
+  source: MemorySource,
+  path: string,
+  candidate: Extract<Candidate, { kind: "memory" }>,
+): MemoryReadResult {
+  return {
+    memory: candidate.memory,
+    source,
+    path,
+    sizeBytes: candidate.sizeBytes,
+    revision: candidate.revision,
+  }
+}
+
+/**
+ * Deterministic selection between the two candidates:
+ *  - both parseable → higher revision wins; equal revision → project wins
+ *  - exactly one parseable → it wins (even when the other is unreadable)
+ *  - neither parseable:
+ *      - both unreadable → no memory + a bounded warning (never empty init)
+ *      - otherwise (missing/corrupt involved) → no memory, no warning
+ */
+function selectCandidate(
+  localPath: string,
+  globalPath: string,
+  local: Candidate,
+  global: Candidate,
+  client?: unknown,
+): MemoryReadResult {
+  if (local.kind === "memory" && global.kind === "memory") {
+    if (global.revision > local.revision) {
+      return resultFromCandidate("global", globalPath, global)
+    }
+    return resultFromCandidate("project", localPath, local)
+  }
+  if (local.kind === "memory") return resultFromCandidate("project", localPath, local)
+  if (global.kind === "memory") return resultFromCandidate("global", globalPath, global)
+
+  if (local.kind === "error" && global.kind === "error") {
+    void log(client, "warn", "memory read failed for both candidates", {
+      project: localPath,
+      global: globalPath,
+      projectError: local.code ?? "",
+      globalError: global.code ?? "",
+    })
+  }
+  return { memory: null, source: null, path: null, sizeBytes: 0, revision: 0 }
+}
+
+/**
+ * Read the current authoritative memory state for a project.
+ *
+ * Resolves the project path (so non-git `worktree === "/"` still records the
+ * real directory), inspects both the project-local and the global fallback
+ * STATE files, and selects one deterministically.  Returns the selected
+ * file's source, path, byte size, revision, and parsed memory — or an explicit
+ * "no memory / cannot be safely determined" result.
+ */
+export async function readMemoryState(args: {
+  worktree: string
+  directory: string
+  bypassCache?: boolean
+  client?: unknown
+}): Promise<MemoryReadResult> {
+  const project = resolveProjectPath(args.worktree, args.directory)
+  const localPath = projectMemoryPath(project)
+  const globalPath = globalMemoryPath(project)
+
+  const localMtime = await getMtime(localPath)
+  const globalMtime = await getMtime(globalPath)
+
+  const cached = cache.get(project)
+  if (
+    !args.bypassCache &&
+    cached &&
+    cached.local?.mtime === localMtime &&
+    cached.global?.mtime === globalMtime
+  ) {
+    return cached.selected
+  }
+
+  const [localRead, globalRead] = await Promise.all([
+    readFileResult(localPath),
+    readFileResult(globalPath),
+  ])
+  const localCandidate = await candidateFrom(localPath, localRead)
+  const globalCandidate = await candidateFrom(globalPath, globalRead)
+  const selected = selectCandidate(
+    localPath,
+    globalPath,
+    localCandidate,
+    globalCandidate,
+    args.client,
+  )
+
+  cache.set(project, {
+    local: { mtime: localMtime, readResult: localRead },
+    global: { mtime: globalMtime, readResult: globalRead },
+    selected,
+  })
+
+  return selected
+}
+
+/**
+ * Read the selected memory file for a project, or null when no authoritative
+ * memory is available.  Compatibility wrapper over `readMemoryState`.
+ */
+export async function readMemory(args: {
+  worktree: string
+  directory: string
+}): Promise<MemoryFile | null> {
+  return (await readMemoryState(args)).memory
 }
 
 /**
@@ -115,7 +214,7 @@ export async function writeMemory(
     // the final guard against an unproven LLM cache or provenance-less fact.
     return false
   }
-  const path = memoryPath(project)
+  const path = projectMemoryPath(project)
   const json = serializeMemory(validated.data)
   const bytes = memorySizeBytes(validated.data)
 
@@ -135,7 +234,7 @@ export async function writeMemory(
   } catch {
     // Project path read-only — try global fallback
     try {
-      await atomicWrite(globalPath(project), json)
+      await atomicWrite(globalMemoryPath(project), json)
     } catch {
       // Both paths failed — give up silently (don't throw from event handler)
       cache.delete(project)
@@ -152,6 +251,7 @@ export async function writeMemory(
 }
 
 export { emptyMemory } from "./schema"
+export { resolveProjectPath } from "./paths"
 
 /**
  * Back up a corrupt STATE.json file by copying it to a timestamped path.

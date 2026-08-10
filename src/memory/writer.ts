@@ -42,6 +42,7 @@ import {
 import { log } from "../util/log"
 import { beginMemoryActivity } from "./activity-state"
 import { MEMORY_MAX_BYTES, memorySizeBytes } from "./memory-size"
+import * as writerModule from "./writer"
 
 const TRANSCRIPT_WINDOW = 50
 const MAX_DIAGNOSTIC_VALUE = 200
@@ -67,6 +68,24 @@ function logLLMDiagnostic(client: unknown, diagnostic: LLMExtractionDiagnostic):
 
   // Logging must never delay or change extraction/memory behavior.
   void log(client, level, "llm extraction diagnostic", extra)
+}
+
+/**
+ * Best-effort HEADER generation. A successful STATE write must remain
+ * successful even if the derivative HEADER write fails, so failures here are
+ * logged and swallowed rather than propagated to the caller.
+ */
+async function writeHeaderBestEffort(
+  client: unknown,
+  worktree: string,
+  directory: string,
+  mem: MemoryFile,
+): Promise<void> {
+  try {
+    await writerModule.generateHeader(worktree, directory, mem)
+  } catch (error) {
+    void log(client, "warn", "header generation failed", { error: String(error) })
+  }
 }
 
 /** The ephemeral deterministic candidate used by provenance construction. */
@@ -217,6 +236,7 @@ export async function writeMemoryOnIdle(opts: IdleWriteOptions): Promise<IdleWri
 async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<IdleWriteOutcome> {
   try {
     const { client, worktree, directory, sessionId } = opts
+    const project = resolveProjectPath(worktree, directory)
 
     const c = client as {
       session?: {
@@ -230,7 +250,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     if (!allMessages || allMessages.length === 0) return "no-messages"
 
     const messages = allMessages.slice(-TRANSCRIPT_WINDOW)
-    const existing = (await readMemory({ worktree, directory })) ?? emptyMemory(worktree)
+    const existing = (await readMemory({ worktree, directory })) ?? emptyMemory(project)
     // Operational audit guards, like the result cache itself, must not change
     // the identity of the same source transcript on a later idle/reload.
     const canonicalPrior = { ...existing, llm_extraction_audits: undefined }
@@ -257,7 +277,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     // un-serialized prompt, so stop before model discovery in that case.
     const heuristicPersisted = await writeMemory({ worktree, directory, client }, pruned)
     if (heuristicPersisted === false) return "write-failed"
-    await generateHeader(worktree, directory, pruned)
+    await writeHeaderBestEffort(client, worktree, directory, pruned)
 
     if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
       void log(client, "debug", "llm extraction skipped: TOKENMAXXER_LLM_EXTRACT is disabled", {
@@ -329,7 +349,6 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       }
     }
 
-    const project = resolveProjectPath(worktree, directory)
     const projectName = basename(project) || project
     let extractionAuditSessionID: string | undefined
     const persistAudit: AuditCreatedCallback = async (audit) => {
@@ -433,7 +452,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     const finalMemory = pruneOld(withCache, client)
     const committed = await writeMemory({ worktree, directory, client }, finalMemory)
     if (committed === false) return "llm-failed"
-    await generateHeader(worktree, directory, finalMemory)
+    await writeHeaderBestEffort(client, worktree, directory, finalMemory)
     void log(client, "info", "llm extraction facts merged")
     return "llm-success"
   } catch {
@@ -502,8 +521,9 @@ async function mergeAsyncFacts(
   sessionId: string,
   mergeOptions: MergeOptions,
 ): Promise<boolean> {
+  const project = resolveProjectPath(opts.worktree, opts.directory)
   const latest = (await readMemory({ worktree: opts.worktree, directory: opts.directory }))
-    ?? emptyMemory(opts.worktree)
+    ?? emptyMemory(project)
   const merged = mergeMemory(latest, facts, {
     sessionId,
     gitSha,
@@ -516,7 +536,7 @@ async function mergeAsyncFacts(
     finalMemory,
   )
   if (!persisted) return false
-  await generateHeader(opts.worktree, opts.directory, finalMemory)
+  await writeHeaderBestEffort(opts.client, opts.worktree, opts.directory, finalMemory)
   return true
 }
 
