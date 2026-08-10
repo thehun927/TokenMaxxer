@@ -66,3 +66,9 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] Retained the pinned-compatibility path for the verified 1.18.15 minimum SDK that lacks global.health.
 - [design-decision] Structured-output compatibility casts remain centralized in llm-adapter.ts (V1ClientLike shape).
 - [test-gap] §12 D fixtures (items 24-34) now green.
+
+## 2026-08-10 — wave-5 graceful degradation through real writer
+- [design-decision] Writer order matches plan §9: heuristic extraction + commit first, optional cache/model work second, structured host gate third; gate rejection skips audit/prompt entirely.
+- [design-decision] Rejected gate (unsupported-version / unhealthy / malformed-envelope / health-request-failed) commits heuristic memory but never calls session.create / session.prompt.
+- [design-decision] Pinned-compatibility and accepted gates proceed with the optional structured-extraction flow unchanged.
+- [test-gap] §12 E fixtures (items 35-38) now green; item 39 control case continues to pass.
