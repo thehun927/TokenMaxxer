@@ -58,3 +58,17 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] A legacy-only authority is one whose provenance is undefined, extractor "legacy", or confidence "legacy"; only those may be superseded by an evidence-backed LLM conflict (plan §7.2).
 - [scope-deviation] plan §7 requires mergeMemory to delegate to mergeDecisions, so src/memory/writer.ts was edited minimally (decision block replaced by a delegation call; dead llmEvidenceFor/randomUUID removed). All non-decision merge logic preserved verbatim.
 - [test-gap] 8 PR 3 merge tests now green; existing merge tests still pass.
+
+## 2026-08-10 — wave-5 authority-aware reader + recall redesign
+- [design-decision] queryDecisions now uses resolveDecisionAuthorities().authorities, not raw still_valid filtering.
+- [design-decision] getDecisionById returns the decision by exact ID regardless of still_valid; callers check authority view themselves.
+- [design-decision] _recallDecision exposes the stable decision ID in a bounded marker for copyability.
+- [design-decision] _getProjectState includes a bounded 'Decision conflicts: ...' line per conflicting-human-foundational topic.
+- [design-decision] _recallPromote now uses {decision_id} OR {topic} (one-release compat); exact-ID is preferred and authoritative.
+- [design-decision] _recallPromote mutation sets ONLY foundational_requested=true; never touches foundational, provenance, or human_review.
+- [design-decision] Topic compatibility path refuses multiple-authority / conflict state with a bounded message.
+- [design-decision] _recallPromote uses one mutateMemory transaction; no separate pre-read.
+- [test-gap] 10 PR 3 recall tests now green; existing recall tests still pass.
+- [design-decision] Topic compatibility additionally requires exactly ONE raw still_valid row for the normalized topic (test 27 refuses two conflicting raw-valid rows even though resolution picks one authority); unresolved duplicate-valid raw state is refused rather than resolved silently.
+- [design-decision] Typed outcomes: requested / already-reviewed / not-found / not-authoritative / conflict / ambiguous; unavailable STATE maps to 'No project memory.', lock-timeout/commit-failed map to bounded 'promotion-write-failed'.
+- [test-gap] test/memory/recall.test.ts PR 2 §11.G/§15.14 cross-process test asserts pre-PR3 promotion semantics ("Promoted:", "confidence=human-reviewed", foundational=true on disk). It already failed at baseline (Wave 2 schema validation rejected the old human-minting mutation), and cannot pass under PR 3 §9 without updating the test. Out of Wave 5 scope (only test/tools/recall.test.ts is touchable); the PR 2 cross-process promotion test needs a Wave 8 test update to assert review-request semantics. Full-suite failures reduced from 14 to 5 (2 Wave 6 module-load + 4 Wave 7 prune + this one pre-existing).

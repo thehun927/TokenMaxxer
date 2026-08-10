@@ -11,6 +11,8 @@ vi.mock("../../src/memory/reader", () => ({
   queryDecisions: vi.fn(),
   getActiveFiles: vi.fn(),
   getProjectState: vi.fn(),
+  getDecisionById: vi.fn(),
+  getDecisionAuthorityConflicts: vi.fn(),
 }))
 
 import { readMemory, writeMemory, mutateMemory, resolveProjectPath } from "../../src/memory/store"
@@ -277,8 +279,8 @@ describe("_recallPromote", () => {
 
   // Drive the real mutateMemory callback against a base memory and return the
   // committed result, mirroring how the production transaction applies it.
-  // After commit, readMemory returns the promoted memory so the tool's label
-  // reflects the human-reviewed provenance.
+  // After commit, readMemory returns the mutated memory so the review-request
+  // effect can be inspected.
   function mockMutateCommitted(base: ReturnType<typeof makeMemory>) {
     vi.mocked(mutateMemory).mockImplementation(async (_args, mutate) => {
       const action = mutate(structuredClone(base), {
@@ -297,7 +299,7 @@ describe("_recallPromote", () => {
     })
   }
 
-  it("with existing topic: sets foundational=true via mutateMemory", async () => {
+  it("with existing topic: requests review via mutateMemory (sets only foundational_requested)", async () => {
     const mem = makeMemory({
       decisions: [
         makeDecision({
@@ -314,8 +316,12 @@ describe("_recallPromote", () => {
 
     expect(mutateMemory).toHaveBeenCalledTimes(1)
     expect(writeMemory).not.toHaveBeenCalled()
-    expect(result).toContain("Promoted: database: Use PostgreSQL")
-    expect(result).toContain("confidence=human-reviewed")
+    expect(result).toContain("Foundational review requested for d1")
+    expect(result).toContain("tokenmaxxer promote d1")
+    const post = await readMemory({ worktree: mockContext.worktree, directory: mockContext.directory })
+    const target = post!.decisions.find((d) => d.id === "d1")!
+    expect(target.foundational_requested).toBe(true)
+    expect(target.foundational).toBe(false)
   })
 
   it("uses the shared resolved project path for promotion", async () => {
@@ -329,27 +335,46 @@ describe("_recallPromote", () => {
     expect(resolveProjectPath).toHaveBeenCalledWith("/", "/home/user/non-git-project")
   })
 
-  it("with missing topic: returns error string and does not commit", async () => {
+  it("with missing topic: returns a bounded not-found message and does not commit", async () => {
     const mem = makeMemory()
     mockMutateCommitted(mem)
     vi.mocked(readMemory).mockResolvedValue(mem)
 
     const result = await _recallPromote({ topic: "nonexistent" }, mockContext)
 
-    expect(result).toBe('No decision with topic "nonexistent".')
+    expect(result).toContain("nonexistent")
+    expect(result).not.toContain("Foundational review requested")
     expect(writeMemory).not.toHaveBeenCalled()
   })
 
-  it("when no memory: returns 'No project memory.'", async () => {
-    vi.mocked(readMemory).mockResolvedValue(null)
-    vi.mocked(mutateMemory).mockResolvedValue({ status: "noop", value: { outcome: "noop" }, revision: 0 })
+  it("requires exactly one selector (decision_id xor topic)", async () => {
+    const mem = makeMemory()
+    mockMutateCommitted(mem)
+    vi.mocked(readMemory).mockResolvedValue(mem)
+
+    const neither = await _recallPromote({}, mockContext)
+    expect(neither).toMatch(/exactly one selector/i)
+    expect(mutateMemory).not.toHaveBeenCalled()
+
+    const both = await _recallPromote({ decision_id: "d1", topic: "database" }, mockContext)
+    expect(both).toMatch(/exactly one selector/i)
+    expect(mutateMemory).not.toHaveBeenCalled()
+  })
+
+  it("with no memory: returns a bounded not-found message and never mints trust", async () => {
+    vi.mocked(mutateMemory).mockResolvedValue({
+      status: "noop",
+      value: { outcome: "not-found", topic: "database" },
+      revision: 0,
+    })
 
     const result = await _recallPromote({ topic: "database" }, mockContext)
 
-    expect(result).toBe("No project memory.")
+    expect(result).toContain("No decision for topic 'database'")
+    expect(writeMemory).not.toHaveBeenCalled()
   })
 
-  it("case-insensitive topic match", async () => {
+  it("case-insensitive topic match requests review of the authority", async () => {
     const mem = makeMemory({
       decisions: [
         makeDecision({
@@ -364,11 +389,14 @@ describe("_recallPromote", () => {
 
     const result = await _recallPromote({ topic: "database" }, mockContext)
 
-    expect(result).toContain("Promoted: Database: Use PostgreSQL")
-    expect(result).toContain("confidence=human-reviewed")
+    expect(result).toContain("Foundational review requested for d1")
+    const post = await readMemory({ worktree: mockContext.worktree, directory: mockContext.directory })
+    const target = post!.decisions.find((d) => d.id === "d1")!
+    expect(target.foundational_requested).toBe(true)
+    expect(target.foundational).toBe(false)
   })
 
-  it("records explicit human-review provenance and clears the request flag", async () => {
+  it("preserves provenance and sets only foundational_requested for a review request", async () => {
     const mem = makeMemory({
       decisions: [makeDecision({
         foundational: false,
@@ -390,7 +418,7 @@ describe("_recallPromote", () => {
       { ...mockContext, sessionID: "human-review-session" },
     )
 
-    // The mutation applied to the base must carry the human-review provenance.
+    // The mutation applied to the base must NOT touch trust/identity fields.
     const action = vi.mocked(mutateMemory).mock.calls[0][1](structuredClone(mem), {
       status: "ok",
       memory: mem,
@@ -401,17 +429,17 @@ describe("_recallPromote", () => {
     })
     if (action.kind !== "commit") throw new Error("expected commit")
     expect(action.memory.decisions[0]).toMatchObject({
-      foundational: true,
-      foundational_requested: false,
+      foundational: false,
+      foundational_requested: true,
       provenance: {
-        extractor: "human",
-        source_session_id: "human-review-session",
+        extractor: "llm",
+        source_session_id: "source-llm",
         source_audit_session_id: "audit-llm",
-        confidence: "human-reviewed",
+        confidence: "llm-corroborated",
       },
     })
-    expect(result).toContain("audit=audit-llm")
-    expect(result).toContain("evidence=1")
+    expect(result).toContain("Foundational review requested for d1")
+    expect(result).not.toContain("confidence=human-reviewed")
   })
 
   it("catches errors and returns error string", async () => {
@@ -433,20 +461,24 @@ describe("_recallPromote", () => {
     expect(writeMemory).not.toHaveBeenCalled()
   })
 
-  it("returns a bounded failure string on unavailable STATE", async () => {
+  it("returns 'No project memory.' on unavailable STATE", async () => {
     const mem = makeMemory()
     vi.mocked(mutateMemory).mockResolvedValue({ status: "unavailable" })
     vi.mocked(readMemory).mockResolvedValue(mem)
 
     const result = await _recallPromote({ topic: "database" }, mockContext)
 
-    expect(result).toBe("promotion-write-failed")
+    expect(result).toBe("No project memory.")
     expect(writeMemory).not.toHaveBeenCalled()
   })
 
-  it("serializes promotion after a concurrent idle write", async () => {
+  it("serializes the review request after a concurrent idle write", async () => {
     let stored = makeMemory()
     vi.mocked(readMemory).mockImplementation(async () => structuredClone(stored))
+    vi.mocked(writeMemory).mockImplementation(async (_ctx, mem) => {
+      stored = structuredClone(mem)
+      return true
+    })
     vi.mocked(mutateMemory).mockImplementation(async (_args, mutate) => {
       const action = mutate(structuredClone(stored), {
         status: "ok",
@@ -489,14 +521,12 @@ describe("_recallPromote", () => {
     releaseIdle()
     await Promise.all([idle, promotion])
 
+    // Both logical mutations survive: the idle write's task and the review
+    // request on the decision. No human trust was minted.
+    expect(stored.current_task).toBe("idle update")
     expect(stored.decisions[0]).toMatchObject({
-      foundational: true,
-      foundational_requested: false,
-      provenance: {
-        extractor: "human",
-        source_session_id: "human-review-session",
-        confidence: "human-reviewed",
-      },
+      foundational: false,
+      foundational_requested: true,
     })
   })
 })
@@ -533,26 +563,9 @@ describe("PR 3 §8/§9 authority-aware reads and review request", () => {
   }
 
   /**
-   * Wave 1B adapter shim: the current production `_recallPromote` API is
-   * `{ topic }`. The PR 3 redesign (Wave 5) ships `{ decision_id?; topic? }`.
-   * Until the API change lands, this shim resolves a decision_id to its topic
-   * against the seeded base memory so the topic path can be driven. The shim
-   * is removed once Wave 5 ships the exact-ID API.
+   * Wave 5 ships the exact-ID API `{ decision_id?; topic? }`; the Wave 1B
+   * adapter shim is removed and tests drive `_recallPromote` directly.
    */
-  async function recallPromote(
-    args: { decision_id?: string; topic?: string },
-    context: typeof mockContext,
-  ): Promise<string> {
-    if (args.decision_id !== undefined && args.topic === undefined) {
-      const mem = await readMemory({ worktree: context.worktree, directory: context.directory })
-      const target = mem?.decisions.find((d) => d.id === args.decision_id)
-      if (!target) {
-        return _recallPromote({ topic: args.decision_id }, context)
-      }
-      return _recallPromote({ topic: target.topic }, context)
-    }
-    return _recallPromote({ topic: args.topic ?? "" }, context)
-  }
 
   it("19. recall_decision exposes stable decision IDs", async () => {
     const mem = makeMemory({
@@ -652,7 +665,7 @@ describe("PR 3 §8/§9 authority-aware reads and review request", () => {
     mockMutateCommitted(mem)
     vi.mocked(readMemory).mockResolvedValue(mem)
 
-    const result = await recallPromote({ decision_id: "llm-1" }, mockContext)
+    const result = await _recallPromote({ decision_id: "llm-1" }, mockContext)
 
     const post = await readMemory({ worktree: mockContext.worktree, directory: mockContext.directory })
     const target = post!.decisions.find((d) => d.id === "llm-1")!
@@ -680,7 +693,7 @@ describe("PR 3 §8/§9 authority-aware reads and review request", () => {
     mockMutateCommitted(mem)
     vi.mocked(readMemory).mockResolvedValue(mem)
 
-    const result = await recallPromote({ decision_id: "nonexistent" }, mockContext)
+    const result = await _recallPromote({ decision_id: "nonexistent" }, mockContext)
 
     expect(result).not.toContain("Promoted:")
     expect(result).toMatch(/no decision|not found|not-found|refus/i)
@@ -714,7 +727,7 @@ describe("PR 3 §8/§9 authority-aware reads and review request", () => {
     mockMutateCommitted(mem)
     vi.mocked(readMemory).mockResolvedValue(mem)
 
-    const result = await recallPromote({ decision_id: "duplicate-2" }, mockContext)
+    const result = await _recallPromote({ decision_id: "duplicate-2" }, mockContext)
 
     expect(result).not.toContain("Promoted:")
     expect(result).toMatch(/refus|ambiguous|not-authoritative|not authoritative|conflict|decision_id/i)
@@ -742,7 +755,7 @@ describe("PR 3 §8/§9 authority-aware reads and review request", () => {
     mockMutateCommitted(mem)
     vi.mocked(readMemory).mockResolvedValue(mem)
 
-    const result = await recallPromote({ decision_id: "human-1" }, mockContext)
+    const result = await _recallPromote({ decision_id: "human-1" }, mockContext)
 
     expect(result).not.toContain("Promoted:")
     expect(result).toMatch(/already|no-op|noop|foundational|review/i)
@@ -762,7 +775,7 @@ describe("PR 3 §8/§9 authority-aware reads and review request", () => {
     mockMutateCommitted(mem)
     vi.mocked(readMemory).mockResolvedValue(mem)
 
-    const result = await recallPromote({ topic: "Auth" }, mockContext)
+    const result = await _recallPromote({ topic: "Auth" }, mockContext)
 
     expect(result).not.toMatch(/refus|ambiguous|not-authoritative|not authoritative|conflict/i)
     const post = await readMemory({ worktree: mockContext.worktree, directory: mockContext.directory })
@@ -781,7 +794,7 @@ describe("PR 3 §8/§9 authority-aware reads and review request", () => {
     mockMutateCommitted(mem)
     vi.mocked(readMemory).mockResolvedValue(mem)
 
-    const result = await recallPromote({ topic: "auth" }, mockContext)
+    const result = await _recallPromote({ topic: "auth" }, mockContext)
 
     expect(result).not.toContain("Promoted:")
     expect(result).toMatch(/refus|ambiguous|not-authoritative|not authoritative|conflict|decision_id/i)
@@ -809,7 +822,7 @@ describe("PR 3 §8/§9 authority-aware reads and review request", () => {
     mockMutateCommitted(mem)
     vi.mocked(readMemory).mockResolvedValue(mem)
 
-    const result = await recallPromote({ decision_id: "llm-1" }, mockContext)
+    const result = await _recallPromote({ decision_id: "llm-1" }, mockContext)
 
     const post = await readMemory({ worktree: mockContext.worktree, directory: mockContext.directory })
     const target = post!.decisions.find((d) => d.id === "llm-1")!
