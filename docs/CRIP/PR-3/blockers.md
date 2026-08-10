@@ -100,3 +100,11 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] The 10/5 pressure stage target applies to DISPOSABLE rows: all foundational rows plus up to `target` newest non-foundational rows are kept. This reconciles the plan §13.3 illustrative snippet (`target - foundationals.length`) with release-gate test 42, which requires the newest disposable row (recent-0) to survive alongside 10 foundationals; tests are the spec.
 - [design-decision] Irreducible over-cap behavior: pruneOld may intentionally return over-cap state; commitMemoryExact rejects the commit; prior STATE remains intact. NO silent foundational deletion.
 - [test-gap] 5 PR 3 prune tests now green; existing prune tests still pass. Full-suite failures are now exactly 1 intended Wave 8 cross-process recall update (PR 2 §11.G/§15.14).
+
+## 2026-08-10 — wave-8 adversarial / integration pass
+- [design-decision] Cross-process recall test updated to assert review-request semantics (foundational_requested=true, not foundational=true; no human_review; confidence != human-reviewed) — test/memory/recall.test.ts — PR 3 §9 forbids the pre-PR3 promotion assertions the old test made.
+- [test-gap] New adversarial concurrent tests added (idle+CLI promote, idle+recall_promote review, idle+CLI supersede, supersede+idle concurrent) — test/cli.test.ts, test/memory/recall.test.ts, test/memory/transaction.test.ts, test/memory/writer.test.ts — all use barrier-driven child fixtures.
+- [test-gap] CLI smoke tests: dist/cli.js non-empty, launcher routes opencode/decisions/promote/supersede, installer syntax valid — test/cli-smoke/smoke.sh, test/cli-smoke/launcher.test.ts, package.json scripts.check-cli-bundle / verify-cli-bundle / smoke:cli.
+- [design-decision] CLI concurrent tests use barrier files (not startup race) for deterministic overlap — hold-write child signals ready and holds the lock while the CLI contends; the transaction revalidates the exact ID after the human typed confirmation.
+- [design-decision] The vitest launcher smoke (test 48) is `describe.skipIf` when dist/cli.js is absent so the unit suite stays green without a build; the shell smoke (46-49) is the CI-after-build verification step.
+- [flakiness] 5x adversarial run of all test files green; no new flakiness.

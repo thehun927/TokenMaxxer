@@ -7,7 +7,8 @@ import {
 } from "../../src/memory/writer"
 import type { TranscriptMessage } from "../../src/types"
 import { emptyMemory } from "../../src/memory/schema"
-import { readMemory } from "../../src/memory/store"
+import { readMemory, mutateMemory, writeMemory } from "../../src/memory/store"
+import { confirmFoundationalReview } from "../../src/memory/decision-review"
 import { globalMemoryPath, projectMemoryPath } from "../../src/memory/paths"
 import { readFileSync } from "node:fs"
 import { mkdir, mkdtemp, readFile, rm, writeFile, access, chmod } from "node:fs/promises"
@@ -719,5 +720,82 @@ describe("writeMemoryOnIdle heuristic transaction (Wave 3)", () => {
     const onDisk = JSON.parse(raw) as { revision: number; decisions: Array<{ topic: string }> }
     expect(onDisk.revision).toBe(2)
     expect(onDisk.decisions.some((decision) => decision.topic === "global-durable-topic")).toBe(true)
+  })
+})
+
+describe("writeMemoryOnIdle rebases on concurrent decision mutations (PR 3 §7 adversarial)", () => {
+  it("idle heuristic write preserves a concurrently confirmed human promotion", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
+    const project = await worktree()
+
+    // Seed one review-requested authority at revision 5.
+    const seeded = emptyMemory(project)
+    seeded.revision = 5
+    seeded.decisions = [{
+      id: "d-auth",
+      topic: "auth",
+      decision: "Use JWT",
+      timestamp: "2026-08-01T00:00:00.000Z",
+      session_id: "seed",
+      still_valid: true,
+      foundational: false,
+      foundational_requested: true,
+      provenance: {
+        extractor: "llm",
+        source_session_id: "s-llm",
+        source_audit_session_id: "a-llm",
+        confidence: "llm-corroborated",
+        evidence: [],
+      },
+    }]
+    await writeMemory({ worktree: project, directory: project }, seeded)
+
+    const client = clientFor({ source: messages() })
+    const reviewedAt = "2026-08-10T00:00:00.000Z"
+
+    // The human promotion and the idle heuristic write run CONCURRENTLY through
+    // the real filesystem lock (they use different process-queue keys, so the
+    // PR 2 cross-process lock is what serializes them). Whichever commits
+    // first, the other must rebase on the newest revision: mergeDecisions must
+    // preserve the trusted human foundational authority and must not duplicate
+    // it, and the idle write's session record must still land.
+    const idle = writeMemoryOnIdle({
+      client,
+      worktree: project,
+      directory: project,
+      sessionId: "source",
+    })
+    const promote = mutateMemory<{ outcome: string }>(
+      { worktree: project, directory: project },
+      (memory) => {
+        const mutation = confirmFoundationalReview(memory, "d-auth", reviewedAt)
+        if (mutation.kind === "confirmed") {
+          return { kind: "commit", memory: mutation.memory, value: { outcome: "confirmed" } }
+        }
+        return { kind: "noop", value: { outcome: "failed" } }
+      },
+    )
+    const [idleOutcome, promoteResult] = await Promise.all([idle, promote])
+
+    expect(idleOutcome).toBe("heuristic-only")
+    expect(promoteResult.status).toBe("committed")
+
+    const memory = await readMemory({ worktree: project, directory: project })
+    expect(memory).not.toBeNull()
+    const target = memory!.decisions.find((d) => d.id === "d-auth")!
+    // The human promotion survived the idle write's rebase.
+    expect(target.foundational).toBe(true)
+    expect(target.foundational_requested).toBe(false)
+    expect(target.human_review?.channel).toBe("interactive-cli")
+    expect(target.human_review?.reviewed_at).toBe(reviewedAt)
+    expect(target.provenance?.extractor).toBe("human")
+    expect(target.provenance?.confidence).toBe("human-reviewed")
+    // The idle write's session was still recorded on top of the promotion.
+    expect(memory!.last_session_id).toBe("source")
+    // Exactly one authority for the topic survives (no duplicate rows).
+    const authRows = memory!.decisions.filter((d) => d.topic === "auth" && d.still_valid)
+    expect(authRows).toHaveLength(1)
+    // Promotion (+1) and idle write (+1) each committed once.
+    expect(memory!.revision).toBe(7)
   })
 })

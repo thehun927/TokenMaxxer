@@ -583,3 +583,53 @@ describe("unavailable STATE fails closed under transaction (PR 2 §15.20)", () =
     expect(writeSpy).not.toHaveBeenCalled()
   })
 })
+
+describe("recall_promote review request serializes with a concurrent idle write (PR 3 §9)", () => {
+  it("final STATE carries both the review request and the idle-write fact", async () => {
+    const project = join(homeDir, "proj-rev")
+    const statePath = projectMemoryPath(project)
+    await writeState(statePath, seedDecisionJson(project, 10))
+
+    const preBarrier = join(homeDir, "rev-pre")
+    const armed = join(homeDir, "rev-armed")
+    barrierFiles.push(preBarrier, armed)
+
+    // The child reaches its pre-mutation barrier (armed) and only then commits.
+    // The parent's review request therefore commits FIRST; the child's
+    // mutateMemory rebases on the request's revision and must preserve it.
+    const child = runWorker([project, "barrier-write", preBarrier, "rev", armed])
+    await waitFor(armed)
+
+    const result = await _recallPromote(
+      { decision_id: "d-db" },
+      { worktree: project, directory: project, sessionID: "review-session" },
+    )
+    expect(result).toContain("Foundational review requested for d-db")
+
+    await writeFile(preBarrier, "go", "utf-8")
+    const { code } = await child
+    expect(code).toBe(0)
+
+    const onDisk = await readOnDisk(statePath)
+    expect(onDisk.revision).toBe(12)
+    const ids = onDisk.decisions.map((d) => d.id)
+    expect(ids).toContain("fact-rev")
+    const raw = await readFile(statePath, "utf-8")
+    const parsed = JSON.parse(raw) as {
+      decisions: Array<{
+        id: string
+        foundational_requested?: boolean
+        foundational?: boolean
+        provenance?: { confidence?: string; extractor?: string }
+        human_review?: unknown
+      }>
+    }
+    const target = parsed.decisions.find((d) => d.id === "d-db")!
+    // The idle write preserved the review request: no trust was minted.
+    expect(target.foundational_requested).toBe(true)
+    expect(target.foundational).toBe(false)
+    expect(target.provenance?.confidence).toBe("heuristic")
+    expect(target.provenance?.extractor).toBe("heuristic")
+    expect(target.human_review).toBeUndefined()
+  })
+})

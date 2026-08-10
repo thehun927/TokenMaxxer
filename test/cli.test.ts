@@ -293,21 +293,22 @@ describe("PR 3 §11 human CLI", () => {
   })
 
   it("37. concurrent idle write + CLI promotion both survive", async () => {
-    await seedState({ ...emptyMemory(project), revision: 10 })
-    const ready = join(dir, "idle-ready")
-    barrierFiles.push(ready, `${ready}.release`)
-
-    // Fork an idle-write child that holds the lock, signals, then mutates.
-    const child = runWorker([project, "hold-write", ready, "idle"])
-
-    const io = makeIo("auth-1")
-    // Seed the authority AFTER the child is forked so the CLI promotes it.
+    // Seed the authority BEFORE forking so both the CLI's pre-TTY read and the
+    // child's mutation observe the same base. One valid authority, already
+    // marked for foundational review.
     await seedState({
       ...emptyMemory(project),
       revision: 10,
       decisions: [mkDecision({ id: "auth-1", topic: "auth", decision: "Use JWT", provenance: llmProv, foundational_requested: true })],
     })
+    const ready = join(dir, "idle-ready")
+    barrierFiles.push(ready, `${ready}.release`)
 
+    // Fork an idle-write child that holds the lock, signals, then mutates.
+    const child = runWorker([project, "hold-write", ready, "idle"])
+    await waitFor(ready) // child owns the lock; the CLI must contend for it.
+
+    const io = makeIo("auth-1") // TTY-true IO returns the exact decision ID.
     const promotion = runCli(["promote", "auth-1"], { project, io })
     await writeFile(`${ready}.release`, "go", "utf-8")
     await Promise.all([child, promotion])
@@ -319,6 +320,11 @@ describe("PR 3 §11 human CLI", () => {
     expect(ids).toContain("fact-idle")
     const target = state.decisions.find((d) => d.id === "auth-1")!
     expect(target.foundational).toBe(true)
+    expect(target.foundational_requested).toBe(false)
+    expect(target.human_review?.channel).toBe("interactive-cli")
+    expect(target.human_review?.reviewed_at).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+    expect(target.provenance?.extractor).toBe("human")
+    expect(target.provenance?.confidence).toBe("human-reviewed")
   })
 
   it("38. supersede refuses unrelated-topic candidate", async () => {
@@ -373,5 +379,50 @@ describe("PR 3 §11 human CLI", () => {
     expect((newAuthority as { derived_from_decision_id?: string }).derived_from_decision_id).toBe("candidate-1")
     expect(newAuthority.provenance?.extractor).toBe("human")
     expect(newAuthority.provenance?.confidence).toBe("human-reviewed")
+  })
+
+  it("40x. concurrent idle write + human supersession both survive (§15.40 adversarial)", async () => {
+    // Seed the human-with-conflict case BEFORE forking so the CLI's pre-TTY
+    // read and the child's mutation observe the same base.
+    await seedState({
+      ...emptyMemory(project),
+      revision: 10,
+      decisions: [
+        mkDecision({ id: "authority-1", topic: "auth", decision: "Use JWT", foundational: true, human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00Z" }, provenance: humanProv }),
+        mkDecision({ id: "candidate-1", topic: "auth", decision: "Use OAuth2", still_valid: false, provenance: llmProv, conflicts_with: ["authority-1"] }),
+      ],
+    })
+    const ready = join(dir, "supersede-idle-ready")
+    barrierFiles.push(ready, `${ready}.release`)
+
+    // Fork an idle-write child that holds the lock, signals, then mutates.
+    const child = runWorker([project, "hold-write", ready, "sup"])
+    await waitFor(ready) // child owns the lock; the CLI must contend for it.
+
+    const io = makeIo("candidate-1") // TTY-true IO returns the candidate ID.
+    const supersede = runCli(["supersede", "candidate-1", "--replaces", "authority-1"], { project, io })
+    await writeFile(`${ready}.release`, "go", "utf-8")
+    await Promise.all([child, supersede])
+
+    const state = await readState()
+    // idle write (+1) and CLI supersession (+1) both survived.
+    expect(state.revision).toBe(12)
+    const ids = state.decisions.map((d) => d.id)
+    expect(ids).toContain("fact-sup")
+    // Exactly one new human authority for the topic.
+    const authorities = state.decisions.filter((d) => d.topic === "auth" && d.still_valid)
+    expect(authorities).toHaveLength(1)
+    const newAuthority = authorities[0]!
+    expect(newAuthority.foundational).toBe(true)
+    expect(newAuthority.decision).toBe("Use OAuth2")
+    expect((newAuthority as { derived_from_decision_id?: string }).derived_from_decision_id).toBe("candidate-1")
+    expect(newAuthority.human_review?.channel).toBe("interactive-cli")
+    expect(newAuthority.provenance?.extractor).toBe("human")
+    expect(newAuthority.provenance?.confidence).toBe("human-reviewed")
+    // The old authority is invalidated and un-foundationalized.
+    const oldAuthority = state.decisions.find((d) => d.id === "authority-1")!
+    expect(oldAuthority.still_valid).toBe(false)
+    expect(oldAuthority.foundational).toBe(false)
+    expect(oldAuthority.superseded_by).toBe(newAuthority.id)
   })
 })

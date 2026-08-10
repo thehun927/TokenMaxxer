@@ -33,8 +33,11 @@
     }
   },
   "scripts": {
-    "build": "tsup src/index.ts src/tui.tsx --format esm --dts --no-splitting --clean --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opentui/solid --external @opentui/core --external @opentui/keymap --external zod && tsup src/cli.ts --format esm --target node18 --out-dir dist --dts --no-splitting",
+    "build": "tsup src/index.ts src/tui.tsx --format esm --dts --no-splitting --clean --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opentui/solid --external @opentui/core --external @opentui/keymap --external zod && tsup src/cli.ts --format esm --target node18 --out-dir dist --dts --no-splitting && npm run check-cli-bundle",
     "build:cli": "tsup src/cli.ts --format esm --target node18 --out-dir dist --dts --no-splitting",
+    "check-cli-bundle": "test -s dist/cli.js || (echo 'missing dist/cli.js' >&2; exit 1)",
+    "verify-cli-bundle": "bash -n install.sh && bash -n bin/tokenmaxxer && npm run check-cli-bundle && grep -q 'CLI_PLUGIN_URL=.*dist/cli.js' install.sh && echo 'verify-cli-bundle: OK'",
+    "smoke:cli": "bash test/cli-smoke/smoke.sh",
     "test": "vitest run",
     "test:watch": "vitest"
   },

@@ -3,10 +3,13 @@
  *
  * These tests prove the `recall_promote` tool's mutation is transactional
  * against a real OS child process running the real `mutateMemory`/lock
- * implementation. A concurrent idle write must not erase the promotion.
+ * implementation. A concurrent idle write must not erase the review request.
  *
- * Promotion authority/human-review semantics are intentionally UNCHANGED
- * (PR 3 will redesign them); only the persistence mechanism is under test.
+ * PR 3 §9 redesigns `recall_promote` as a review-request tool: the ONLY
+ * mutation is `foundational_requested = true`, and it never mints human trust.
+ * The cross-process test asserts those post-PR3 semantics (foundational_requested
+ * survives the concurrent idle write; `foundational` stays false, no
+ * `human_review`, confidence is never `human-reviewed`).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { spawn } from "node:child_process"
@@ -103,7 +106,14 @@ function seedMemoryJson(project: string, revision: number): string {
 
 async function readOnDisk(path: string): Promise<{
   revision: number
-  decisions: Array<{ id: string; topic: string; foundational: boolean }>
+  decisions: Array<{
+    id: string
+    topic: string
+    foundational: boolean
+    foundational_requested?: boolean
+    provenance?: { extractor?: string; confidence?: string }
+    human_review?: { channel?: string; reviewed_at?: string }
+  }>
 }> {
   const raw = await readFile(path, "utf-8")
   return JSON.parse(raw)
@@ -124,7 +134,7 @@ afterEach(async () => {
 })
 
 describe("recall_promote is transactional against a concurrent idle write (PR 2 §11.G, §15.14)", () => {
-  it("both the promotion and the idle write survive; neither is erased", async () => {
+  it("both the review request and the idle write survive; neither is erased", async () => {
     const project = join(homeDir, "proj")
     const statePath = projectMemoryPath(project)
     await atomicWrite(statePath, seedMemoryJson(project, 10))
@@ -139,13 +149,14 @@ describe("recall_promote is transactional against a concurrent idle write (PR 2 
     await waitFor(held) // child holds the lock.
 
     // Drive the real recall_promote tool in this process for the same project.
-    // It must block on the lock until the child releases.
+    // It must block on the lock until the child releases. PR 3 §9: this is a
+    // review request by exact stable decision ID, never a promotion.
     const promotePromise = _recallPromote(
-      { topic: "database" },
+      { decision_id: "d-db" },
       { worktree: project, directory: project, sessionID: "human-review-session" },
     )
 
-    // Give the promotion a moment to contend, then release the child so it
+    // Give the request a moment to contend, then release the child so it
     // commits its idle write and releases the lock.
     await sleep(100)
     await writeFile(`${held}.release`, "go", "utf-8")
@@ -153,19 +164,28 @@ describe("recall_promote is transactional against a concurrent idle write (PR 2 
     const result = await promotePromise
     const { code } = await child
     expect(code).toBe(0)
-    expect(result).toContain("Promoted: database: Use PostgreSQL")
-    expect(result).toContain("confidence=human-reviewed")
+    expect(result).toContain("Foundational review requested for d-db")
+    expect(result).not.toContain("Promoted:")
+    expect(result).not.toContain("confidence=human-reviewed")
 
-    // Final STATE must contain BOTH the promotion's effect (foundational=true,
-    // human provenance) AND the idle write's appended fact. The promotion was
-    // not erased by the concurrent idle write.
+    // Final STATE must contain BOTH the review request's effect
+    // (foundational_requested=true, trust/identity fields untouched) AND the
+    // idle write's appended fact. The review request was not erased by the
+    // concurrent idle write.
     const onDisk = await readOnDisk(statePath)
     const db = onDisk.decisions.find((d) => d.topic === "database")
     expect(db).toBeDefined()
-    expect(db?.foundational).toBe(true)
+    expect(db?.foundational_requested).toBe(true)
+    // PR 3 §9: foundational stays false; provenance/human_review are untouched.
+    expect(db?.foundational).toBe(false)
+    expect(db?.provenance?.confidence).toBe("heuristic")
+    expect(db?.provenance?.confidence).not.toBe("human-reviewed")
+    expect(db?.provenance?.extractor).toBe("heuristic")
+    expect(db?.provenance?.extractor).not.toBe("human")
+    expect(db?.human_review).toBeUndefined()
     const ids = onDisk.decisions.map((d) => d.id)
     expect(ids).toContain("fact-child")
-    // Two logical mutations (promotion + idle write) advanced revision twice.
+    // Two logical mutations (review request + idle write) advanced revision twice.
     expect(onDisk.revision).toBe(12)
   })
 })
