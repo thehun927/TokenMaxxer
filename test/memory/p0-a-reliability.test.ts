@@ -507,12 +507,13 @@ describe("P0-A idle reliability", () => {
 
     // Project write fails (a directory sits at the STATE path), so the write
     // lands on the global fallback — which must still carry the durable
-    // decision (revision 2 → 3 after the successful merge write).
+    // decision. Raw `writeMemory` no longer advances revision (PR 2 §8); the
+    // writer's revision advancement is migrated to `mutateMemory` in Wave 3.
     expect(outcome).toBe("heuristic-only")
 
     const raw = await readFile(globalPath, "utf-8")
     const onDisk = JSON.parse(raw) as { revision: number; decisions: Array<{ topic: string }> }
-    expect(onDisk.revision).toBe(3)
+    expect(onDisk.revision).toBe(2)
     expect(onDisk.decisions.some((decision) => decision.topic === "global-durable-topic")).toBe(true)
   })
 })

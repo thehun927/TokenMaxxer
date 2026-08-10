@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { chmod, mkdir, mkdtemp, readFile, rm, utimes } from "node:fs/promises"
+import { spawn } from "node:child_process"
+import { access, chmod, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
 
-import { readMemory, readMemoryState, writeMemory } from "../../src/memory/store"
+import { readMemory, readMemoryState, writeMemory, mutateMemory } from "../../src/memory/store"
 import {
   globalMemoryPath,
   projectMemoryPath,
@@ -14,6 +16,32 @@ import { atomicWrite } from "../../src/util/fs"
 
 const worktrees: string[] = []
 let homeDir: string
+
+const WORKER = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "fixtures",
+  "transaction-worker.ts",
+)
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitFor(path: string, timeoutMs = 5000): Promise<void> {
+  const start = Date.now()
+  for (;;) {
+    try {
+      await access(path)
+      return
+    } catch {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`timed out waiting for ${path}`)
+      }
+      await sleep(10)
+    }
+  }
+}
 
 async function makeWorktree(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "tokenmaxxer-store-"))
@@ -204,16 +232,34 @@ describe("readMemoryState selection", () => {
 })
 
 describe("revision monotonicity (PR 1 Blocker 1)", () => {
-  it("sequential writes advance revision 0 → 1 → 2", async () => {
+  it("mutateMemory advances revision 0 → 1 → 2", async () => {
     const project = await makeWorktree()
 
-    expect(await writeMemory({ worktree: project, directory: project }, emptyMemory(project))).toBe(true)
-    const first = await readMemory({ worktree: project, directory: project })
-    expect(first?.revision).toBe(1)
+    const first = await mutateMemory(
+      { worktree: project, directory: project },
+      (memory) => ({ kind: "commit", memory, value: null }),
+    )
+    expect(first.status).toBe("committed")
+    expect(first.revision).toBe(1)
 
-    expect(await writeMemory({ worktree: project, directory: project }, first!)).toBe(true)
-    const second = await readMemory({ worktree: project, directory: project })
-    expect(second?.revision).toBe(2)
+    const second = await mutateMemory(
+      { worktree: project, directory: project },
+      (memory) => ({ kind: "commit", memory, value: null }),
+    )
+    expect(second.status).toBe("committed")
+    expect(second.revision).toBe(2)
+
+    const read = await readMemory({ worktree: project, directory: project })
+    expect(read?.revision).toBe(2)
+  })
+
+  it("writeMemory persists the supplied revision exactly (no advancement)", async () => {
+    const project = await makeWorktree()
+    const seeded = { ...emptyMemory(project), revision: 5 }
+
+    expect(await writeMemory({ worktree: project, directory: project }, seeded)).toBe(true)
+    const read = await readMemory({ worktree: project, directory: project })
+    expect(read?.revision).toBe(5)
   })
 
   it("pruneOld preserves a non-zero revision even when other fields are reduced", () => {
@@ -358,5 +404,133 @@ describe("unavailable-state safety (PR 1 Blocker 3)", () => {
     const after = await readMemoryState({ worktree: project, directory: project })
     expect(after.status).toBe("ok")
     expect(after.revision).toBe(4)
+  })
+})
+
+describe("mutateMemory (PR 2 §8)", () => {
+  it("commits revision N -> N+1 and persists the new revision", async () => {
+    const project = await makeWorktree()
+    // Seed at revision 0 via the raw exact-commit primitive (writeMemory).
+    expect(await writeMemory({ worktree: project, directory: project }, emptyMemory(project))).toBe(true)
+    expect((await readMemoryState({ worktree: project, directory: project })).revision).toBe(0)
+
+    const result = await mutateMemory(
+      { worktree: project, directory: project },
+      (memory) => ({
+        kind: "commit",
+        memory: {
+          ...memory,
+          decisions: [
+            ...memory.decisions,
+            {
+              id: "d1",
+              topic: "topic",
+              decision: "decision",
+              timestamp: new Date().toISOString(),
+              session_id: "source",
+              still_valid: true,
+              foundational: false,
+              provenance: {
+                extractor: "heuristic",
+                source_session_id: "source",
+                confidence: "heuristic",
+                evidence: [],
+              },
+            },
+          ],
+        },
+        value: "done",
+      }),
+    )
+
+    expect(result.status).toBe("committed")
+    if (result.status === "committed") {
+      expect(result.value).toBe("done")
+      expect(result.revision).toBe(1)
+    }
+    const read = await readMemoryState({ worktree: project, directory: project })
+    expect(read.status).toBe("ok")
+    if (read.status === "ok") expect(read.revision).toBe(1)
+  })
+
+  it("noop does not bump revision", async () => {
+    const project = await makeWorktree()
+    expect(await writeMemory({ worktree: project, directory: project }, emptyMemory(project))).toBe(true)
+
+    const result = await mutateMemory(
+      { worktree: project, directory: project },
+      () => ({ kind: "noop", value: "noop-value" }),
+    )
+
+    expect(result.status).toBe("noop")
+    if (result.status === "noop") {
+      expect(result.value).toBe("noop-value")
+      expect(result.revision).toBe(0)
+    }
+    const read = await readMemoryState({ worktree: project, directory: project })
+    expect(read.status).toBe("ok")
+    if (read.status === "ok") expect(read.revision).toBe(0)
+  })
+
+  it("returns lock-timeout against a held lock and writes no STATE", async () => {
+    const project = await makeWorktree()
+    const barrier = join(homeDir, "store-lock-barrier")
+    const release = `${barrier}.release`
+
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", WORKER, project, "hold-lock", barrier],
+      { stdio: ["ignore", "pipe", "pipe"], env: process.env },
+    )
+    await waitFor(barrier)
+
+    const result = await mutateMemory(
+      { worktree: project, directory: project, lockOptions: { acquireTimeoutMs: 50, initialBackoffMs: 5, maxBackoffMs: 20 } },
+      (memory) => ({ kind: "commit", memory, value: null }),
+    )
+    expect(result.status).toBe("lock-timeout")
+
+    // No STATE was written.
+    const read = await readMemoryState({ worktree: project, directory: project })
+    expect(read.status).toBe("missing")
+
+    await writeFile(release, "go", "utf-8")
+    await new Promise<void>((resolve, reject) => {
+      child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`worker exited ${code}`))))
+      child.on("error", reject)
+    })
+  })
+
+  it("transaction reads bypass the process cache", async () => {
+    const project = await makeWorktree()
+    const path = projectMemoryPath(project)
+    // Seed at revision 0 and preload the cache.
+    await writeState(path, memoryJson(project, 0))
+    const cached = await readMemoryState({ worktree: project, directory: project })
+    expect(cached.status).toBe("ok")
+    if (cached.status === "ok") expect(cached.revision).toBe(0)
+
+    // Record the mtime the cache observed, then externally replace STATE at
+    // revision 5 while pinning the new file to that same mtime. A non-bypassing
+    // read would reuse the stale cached revision 0; the transaction must not.
+    const originalMtime = (await stat(path)).mtimeMs
+    await writeState(path, memoryJson(project, 5))
+    await utimes(path, new Date(originalMtime), new Date(originalMtime))
+
+    let observedRevision: number | null = null
+    const result = await mutateMemory(
+      { worktree: project, directory: project },
+      (memory) => {
+        observedRevision = memory.revision
+        return { kind: "commit", memory, value: null }
+      },
+    )
+
+    expect(observedRevision).toBe(5)
+    expect(result.status).toBe("committed")
+    if (result.status === "committed") expect(result.revision).toBe(6)
+    const read = await readMemoryState({ worktree: project, directory: project })
+    expect(read.status).toBe("ok")
+    if (read.status === "ok") expect(read.revision).toBe(6)
   })
 })

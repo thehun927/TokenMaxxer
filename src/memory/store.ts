@@ -14,6 +14,11 @@ import { emptyMemory, MemoryFileSchema } from "./schema"
 import type { MemoryFile } from "./schema"
 import { log } from "../util/log"
 import { MEMORY_MAX_BYTES, memorySizeBytes, serializeMemory } from "./memory-size"
+import {
+  withProjectLock,
+  ProjectLockTimeoutError,
+} from "./project-lock"
+import type { ProjectLockOptions } from "./project-lock"
 
 export type MemorySource = "project" | "global"
 
@@ -264,7 +269,13 @@ export async function readMemory(args: {
 }
 
 /**
- * Write the memory file atomically.
+ * Write the supplied memory to disk exactly.
+ *
+ * This is a low-level persistence primitive. It serializes `mem.revision`
+ * exactly as supplied — it does NOT advance revision. Revision advancement is
+ * the sole responsibility of `mutateMemory`. It is retained for the fallback
+ * path and migration; application code should prefer `mutateMemory`.
+ *
  * Tries project path first; falls back to global path if read-only.
  * Never throws — catches and logs on failure.
  */
@@ -273,33 +284,55 @@ export async function writeMemory(
   mem: MemoryFile,
 ): Promise<boolean> {
   const project = resolveProjectPath(worktree, directory)
-  const validated = MemoryFileSchema.safeParse(mem)
+  const committed = await commitMemoryExact(project, mem, { client })
+  return committed.ok
+}
+
+/**
+ * Result of an exact commit. `ok: true` carries the path that was written.
+ */
+type CommitMemoryExactResult =
+  | { ok: true; path: string }
+  | { ok: false; reason: "validation-failed" | "size-cap-exceeded" | "io-failed" }
+
+/**
+ * Internal exact-commit primitive used by `mutateMemory`.
+ *
+ * - validates via `MemoryFileSchema.safeParse`;
+ * - enforces the `MEMORY_MAX_BYTES` byte cap;
+ * - serializes the supplied revision exactly (no increment);
+ * - tries the project-local path first, then the global fallback;
+ * - does NOT perform a preceding read;
+ * - invalidates the process cache on both success and failure.
+ */
+async function commitMemoryExact(
+  project: string,
+  memory: MemoryFile,
+  options?: { client?: unknown },
+): Promise<CommitMemoryExactResult> {
+  const validated = MemoryFileSchema.safeParse(memory)
   if (!validated.success) {
     // Never persist a state that the v3 reader would quarantine. This is also
     // the final guard against an unproven LLM cache or provenance-less fact.
-    return false
+    cache.delete(project)
+    return { ok: false, reason: "validation-failed" }
   }
-  // Every successful logical mutation advances revision by exactly one from
-  // the validated in-memory base. The increment lives INSIDE the write path so
-  // callers never need to pre-increment and can never accidentally persist an
-  // unchanged revision. Serialization, size accounting, and both write paths
-  // (project + global fallback) all use the incremented `next`.
-  const next = { ...validated.data, revision: validated.data.revision + 1 }
-  const path = projectMemoryPath(project)
-  const json = serializeMemory(next)
-  const bytes = memorySizeBytes(next)
+
+  const json = serializeMemory(validated.data)
+  const bytes = memorySizeBytes(validated.data)
 
   if (bytes > MEMORY_MAX_BYTES) {
     // The size limit is a hard storage invariant. Callers may try pruning
     // first, but an unrepresentable state must never reach atomicWrite.
-    void log(client, "error", `tokenmaxxer: STATE.json write rejected: exceeds ${MEMORY_MAX_BYTES}-byte cap`, {
+    void log(options?.client, "error", `tokenmaxxer: STATE.json write rejected: exceeds ${MEMORY_MAX_BYTES}-byte cap`, {
       bytes,
       max_bytes: MEMORY_MAX_BYTES,
     })
     cache.delete(project)
-    return false
+    return { ok: false, reason: "size-cap-exceeded" }
   }
 
+  const path = projectMemoryPath(project)
   try {
     await atomicWrite(path, json)
   } catch {
@@ -309,16 +342,117 @@ export async function writeMemory(
     } catch {
       // Both paths failed — give up silently (don't throw from event handler)
       cache.delete(project)
-      return false
+      return { ok: false, reason: "io-failed" }
     }
     // Even on global fallback success, invalidate the cache
     cache.delete(project)
-    return true
+    return { ok: true, path: globalMemoryPath(project) }
   }
 
   // Invalidate cache after successful write
   cache.delete(project)
-  return true
+  return { ok: true, path }
+}
+
+/**
+ * A single logical mutation action produced by the synchronous mutation
+ * callback. `commit` persists a new memory; `noop` leaves STATE untouched.
+ */
+export type MutationAction<T> =
+  | { kind: "commit"; memory: MemoryFile; value: T }
+  | { kind: "noop"; value: T }
+
+/**
+ * Result of a `mutateMemory` transaction.
+ */
+export type MemoryMutationResult<T> =
+  | { status: "committed"; value: T; revision: number }
+  | { status: "noop"; value: T; revision: number }
+  | { status: "lock-timeout" }
+  | { status: "unavailable" }
+  | { status: "commit-failed" }
+
+/**
+ * The canonical logical mutation primitive.
+ *
+ * Acquires the cross-process project lock, re-reads the authoritative STATE
+ * bypassing the process cache, applies one synchronous in-memory mutation,
+ * advances revision exactly once, and commits atomically.
+ *
+ * Lock ordering (PR 2 §10): the process-local queue in `./lock` is an outer
+ * optimization layer for same-process coalescing/ordering. The filesystem
+ * lock inside `withProjectLock` is the cross-process durability boundary.
+ * This function does not participate in the process-local queue; a caller
+ * that wants same-process coalescing wraps this call in `enqueueProjectJob`.
+ *
+ * The mutation callback is synchronous. If a caller needs an async step
+ * inside the transaction body, it must do so BEFORE calling `mutateMemory`
+ * (PR 2 §12 "no-lock zones").
+ */
+export async function mutateMemory<T>(
+  args: {
+    worktree: string
+    directory: string
+    client?: unknown
+    lockOptions?: ProjectLockOptions
+  },
+  mutate: (
+    memory: MemoryFile,
+    state: MemoryReadResult,
+  ) => MutationAction<T>,
+): Promise<MemoryMutationResult<T>> {
+  const project = resolveProjectPath(args.worktree, args.directory)
+
+  try {
+    return await withProjectLock(project, async () => {
+      const state = await readMemoryState({
+        worktree: args.worktree,
+        directory: args.directory,
+        client: args.client,
+        bypassCache: true, // PR 2 §9: every transaction read bypasses cache
+      })
+
+      if (state.status === "unavailable") {
+        return { status: "unavailable" } as const
+      }
+
+      const base = state.status === "ok"
+        ? state.memory
+        : emptyMemory(project)
+
+      const action = mutate(base, state)
+
+      if (action.kind === "noop") {
+        return {
+          status: "noop",
+          value: action.value,
+          revision: base.revision,
+        } as const
+      }
+
+      const next: MemoryFile = {
+        ...action.memory,
+        revision: base.revision + 1,
+      }
+
+      const committed = await commitMemoryExact(project, next, { client: args.client })
+      if (!committed.ok) {
+        return { status: "commit-failed" } as const
+      }
+
+      return {
+        status: "committed",
+        value: action.value,
+        revision: next.revision,
+      } as const
+    }, args.lockOptions)
+  } catch (error) {
+    if (error instanceof ProjectLockTimeoutError) {
+      return { status: "lock-timeout" }
+    }
+    // Other errors propagate; the lock module releases on throw.
+    throw error
+  }
 }
 
 export { emptyMemory } from "./schema"
