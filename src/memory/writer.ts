@@ -4,13 +4,13 @@
  */
 import type {
   MemoryFile,
-  Decision,
   AuditTerminalOutcome,
   LLMAuditMetadata,
   Evidence,
   Provenance,
 } from "./schema"
 import type { ExtractedFacts, TranscriptMessage } from "../types"
+import { mergeDecisions } from "./merge"
 import { readMemoryState, emptyMemory, resolveProjectPath, mutateMemory } from "./store"
 import type { MemoryMutationResult } from "./store"
 import { enqueueProjectJob, setProjectQueueOutcome } from "./lock"
@@ -18,7 +18,6 @@ import type { ProjectLockOptions } from "./project-lock"
 import { getCurrentGitSha } from "../util/git"
 import { atomicWrite } from "../util/fs"
 import { basename, join } from "node:path"
-import { randomUUID } from "node:crypto"
 import {
   buildCanonicalInput,
   buildTranscriptEvidenceCandidateMap,
@@ -1483,15 +1482,6 @@ function heuristicEvidenceFor(
     : []
 }
 
-function llmEvidenceFor(
-  refs: unknown,
-  meta: MergeMeta,
-): Evidence[] | null {
-  if (!meta.evidenceCandidates) return null
-  const evidence = candidateEvidence(refs, meta.evidenceCandidates)
-  return evidence.length > 0 ? evidence : null
-}
-
 /**
  * Merge extracted facts into existing memory.
  * Full rules in docs/IMPLEMENTATION.md Appendix A.2.
@@ -1548,64 +1538,10 @@ export function mergeMemory(
       ]
     : incomingFiles
 
-  // decisions: merge with exact topic match (NOT substring)
-  const existingDecisions = existing.decisions.map((d) => ({ ...d })) // shallow clone
-  const existingTopicMap = new Map<string, number>() // topic → index
-
-  for (let i = 0; i < existingDecisions.length; i++) {
-    const normalized = normalizedFact(existingDecisions[i].topic)
-    existingTopicMap.set(normalized, i)
-  }
-
-  for (const newDec of extracted.decisions) {
-    const normalizedTopic = normalizedFact(newDec.topic)
-    const existingIdx = existingTopicMap.get(normalizedTopic)
-
-    const evidence = origin === "llm"
-      ? llmEvidenceFor((newDec as { evidence_refs?: unknown }).evidence_refs, meta)
-      : heuristicEvidenceFor(newDec, meta.evidenceCandidates)
-    // Direct callers cannot bypass the evidence boundary by calling mergeMemory
-    // with an LLM-shaped fact. The normal extractor already performs the same
-    // check before this merge.
-    if (origin === "llm" && !evidence) continue
-
-    const decision: Decision = {
-      id: randomUUID(),
-      topic: newDec.topic,
-      decision: newDec.decision,
-      rationale: newDec.rationale,
-      timestamp: meta.timestamp,
-      git_sha: meta.gitSha ?? undefined,
-      session_id: meta.sessionId,
-      still_valid: true,
-      // Foundational status is human-reviewed state. Both model and heuristic
-      // extraction may request it, but neither extraction path may promote it.
-      foundational: false,
-      foundational_requested: origin === "llm"
-        ? Boolean(newDec.foundational)
-        : Boolean(newDec.foundational) ||
-          Boolean((newDec as { foundational_requested?: unknown }).foundational_requested),
-      provenance: makeProvenance(meta, evidence ?? []),
-    }
-
-    if (existingIdx !== undefined) {
-      const old = existingDecisions[existingIdx]
-      const oldIsHeuristic = old?.provenance?.extractor === "heuristic" ||
-        old?.provenance?.confidence === "heuristic"
-      if (origin === "llm" && old?.still_valid && oldIsHeuristic) {
-        // Preserve a corroborated heuristic fact. A differing model claim is
-        // retained as an invalid audit fact; an equivalent claim is retained as
-        // an additional corroborated observation without erasing the heuristic.
-        decision.still_valid = normalizedFact(decision.decision) === normalizedFact(old.decision)
-      } else if (typeof old?.id === "string") {
-        old.still_valid = false
-      }
-      existingDecisions.push(decision)
-    } else {
-      // No match → append new
-      existingDecisions.push(decision)
-    }
-  }
+  // decisions: PR 3 §7 — delegated to mergeDecisions(), which reasons over the
+  // reconciled authority view (resolveDecisionAuthorities) instead of a stale
+  // one-index topic map. Heuristic/LLM rules live in src/memory/merge.ts.
+  const decisions = mergeDecisions(existing.decisions, extracted.decisions, meta)
 
   return {
     ...existing,
@@ -1617,7 +1553,7 @@ export function mergeMemory(
     current_task,
     current_task_provenance,
     active_files,
-    decisions: existingDecisions,
+    decisions,
     blockers: extracted.blockers,
     next_steps: extracted.next_steps,
     recent_sessions: existing.recent_sessions ?? [],

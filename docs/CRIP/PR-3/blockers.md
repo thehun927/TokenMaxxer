@@ -47,3 +47,14 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] Conflicting non-human rows in a human-foundational topic get conflicts_with (NOT superseded_by).
 - [test-gap] 13 tests in decision-authority.test.ts now green.
 - [scope-deviation] The first Wave 3 attempt by another agent produced an empty result with no file changes; this is the successful retry.
+
+## 2026-08-10 — wave-4 mergeDecisions extraction
+- [design-decision] mergeDecisions begins from resolveDecisionAuthorities's read view, not a topic-index map.
+- [design-decision] Heuristic conflicts supersede ALL prior valid non-human same-topic rows (not one mapped index) per plan §7.1.
+- [design-decision] LLM-equivalent observations corroborate the same authority ID in place; provenance upgraded when stronger.
+- [design-decision] Extraction 'foundational' signal maps only to foundational_requested.
+- [design-decision] Conflict-with-human rows carry conflicts_with (NOT superseded_by); the human did not adopt those values.
+- [design-decision] LLM observations against a quarantined conflicting-human-foundational topic become invalid conflict candidates linked to the unresolved human IDs (same veto as heuristic, plan §7.1).
+- [design-decision] A legacy-only authority is one whose provenance is undefined, extractor "legacy", or confidence "legacy"; only those may be superseded by an evidence-backed LLM conflict (plan §7.2).
+- [scope-deviation] plan §7 requires mergeMemory to delegate to mergeDecisions, so src/memory/writer.ts was edited minimally (decision block replaced by a delegation call; dead llmEvidenceFor/randomUUID removed). All non-decision merge logic preserved verbatim.
+- [test-gap] 8 PR 3 merge tests now green; existing merge tests still pass.
