@@ -11,8 +11,9 @@ import type {
   Provenance,
 } from "./schema"
 import type { ExtractedFacts, TranscriptMessage } from "../types"
-import { readMemoryState, writeMemory, emptyMemory, resolveProjectPath } from "./store"
+import { readMemoryState, writeMemory, emptyMemory, resolveProjectPath, mutateMemory } from "./store"
 import { enqueueProjectJob, setProjectQueueOutcome } from "./lock"
+import type { ProjectLockOptions } from "./project-lock"
 import { getCurrentGitSha } from "../util/git"
 import { atomicWrite } from "../util/fs"
 import { basename, join } from "node:path"
@@ -206,6 +207,8 @@ type IdleWriteOptions = {
   worktree: string
   directory: string
   sessionId: string
+  /** Test-only: bound the heuristic transaction lock acquisition window. */
+  lockOptions?: ProjectLockOptions
 }
 
 /**
@@ -265,6 +268,10 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     // on every heuristic write, so normalizing it out of the fingerprint keeps
     // the LLM cache stable across mutations that did not change the meaning of
     // the prior state.
+    //
+    // This pre-lock snapshot feeds ONLY the LLM cache fingerprint below (the
+    // LLM lifecycle is Wave 4). It is never the merge authority: the heuristic
+    // transaction re-reads the authoritative STATE under the lock (PR 2 §11.A).
     const canonicalPrior = { ...existing, llm_extraction_audits: undefined, revision: 0 }
     const canonicalInput = buildCanonicalInput(messages, canonicalPrior)
     const gitSha = await getCurrentGitSha(worktree)
@@ -275,21 +282,47 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     )
     const digests = evidenceDigestMap(candidates)
 
-    markReferencedDecisions(existing, allMessages, sessionId)
-    const merged = mergeMemory(existing, extracted, {
-      sessionId,
-      gitSha,
-      timestamp: new Date().toISOString(),
-      origin: "heuristic",
-      evidenceCandidates: candidates,
-    })
-    const pruned = pruneOld(recordRecentSession(merged, sessionId), client)
+    // Heuristic transaction (PR 2 §11.A): one short lock-protected mutation.
+    // The authoritative base is read under the lock; the pre-lock `existing`
+    // snapshot above feeds only the LLM cache fingerprint, never the merge.
+    const heuristicResult = await mutateMemory<{ outcome: IdleWriteOutcome; memory: MemoryFile }>(
+      { worktree, directory, client, lockOptions: opts.lockOptions },
+      (base) => {
+        const referenced = markReferencedDecisions(base, allMessages, sessionId)
+        const merged = mergeMemory(referenced, extracted, {
+          sessionId,
+          gitSha,
+          timestamp: new Date().toISOString(),
+          origin: "heuristic",
+          evidenceCandidates: candidates,
+        })
+        const heuristicMemory = pruneOld(recordRecentSession(merged, sessionId), client)
+        return {
+          kind: "commit",
+          memory: heuristicMemory,
+          value: { outcome: "heuristic-only", memory: heuristicMemory },
+        }
+      },
+    )
 
-    // Durable heuristic fallback. A failed state write cannot justify an
-    // un-serialized prompt, so stop before model discovery in that case.
-    const heuristicPersisted = await writeMemory({ worktree, directory, client }, pruned)
-    if (heuristicPersisted === false) return "write-failed"
-    await writeHeaderBestEffort(client, worktree, directory, pruned)
+    // Map the transaction result to the existing IdleWriteOutcome taxonomy
+    // (PR 2 §13). A no-op mutation (not produced by the heuristic path today)
+    // must not change the observable outcome, so it maps to "heuristic-only".
+    if (heuristicResult.status === "lock-timeout") {
+      void log(client, "warn", "heuristic transaction lock-timeout", { project: resolveProjectPath(worktree, directory) })
+      return "write-failed"
+    }
+    if (heuristicResult.status === "unavailable") {
+      void log(client, "warn", "heuristic transaction unavailable", { project: resolveProjectPath(worktree, directory) })
+      return "write-failed"
+    }
+    if (heuristicResult.status === "commit-failed") {
+      void log(client, "warn", "heuristic transaction commit-failed", { project: resolveProjectPath(worktree, directory) })
+      return "write-failed"
+    }
+    // heuristicResult.status === "committed" | "noop"
+    const heuristicMemory = heuristicResult.value.memory
+    await writeHeaderBestEffort(client, worktree, directory, heuristicMemory)
 
     if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
       void log(client, "debug", "llm extraction skipped: TOKENMAXXER_LLM_EXTRACT is disabled", {
@@ -324,7 +357,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       void log(client, "warn", "memory read failed; refusing cache/LLM merge", { project })
       return "heuristic-only"
     }
-    const afterHeuristic = afterHeuristicState.memory ?? pruned
+    const afterHeuristic = afterHeuristicState.memory ?? heuristicMemory
     const cachedEntry = readExtractionCacheEntry(afterHeuristic, cacheKey, {
       evidenceCandidateMap: candidates,
       evidenceDigestMap: digests,
@@ -446,7 +479,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       void log(client, "warn", "memory read failed; refusing final LLM merge", { project })
       return "llm-failed"
     }
-    const latest = latestState.memory ?? pruned
+    const latest = latestState.memory ?? heuristicMemory
     const cacheAlreadyCommitted = readExtractionCacheEntry(latest, selectedCacheKey, {
       evidenceCandidateMap: candidates,
       evidenceDigestMap: digests,
@@ -1201,12 +1234,16 @@ function stripCodeBlocks(text: string): string {
 /**
  * Scan transcript for recall_decision tool calls and mark all valid decisions
  * as used in this session.
+ *
+ * Pure: returns a NEW memory with the references marked and never mutates the
+ * input. This lets the heuristic transaction call it inside the `mutateMemory`
+ * callback on the authoritative lock-protected base (PR 2 §11.A).
  */
 export function markReferencedDecisions(
   mem: MemoryFile,
   messages: TranscriptMessage[],
   sessionId: string,
-): void {
+): MemoryFile {
   let recalled = false
 
   for (const msg of messages) {
@@ -1219,12 +1256,13 @@ export function markReferencedDecisions(
     if (recalled) break
   }
 
-  if (recalled) {
-    for (const d of mem.decisions) {
-      if (d.still_valid) {
-        d.last_used_in_session = sessionId
-      }
-    }
+  if (!recalled) return mem
+
+  return {
+    ...mem,
+    decisions: mem.decisions.map((d) =>
+      d.still_valid ? { ...d, last_used_in_session: sessionId } : d,
+    ),
   }
 }
 

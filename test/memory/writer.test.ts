@@ -1,9 +1,22 @@
-import { describe, it, expect } from "vitest"
-import { extractFactsHeuristic, mergeMemory, recordRecentSession } from "../../src/memory/writer"
+import { describe, it, expect, vi, afterEach } from "vitest"
+import {
+  extractFactsHeuristic,
+  mergeMemory,
+  recordRecentSession,
+  writeMemoryOnIdle,
+} from "../../src/memory/writer"
 import type { TranscriptMessage } from "../../src/types"
 import { emptyMemory } from "../../src/memory/schema"
+import { readMemory } from "../../src/memory/store"
+import { globalMemoryPath, projectMemoryPath } from "../../src/memory/paths"
 import { readFileSync } from "node:fs"
-import { join } from "node:path"
+import { mkdir, mkdtemp, readFile, rm, writeFile, access, chmod } from "node:fs/promises"
+import { dirname, join } from "node:path"
+import { tmpdir } from "node:os"
+import { spawn } from "node:child_process"
+import { fileURLToPath } from "node:url"
+import { atomicWrite } from "../../src/util/fs"
+import { resetProjectQueues } from "../../src/memory/lock"
 
 const fixturesDir = join(__dirname, "..", "fixtures", "transcripts")
 
@@ -11,6 +24,43 @@ function loadTranscript(name: string): TranscriptMessage[] {
   const raw = readFileSync(join(fixturesDir, name), "utf-8")
   return JSON.parse(raw) as TranscriptMessage[]
 }
+
+const directories: string[] = []
+
+async function worktree(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "tokenmaxxer-writer-"))
+  directories.push(directory)
+  return directory
+}
+
+function messages(sessionID = "source"): TranscriptMessage[] {
+  return [
+    {
+      info: { id: `${sessionID}-user`, role: "user" },
+      parts: [{ type: "text", text: `Implement ${sessionID} extraction.` }],
+    },
+    {
+      info: { id: `${sessionID}-assistant`, role: "assistant" },
+      parts: [{ type: "text", text: "We will use a bounded queue for this project." }],
+    },
+  ]
+}
+
+function clientFor(sessionMap: Record<string, TranscriptMessage[]>) {
+  return {
+    app: { log: vi.fn() },
+    session: {
+      messages: vi.fn(async ({ path }: { path: { id: string } }) => ({ data: sessionMap[path.id] })),
+    },
+  }
+}
+
+afterEach(async () => {
+  vi.unstubAllEnvs()
+  vi.restoreAllMocks()
+  resetProjectQueues()
+  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
+})
 
 describe("recordRecentSession", () => {
   it("dedupes a session and caps history at the newest ten", () => {
@@ -533,5 +583,141 @@ describe("extractFactsHeuristic", () => {
       // Topic "schema." }" contains non-alphanumeric chars
       expect(facts.decisions).toHaveLength(0)
     })
+  })
+})
+
+// ─── Wave 3: heuristic transaction migration ─────────────────────────────────
+
+const LOCK_WORKER = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "fixtures",
+  "project-lock-worker.ts",
+)
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitFor(path: string, timeoutMs = 5000): Promise<void> {
+  const start = Date.now()
+  for (;;) {
+    try {
+      await access(path)
+      return
+    } catch {
+      if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${path}`)
+      await sleep(10)
+    }
+  }
+}
+
+function runLockWorker(args: string[]): Promise<{ code: number }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--import", "tsx", LOCK_WORKER, ...args], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    })
+    child.on("error", reject)
+    child.on("exit", (code) => resolve({ code: code ?? -1 }))
+  })
+}
+
+describe("writeMemoryOnIdle heuristic transaction (Wave 3)", () => {
+  it("persists via mutateMemory, bumps revision exactly once, and returns heuristic-only", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
+    const project = await worktree()
+    const client = clientFor({ source: messages() })
+
+    const outcome = await writeMemoryOnIdle({
+      client,
+      worktree: project,
+      directory: project,
+      sessionId: "source",
+    })
+
+    expect(outcome).toBe("heuristic-only")
+    const memory = await readMemory({ worktree: project, directory: project })
+    expect(memory).not.toBeNull()
+    expect(memory!.revision).toBe(1)
+    expect(memory!.last_session_id).toBe("source")
+  })
+
+  it("returns write-failed on lock-timeout without writing STATE", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
+    const project = await worktree()
+    const barrier = join(tmpdir(), `tokenmaxxer-lock-${Date.now()}-${Math.random()}`)
+    const client = clientFor({ source: messages() })
+
+    // A child process holds the project lock behind a barrier.
+    const child = runLockWorker([project, "hold-lock", barrier])
+    await waitFor(barrier)
+
+    const outcome = await writeMemoryOnIdle({
+      client,
+      worktree: project,
+      directory: project,
+      sessionId: "source",
+      lockOptions: { acquireTimeoutMs: 150, initialBackoffMs: 5, maxBackoffMs: 20 },
+    })
+
+    expect(outcome).toBe("write-failed")
+    // No STATE write happened while the lock was held.
+    expect(await readMemory({ worktree: project, directory: project })).toBeNull()
+
+    // Release the child so it exits cleanly.
+    await writeFile(`${barrier}.release`, "go", "utf-8")
+    const { code } = await child
+    expect(code).toBe(0)
+  })
+
+  it("returns write-failed when STATE is unavailable and preserves the global fallback", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
+    const project = await worktree()
+    const localPath = projectMemoryPath(project)
+    const globalPath = globalMemoryPath(project)
+
+    // Seed a durable global fallback.
+    const globalMemory = emptyMemory(project)
+    globalMemory.revision = 2
+    globalMemory.decisions = [{
+      id: "global-durable-1",
+      topic: "global-durable-topic",
+      decision: "Keep the global durable decision",
+      timestamp: "2026-08-09T00:00:00.000Z",
+      session_id: "source",
+      still_valid: true,
+      foundational: false,
+      provenance: {
+        extractor: "legacy",
+        source_session_id: "legacy",
+        confidence: "legacy",
+        evidence: [],
+      },
+    }]
+    await mkdir(join(project, ".opencode", "memory"), { recursive: true })
+    await atomicWrite(globalPath, JSON.stringify(globalMemory, null, 2))
+
+    // Make BOTH candidates unreadable so the authoritative read is
+    // "unavailable": local is a directory surrogate (EISDIR), global is chmod
+    // 000 (EACCES) while its content stays intact on disk.
+    await mkdir(localPath)
+    await chmod(globalPath, 0o000)
+
+    const client = clientFor({ source: messages() })
+    const outcome = await writeMemoryOnIdle({
+      client,
+      worktree: project,
+      directory: project,
+      sessionId: "source",
+    })
+
+    expect(outcome).toBe("write-failed")
+    // The global fallback survives untouched on disk.
+    await chmod(globalPath, 0o644)
+    const raw = await readFile(globalPath, "utf-8")
+    const onDisk = JSON.parse(raw) as { revision: number; decisions: Array<{ topic: string }> }
+    expect(onDisk.revision).toBe(2)
+    expect(onDisk.decisions.some((decision) => decision.topic === "global-durable-topic")).toBe(true)
   })
 })
