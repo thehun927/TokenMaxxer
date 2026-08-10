@@ -20,6 +20,12 @@ import {
 import { requestFoundationalReview } from "../memory/decision-review"
 import type { DecisionReviewMutation } from "../memory/decision-review"
 import { enqueueProjectJob } from "../memory/lock"
+import {
+  recallQuerySchema,
+  recallLimitSchema,
+  decisionIdSchema,
+  decisionTopicSchema,
+} from "./bounds"
 
 function decisionProvenanceLabel(value: { provenance?: {
   source_session_id: string
@@ -241,11 +247,9 @@ export function registerTools(_ctx: {
         description:
           "Recall a prior decision for this project. CALL THIS before assuming continuity with a previous session. Returns the stable decision ID plus date/git-SHA so you can judge staleness.",
         args: {
-          query: tool.schema
-            .string()
-            .optional()
+          query: recallQuerySchema
             .describe("topic or keyword. Omit to get most recent decisions."),
-          limit: tool.schema.number().default(10).describe("max results"),
+          limit: recallLimitSchema.describe("max results"),
         },
         async execute(args, context) {
           return _recallDecision(args, context)
@@ -274,13 +278,9 @@ export function registerTools(_ctx: {
         description:
           "Request human foundational review for a decision by stable ID (preferred) or exact topic (one-release compatibility). This only requests review; it never mints human trust. The human CLI `tokenmaxxer promote <id>` must confirm.",
         args: {
-          decision_id: tool.schema
-            .string()
-            .optional()
+          decision_id: decisionIdSchema
             .describe("stable decision ID from recall_decision"),
-          topic: tool.schema
-            .string()
-            .optional()
+          topic: decisionTopicSchema
             .describe("exact normalized topic (compatibility only; refused when ambiguous)"),
         },
         async execute(args, context) {

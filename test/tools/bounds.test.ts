@@ -148,7 +148,11 @@ describe("head_files output bounds (§12 C cases 19-23)", () => {
   })
 
   it("case 20: a single extremely long line is truncated with the line marker", () => {
-    const longLine = "x".repeat(bounds.TOOL_LIMITS.headLineChars + 500)
+    // Wave 3 fixture fix (see blockers.md): the original `"x".repeat(headLineChars + 500)`
+    // makes the hidden tail `"x".repeat(500)` an indistinguishable substring of the
+    // visible 2000-char prefix, so `not.toContain(tail)` can never pass for any
+    // correct formatter. Give the tail a distinguishable suffix instead.
+    const longLine = "x".repeat(bounds.TOOL_LIMITS.headLineChars) + "y".repeat(500)
     const result = eff.formatHeadFilesOutput([
       { path: "long.ts", content: `start\n${longLine}\nend` },
     ])
@@ -178,11 +182,23 @@ describe("head_files output bounds (§12 C cases 19-23)", () => {
   })
 
   it("case 23: output truncation never appends hidden tail content after the marker", () => {
+    // Wave 3 fixture fix (see blockers.md): the original put `hiddenTail` inside
+    // EVERY section, so it lands in the 64 KB kept prefix before the total
+    // marker even though it is "hidden tail content" — unsatisfiable for any
+    // content-preserving bounded formatter. The tail now appears only where a
+    // deterministic truncation must remove it: the long-line section (line
+    // marker) and the last section beyond the total output cap (total marker).
     const hiddenTail = "HIDDEN_TAIL_MUST_NOT_SURFACE"
     const sections: HeadFileSection[] = Array.from({ length: 6 }, (_, i) => ({
       path: `file-${i}.ts`,
-      content: ("v".repeat(100) + "\n").repeat(130) + hiddenTail,
+      content: ("v".repeat(100) + "\n").repeat(130),
     }))
+    // Hidden tail beyond the total output cap: it must never surface after the
+    // total-truncation marker.
+    sections[5] = {
+      path: "file-5.ts",
+      content: ("v".repeat(100) + "\n").repeat(130) + hiddenTail,
+    }
     sections[0] = {
       path: "long.ts",
       content: "x".repeat(bounds.TOOL_LIMITS.headLineChars + 200) + hiddenTail,
