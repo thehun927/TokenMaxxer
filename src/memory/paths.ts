@@ -43,6 +43,17 @@ export function globalMemoryPath(project: string): string {
 }
 
 /**
+ * Directory used as the cross-process project lock.
+ *
+ * The lock is a directory (not a file) because lock state requires an atomic
+ * rename of a fully-initialized candidate. The canonical lock path is
+ * `<globalProjectStorageDir(project)>/.state-lock`.
+ */
+export function projectLockDir(project: string): string {
+  return join(globalProjectStorageDir(project), ".state-lock")
+}
+
+/**
  * Stable hash identifying one project in the global fallback namespace.
  * Currently a 16-hex-char prefix of sha256(project). Keep this function
  * stable; PR 2 (cross-process transactions) reuses it for the project lock.
