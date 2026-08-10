@@ -6,11 +6,21 @@
  * `./writer`, `./schema`, or `./lock`.  Later waves wire this lock into
  * STATE mutations; this wave delivers the lock primitive only.
  *
- * The lock is a directory (not a file) so that a fully-initialized candidate
- * (with `owner.json` already present) can be published atomically via rename.
- * The canonical lock path is `<globalProjectStorageDir(project)>/.state-lock`.
+ * The lock is a directory (not a file). The canonical lock path is
+ * `<globalProjectStorageDir(project)>/.state-lock`. Ownership is published by
+ * atomically creating the canonical directory (`mkdir` with `recursive:false`)
+ * and then writing `owner.json` inside it. Release retires the owned directory
+ * to a unique `.state-lock.released.<nonce>.*` path before recursive cleanup,
+ * so old cleanup can never target a replacement owner's canonical lock.
  */
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import {
+  access,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { hostname } from "node:os"
 import { randomUUID } from "node:crypto"
@@ -45,6 +55,13 @@ export type ProjectLockOptions = {
     owner: ProjectLockOwner | null
     classification: LockClassification
   }) => void
+  /**
+   * For tests: a barrier path. Immediately after every classification the
+   * caller writes `<path>` and waits for `<path>.release` to exist. This lets
+   * a test deterministically pause a contender at the classification →
+   * recovery boundary. Only honored when provided; no effect on production.
+   */
+  waitForClassificationBarrier?: string
 }
 
 export type LockClassification =
@@ -95,28 +112,6 @@ function buildOwner(): ProjectLockOwner {
 /** Ensure the global project storage directory (the lock's parent) exists. */
 async function ensureGlobalProjectDir(project: string): Promise<void> {
   await mkdir(globalProjectStorageDir(project), { recursive: true })
-}
-
-/**
- * Create a unique, fully-initialized candidate directory containing
- * `owner.json`. Returns the candidate path and the owner it published.
- */
-async function createCandidate(
-  project: string,
-): Promise<{ candidate: string; owner: ProjectLockOwner }> {
-  const parentDir = globalProjectStorageDir(project)
-  const candidate = join(
-    parentDir,
-    `.state-lock.candidate.${process.pid}.${randomUUID()}`,
-  )
-  await mkdir(candidate, { recursive: false })
-  const owner = buildOwner()
-  await writeFile(
-    join(candidate, "owner.json"),
-    JSON.stringify(owner, null, 2),
-    "utf-8",
-  )
-  return { candidate, owner }
 }
 
 /** Read and validate the current owner of a lock directory, or null. */
@@ -176,8 +171,8 @@ async function classifyLock(lockDir: string): Promise<LockClassification> {
 }
 
 /**
- * Treat rename errors portably as "destination exists". Do not assume POSIX.
- * Inspect `error.code` first, then fall back to known platform message
+ * Treat mkdir/rename errors portably as "destination exists". Do not assume
+ * POSIX. Inspect `error.code` first, then fall back to known platform message
  * variants. Anything else is an unexpected error.
  */
 function isDestinationExists(error: unknown): boolean {
@@ -190,10 +185,91 @@ function isDestinationExists(error: unknown): boolean {
 }
 
 /**
+ * Identity-preserving recovery claim.
+ *
+ * Before quarantining a `dead-same-host` lock, a recoverer must atomically
+ * create a claim file INSIDE the canonical lock directory and then re-read
+ * `owner.json` to confirm the exact owner it classified is still present and
+ * still dead. This closes the window between classification and quarantine
+ * where another contender could replace the canonical lock with a live
+ * replacement.
+ *
+ * Returns the claim path on success, or `null` if the claim could not be
+ * acquired or the owner identity changed (the current lock is NOT what we
+ * classified — do not quarantine).
+ *
+ * SOFT PROTOCOL: all compliant recoverers must honor the claim. A non-compliant
+ * recoverer that ignores the claim can still race; the claim is a mutual
+ * exclusion marker, not a hard filesystem primitive.
+ */
+async function acquireRecoveryClaim(
+  project: string,
+  expectedOwner: ProjectLockOwner,
+): Promise<string | null> {
+  const lockDir = projectLockDir(project)
+  const claimPath = join(
+    lockDir,
+    `.recovery-claim-${process.pid}-${expectedOwner.nonce}`,
+  )
+  try {
+    // `wx` = create-if-absent. EEXIST means someone else is recovering.
+    await writeFile(
+      claimPath,
+      JSON.stringify({ pid: process.pid, nonce: expectedOwner.nonce }),
+      { flag: "wx" },
+    )
+  } catch {
+    // EEXIST (another recoverer) or ENOENT (canonical lock already gone).
+    return null
+  }
+
+  // Re-read the current owner and verify it is still the exact owner we
+  // classified, and still qualifies as dead (PID ESRCH).
+  const current = await readOwner(lockDir)
+  if (!current || current.nonce !== expectedOwner.nonce) {
+    await rm(claimPath, { force: true }).catch(() => {})
+    return null
+  }
+  try {
+    process.kill(current.pid, 0)
+    // Still alive: not dead anymore. Do not recover.
+    await rm(claimPath, { force: true }).catch(() => {})
+    return null
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ESRCH") {
+      return claimPath
+    }
+    // EPERM or unexpected: conservative, do not recover.
+    await rm(claimPath, { force: true }).catch(() => {})
+    return null
+  }
+}
+
+/**
+ * Best-effort removal of a recovery claim. The claim is only a mutual-exclusion
+ * marker during recovery; failure to remove it is non-fatal.
+ */
+async function retireRecoveryClaim(
+  _project: string,
+  claimPath: string,
+): Promise<void> {
+  await rm(claimPath, { force: true }).catch(() => {})
+}
+
+/**
  * ABA-safe stale recovery: atomically rename the canonical `.state-lock` into
  * a unique stale-recovery directory, then best-effort delete it. Only the
  * process that successfully renames owns the recovery. Returns true if we
  * quarantined the stale lock.
+ *
+ * SOFT PROTOCOL ASSUMPTION: this function is only safe to call AFTER the
+ * caller has acquired a recovery claim via `acquireRecoveryClaim` and verified
+ * the owner identity. The atomic rename proves only that one process moved
+ * whatever object occupied the canonical path at rename time; it does NOT
+ * prove that object is the stale owner previously classified. The recovery
+ * claim + revalidation is what closes that interval. Non-compliant callers that
+ * call this without a claim can still race and must not be relied upon.
  */
 async function quarantineStaleLock(project: string): Promise<boolean> {
   const lockDir = projectLockDir(project)
@@ -228,16 +304,29 @@ function buildHandle(
         console.error("lock-release-skipped-owner-mismatch", { project })
         return false
       }
+      // Retire-then-delete: atomically rename the owned canonical directory to
+      // a unique retired path, then recursively delete ONLY that path. Once the
+      // rename succeeds, a new owner can acquire the canonical path; our
+      // cleanup can never target a replacement owner's lock.
+      const parentDir = globalProjectStorageDir(project)
+      const retiredPath = join(
+        parentDir,
+        `.state-lock.released.${owner.nonce}.${randomUUID().slice(0, 8)}`,
+      )
       try {
-        await rm(lockDir, { recursive: true, force: true })
-        return true
+        await rename(lockDir, retiredPath)
       } catch (error) {
+        // Rename failed (someone else acquired). Do NOT recursively delete the
+        // canonical path.
         console.error("lock-release-failed", {
           project,
           error: String(error),
         })
         return false
       }
+      // Best-effort recursive delete of the unique retired path.
+      await rm(retiredPath, { recursive: true, force: true }).catch(() => {})
+      return true
     },
   }
 }
@@ -247,16 +336,23 @@ type AcquireOnceResult =
   | { status: "contended"; classification: LockClassification }
 
 /**
- * One acquisition attempt: publish a fully-initialized candidate and atomically
- * rename it to `.state-lock`. On contention, classify the current owner.
+ * One acquisition attempt: atomically create the canonical `.state-lock`
+ * directory (create-if-absent via `mkdir` with `recursive:false`), then write
+ * `owner.json`. On contention, classify the current owner.
+ *
+ * There is a brief publication interval where `.state-lock` exists but
+ * `owner.json` does not yet exist. That interval is SAFE: a contender that
+ * observes an empty `.state-lock` classifies as `unknown-owner` and retries. A
+ * crash in that window leaves an unknown lock requiring manual cleanup
+ * (availability failure, not a mutual-exclusion failure).
  */
 async function acquireOnce(project: string): Promise<AcquireOnceResult> {
   const lockDir = projectLockDir(project)
   await ensureGlobalProjectDir(project)
-  const { candidate, owner } = await createCandidate(project)
+  const owner = buildOwner()
   try {
-    await rename(candidate, lockDir)
-    return { status: "acquired", handle: buildHandle(project, lockDir, owner) }
+    // True create-if-absent: throws EEXIST if `.state-lock` already exists.
+    await mkdir(lockDir, { recursive: false })
   } catch (error) {
     if (!isDestinationExists(error)) {
       // Unexpected error: surface a bounded diagnostic, do not crash.
@@ -271,10 +367,31 @@ async function acquireOnce(project: string): Promise<AcquireOnceResult> {
     }
     const classification = await classifyLock(lockDir)
     return { status: "contended", classification }
-  } finally {
-    // Best-effort cleanup of the abandoned candidate; never blocks acquisition.
-    await rm(candidate, { recursive: true, force: true }).catch(() => {})
   }
+
+  // We created the canonical directory; publish the owner metadata.
+  try {
+    await writeFile(
+      join(lockDir, "owner.json"),
+      JSON.stringify(owner, null, 2),
+      "utf-8",
+    )
+  } catch (error) {
+    // Best-effort cleanup of the directory we just created. No contender can
+    // have acquired it (mkdir would have failed for them), so removing it is
+    // safe. A crash here leaves an unknown lock for manual cleanup.
+    await rm(lockDir, { recursive: true, force: true }).catch(() => {})
+    console.error("lock-acquire-write-owner-failed", {
+      project,
+      error: String(error),
+    })
+    return {
+      status: "contended",
+      classification: { kind: "unknown-owner", reason: "read-error" },
+    }
+  }
+
+  return { status: "acquired", handle: buildHandle(project, lockDir, owner) }
 }
 
 function ownerFromClassification(
@@ -294,6 +411,18 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+/** Wait until `path` exists (used by the test classification barrier). */
+async function waitFor(path: string): Promise<void> {
+  for (;;) {
+    try {
+      await access(path)
+      return
+    } catch {
+      await sleep(10)
+    }
+  }
+}
+
 /** Exponential backoff with jitter, capped at `max`. */
 function backoffWithJitter(base: number, max: number): number {
   const jitter = Math.random() * base
@@ -303,8 +432,9 @@ function backoffWithJitter(base: number, max: number): number {
 /**
  * Single acquisition attempt. Returns `null` on contention / unknown ownership
  * (treat as "could not acquire right now"). Dead same-host locks are recovered
- * via ABA-safe quarantine before giving up. The caller is responsible for
- * retry/backoff logic if needed; `withProjectLock` wraps this with retry.
+ * via an identity-preserving recovery claim + quarantine before giving up. The
+ * caller is responsible for retry/backoff logic if needed; `withProjectLock`
+ * wraps this with retry.
  */
 export async function tryAcquireProjectLock(
   project: string,
@@ -320,10 +450,14 @@ export async function tryAcquireProjectLock(
   })
 
   if (classification.kind === "dead-same-host") {
-    const quarantined = await quarantineStaleLock(project)
-    if (quarantined) {
-      const retry = await acquireOnce(project)
-      if (retry.status === "acquired") return retry.handle
+    const claimPath = await acquireRecoveryClaim(project, classification.owner)
+    if (claimPath) {
+      const quarantined = await quarantineStaleLock(project)
+      await retireRecoveryClaim(project, claimPath)
+      if (quarantined) {
+        const retry = await acquireOnce(project)
+        if (retry.status === "acquired") return retry.handle
+      }
     }
   }
   return null
@@ -348,6 +482,7 @@ export async function withProjectLock<T>(
   const maxBackoffMs = options?.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS
   const shouldAbort = options?.shouldAbort
   const onClassify = options?.onClassify
+  const classificationBarrier = options?.waitForClassificationBarrier
 
   const lockDir = projectLockDir(project)
   const start = Date.now()
@@ -377,14 +512,29 @@ export async function withProjectLock<T>(
       classification,
     })
 
+    // Test hook: pause immediately after classification, before any recovery.
+    if (classificationBarrier) {
+      await writeFile(classificationBarrier, "ready", "utf-8")
+      await waitFor(`${classificationBarrier}.release`)
+    }
+
     if (classification.kind === "dead-same-host") {
-      const quarantined = await quarantineStaleLock(project)
-      if (quarantined) {
-        // Retry normal acquisition from the top.
-        backoff = initialBackoffMs
+      const claimPath = await acquireRecoveryClaim(project, classification.owner)
+      if (claimPath) {
+        const quarantined = await quarantineStaleLock(project)
+        await retireRecoveryClaim(project, claimPath)
+        if (quarantined) {
+          // Retry normal acquisition from the top.
+          backoff = initialBackoffMs
+          continue
+        }
+        // Quarantine failed: someone else changed the lock; re-classify next loop.
         continue
       }
-      // Quarantine failed: someone else changed the lock; re-classify next loop.
+      // Claim failed: someone else is recovering (or the lock changed). Back off
+      // and re-classify on the next iteration.
+      await sleep(backoffWithJitter(backoff, maxBackoffMs))
+      backoff = Math.min(backoff * 2, maxBackoffMs)
       continue
     }
 

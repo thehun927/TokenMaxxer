@@ -125,18 +125,29 @@ afterEach(async () => {
 })
 
 describe("two child processes, same project, different facts", () => {
-  it("both mutations survive; final revision is N+2", async () => {
+  it("both mutations survive; final revision is N+2; one child is blocked on the lock", async () => {
     const project = join(homeDir, "proj")
     const statePath = projectMemoryPath(project)
     await writeState(statePath, memoryJson(project, 10))
 
-    const barrierA = join(homeDir, "txn-a")
-    const barrierB = join(homeDir, "txn-b")
-    barrierFiles.push(barrierA, barrierB)
+    // Child A acquires the lock, signals readyA, and holds it until released.
+    // Child B waits for readyA (its pre-mutation barrier) before mutating, so
+    // B is guaranteed to contend for the lock while A holds it — not run
+    // sequentially.
+    const readyA = join(homeDir, "txn-a")
+    const readyB = join(homeDir, "txn-b")
+    barrierFiles.push(readyA, `${readyA}.release`, readyB)
 
-    // Fork both workers; they contend for the same project lock.
-    const a = runWorker([project, "idle-write", "A"])
-    const b = runWorker([project, "idle-write", "B"])
+    const a = runWorker([project, "hold-write", readyA, "A"])
+    await waitFor(readyA) // A holds the lock.
+
+    const b = runWorker([project, "barrier-write", readyA, "B", readyB])
+    await waitFor(readyB) // B reached its pre-mutation barrier (about to block).
+
+    // B must be blocked on the lock while A holds it: B cannot have finished.
+    // Release A; A mutates (revision +1) and releases, then B acquires and
+    // mutates (revision +1).
+    await writeFile(`${readyA}.release`, "go", "utf-8")
 
     const [ra, rb] = await Promise.all([a, b])
     expect(ra.code).toBe(0)

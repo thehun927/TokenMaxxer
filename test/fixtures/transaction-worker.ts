@@ -93,6 +93,57 @@ async function main(): Promise<void> {
     process.exit(1)
   }
 
+  if (command === "barrier-write") {
+    // Signal readiness by writing <ready-path>, then wait for <pre-barrier> to
+    // exist, then perform an idle-write mutation (appending <fact-id>). This
+    // lets a test force a worker to reach a pre-mutation barrier before
+    // mutating, guaranteeing it contends for the project lock rather than
+    // running sequentially.
+    const preBarrier = args[0]
+    const factId = args[1]
+    const readyPath = args[2]
+    if (!preBarrier || !factId) {
+      console.error("barrier-write requires <pre-barrier> <fact-id> [ready-path]")
+      process.exit(2)
+    }
+    if (readyPath) await writeFile(readyPath, "ready", "utf-8")
+    await waitFor(preBarrier)
+    const result = await mutateMemory(
+      { worktree: project, directory: project },
+      (memory) => ({
+        kind: "commit",
+        memory: {
+          ...memory,
+          decisions: [
+            ...memory.decisions,
+            {
+              id: `fact-${factId}`,
+              topic: `topic-${factId}`,
+              decision: `decision-${factId}`,
+              timestamp: new Date().toISOString(),
+              session_id: `worker-${factId}`,
+              still_valid: true,
+              foundational: false,
+              provenance: {
+                extractor: "heuristic",
+                source_session_id: `worker-${factId}`,
+                confidence: "heuristic",
+                evidence: [],
+              },
+            },
+          ],
+        },
+        value: null,
+      }),
+    )
+    if (result.status === "committed") {
+      printResult({ status: "ok", revision: result.revision })
+      process.exit(0)
+    }
+    printResult({ status: result.status })
+    process.exit(1)
+  }
+
   if (command === "hold-lock") {
     const barrierPath = args[0]
     if (!barrierPath) {
@@ -102,6 +153,50 @@ async function main(): Promise<void> {
     await withProjectLock(project, async () => {
       await writeFile(barrierPath, "ready", "utf-8")
       await waitFor(`${barrierPath}.release`)
+    })
+    process.exit(0)
+  }
+
+  if (command === "hold-write") {
+    // Acquire the lock, signal readiness by writing <ready-path>, then wait for
+    // <ready-path>.release before performing an idle-write mutation WHILE still
+    // holding the lock. This lets a test prove a second contender is blocked on
+    // the lock while this child holds it and mutates.
+    const readyPath = args[0]
+    const factId = args[1]
+    if (!readyPath || !factId) {
+      console.error("hold-write requires <ready-path> <fact-id>")
+      process.exit(2)
+    }
+    await withProjectLock(project, async () => {
+      await writeFile(readyPath, "ready", "utf-8")
+      await waitFor(`${readyPath}.release`)
+      // Append a fact directly to STATE while holding the lock (a mutation under
+      // the lock, without nesting mutateMemory which would re-acquire the lock).
+      const statePath = projectMemoryPath(project)
+      const raw = await readFile(statePath, "utf-8")
+      const mem = JSON.parse(raw)
+      mem.revision = (mem.revision ?? 0) + 1
+      mem.decisions = [
+        ...(mem.decisions ?? []),
+        {
+          id: `fact-${factId}`,
+          topic: `topic-${factId}`,
+          decision: `decision-${factId}`,
+          timestamp: new Date().toISOString(),
+          session_id: `worker-${factId}`,
+          still_valid: true,
+          foundational: false,
+          provenance: {
+            extractor: "heuristic",
+            source_session_id: `worker-${factId}`,
+            confidence: "heuristic",
+            evidence: [],
+          },
+        },
+      ]
+      await atomicWrite(statePath, JSON.stringify(mem, null, 2))
+      printResult({ status: "ok", revision: mem.revision })
     })
     process.exit(0)
   }

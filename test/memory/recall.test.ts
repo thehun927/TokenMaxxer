@@ -10,7 +10,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { spawn } from "node:child_process"
-import { access, mkdir, mkdtemp, readFile, rm } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
@@ -129,16 +129,28 @@ describe("recall_promote is transactional against a concurrent idle write (PR 2 
     const statePath = projectMemoryPath(project)
     await atomicWrite(statePath, seedMemoryJson(project, 10))
 
-    // Fork a child idle-write worker for the same project. It contends for the
-    // same filesystem project lock as the promotion in this process.
-    const child = runWorker([project, "idle-write", "child"])
+    // Fork a child that acquires the project lock, signals held, then waits for
+    // release before committing an idle write. This guarantees the parent's
+    // `_recallPromote` contends for the lock while the child owns it — actual
+    // contention, not sequential execution.
+    const held = join(homeDir, "recall-held")
+    barrierFiles.push(held, `${held}.release`)
+    const child = runWorker([project, "hold-write", held, "child"])
+    await waitFor(held) // child holds the lock.
 
     // Drive the real recall_promote tool in this process for the same project.
-    const result = await _recallPromote(
+    // It must block on the lock until the child releases.
+    const promotePromise = _recallPromote(
       { topic: "database" },
       { worktree: project, directory: project, sessionID: "human-review-session" },
     )
 
+    // Give the promotion a moment to contend, then release the child so it
+    // commits its idle write and releases the lock.
+    await sleep(100)
+    await writeFile(`${held}.release`, "go", "utf-8")
+
+    const result = await promotePromise
     const { code } = await child
     expect(code).toBe(0)
     expect(result).toContain("Promoted: database: Use PostgreSQL")
