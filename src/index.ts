@@ -112,12 +112,18 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
       }
     },
 
-    // Layer 2: custom tools (recall + efficiency + status)
-    ...registerTools(ctx),
-    // PR 4 §6: the legitimate `PluginInput["client"]` is injected into the
-    // efficiency tools by closure. A `ToolContext` never carries a client.
-    ...registerEfficiencyTools(client),
-    ...registerStatusTools(),
+    // Layer 2: custom tools (recall + efficiency + status). Every register*
+    // helper returns a `{ tool: {...} }` wrapper, so the maps are merged into
+    // the single Hooks `tool` map. Spreading the wrappers into the top-level
+    // return instead would let the last `tool` key clobber the earlier ones
+    // (only `tokenmaxxer_status` would survive).
+    tool: {
+      ...registerTools(ctx).tool,
+      // PR 4 §6: the legitimate `PluginInput["client"]` is injected into the
+      // efficiency tools by closure. A `ToolContext` never carries a client.
+      ...registerEfficiencyTools(client).tool,
+      ...registerStatusTools().tool,
+    },
 
   }
 }

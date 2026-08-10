@@ -72,3 +72,8 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] Rejected gate (unsupported-version / unhealthy / malformed-envelope / health-request-failed) commits heuristic memory but never calls session.create / session.prompt.
 - [design-decision] Pinned-compatibility and accepted gates proceed with the optional structured-extraction flow unchanged.
 - [test-gap] §12 E fixtures (items 35-38) now green; item 39 control case continues to pass.
+
+## 2026-08-10 — wave-6 clean host mocks
+- [design-decision] src/index.ts plugin init no longer uses any/never casts at the host boundary; the legitimate PluginInput["client"] is the only accepted source.
+- [design-decision] test/index.test.ts uses a real PluginInput-shape via satisfies PluginInput; no invented ToolContext.client fields.
+- [test-gap] §12 F item 45 (test/index.test.ts) now green.

@@ -35,6 +35,62 @@ const toolContext: ToolContext = {
   async ask() {},
 }
 
+/**
+ * Narrow, type-checked SDK client stub (PR 4 §10.2). Constructing the entire
+ * generated `OpencodeClient` is impractical, so the stub carries only the real
+ * v1.18.15 endpoints this plugin uses (`file.read`, `app.log`, `config.get`).
+ * The single cast is localized here and targets the exact SDK type; tests never
+ * invent members (`app.info` is NOT a real endpoint) and never escape through
+ * `as never` at the host boundary.
+ */
+type FileReadStub = (
+  options: { query: { path: string; directory?: string } },
+) => Promise<{ data?: { content?: string } }>
+
+type ClientOverride = {
+  file?: Partial<{ read: FileReadStub }>
+  app?: Partial<{ log: (...args: unknown[]) => unknown }>
+  config?: Partial<{ get: (...args: unknown[]) => unknown }>
+}
+
+function makeClient(overrides: ClientOverride = {}): PluginInput["client"] {
+  return {
+    file: {
+      read: overrides.file?.read ?? vi.fn(async () => ({ data: { content: "" } })),
+    },
+    app: {
+      log: overrides.app?.log ?? vi.fn(),
+    },
+    config: {
+      get: overrides.config?.get ?? vi.fn(),
+    },
+  } as unknown as PluginInput["client"]
+}
+
+/**
+ * A real `PluginInput`-shaped fixture (PR 4 §10.2). Only the members each test
+ * needs are supplied; the whole object is checked against the actual SDK type
+ * via `satisfies PluginInput`. `$` is a narrowed stub typed to the real
+ * `BunShell` surface (constructing a real BunShell is impractical).
+ */
+function makePluginInput(opts: {
+  directory?: string
+  worktree?: string
+  client?: PluginInput["client"]
+} = {}): PluginInput {
+  const directory = opts.directory ?? "/workspace/project"
+  const worktree = opts.worktree ?? directory
+  return {
+    client: opts.client ?? makeClient(),
+    project: { id: "test-project", worktree, time: { created: Date.now() } },
+    directory,
+    worktree,
+    experimental_workspace: { register: vi.fn() },
+    serverUrl: new URL("http://127.0.0.1:4096"),
+    $: {} as PluginInput["$"],
+  } satisfies PluginInput
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
 })
@@ -42,21 +98,12 @@ beforeEach(() => {
 describe("plugin initialization", () => {
   it("does not call config or another endpoint during initialization", async () => {
     const configGet = vi.fn()
-    const ctx = {
-      client: { app: { log: vi.fn(), info: vi.fn() }, config: { get: configGet } },
-      directory: "/workspace/project",
-      worktree: "/workspace/project",
-      serverUrl: new URL("http://127.0.0.1:4096"),
-      project: {},
-      experimental_workspace: { register: vi.fn() },
-      $: {},
-    }
+    const input = makePluginInput({ client: makeClient({ config: { get: configGet } }) })
 
-    await TokenmaxxerPlugin(ctx as never)
+    await TokenmaxxerPlugin(input)
 
     expect(configGet).not.toHaveBeenCalled()
-    expect(ctx.client.app.info).not.toHaveBeenCalled()
-    expect(ctx.client.app.log).not.toHaveBeenCalled()
+    expect(input.client.app.log).not.toHaveBeenCalled()
   })
 
   it("replaces the compaction log with only the newest snapshot", async () => {
@@ -66,16 +113,10 @@ describe("plugin initialization", () => {
       .mockResolvedValueOnce("newest durable snapshot")
 
     try {
-      const ctx = {
-        client: { app: { log: vi.fn(), info: vi.fn() } },
+      const hooks = await TokenmaxxerPlugin(makePluginInput({
         directory: project,
         worktree: project,
-        serverUrl: new URL("http://127.0.0.1:4096"),
-        project: {},
-        experimental_workspace: { register: vi.fn() },
-        $: {},
-      }
-      const hooks = await TokenmaxxerPlugin(ctx as never)
+      }))
       const firstOutput = { context: [] as string[] }
       const secondOutput = { context: [] as string[] }
 
@@ -101,17 +142,7 @@ describe("plugin initialization", () => {
   })
 
   it("does not expose a system transform hook or inject composer text", async () => {
-    const ctx = {
-      client: { app: { log: vi.fn(), info: vi.fn() } },
-      directory: "/workspace/project",
-      worktree: "/workspace/project",
-      serverUrl: new URL("http://127.0.0.1:4096"),
-      project: {},
-      experimental_workspace: { register: vi.fn() },
-      $: {},
-    }
-
-    const hooks = await TokenmaxxerPlugin(ctx as never)
+    const hooks = await TokenmaxxerPlugin(makePluginInput())
 
     expect(hooks).not.toHaveProperty("experimental.chat.system.transform")
     expect(JSON.stringify(hooks)).not.toContain("tokenmaxxer: This project has cross-session memory")
@@ -147,16 +178,7 @@ describe("plugin initialization", () => {
       { directory: "/workspace/project" },
     )
 
-    const ctx = {
-      client: { app: { log: vi.fn(), info: vi.fn() } },
-      directory: "/workspace/project",
-      worktree: "/workspace/project",
-      serverUrl: new URL("http://127.0.0.1:4096"),
-      project: {},
-      experimental_workspace: { register: vi.fn() },
-      $: {},
-    }
-    const hooks = await TokenmaxxerPlugin(ctx as never)
+    const hooks = await TokenmaxxerPlugin(makePluginInput())
 
     await hooks.event?.({
       event: { type: "session.idle", properties: { sessionID: extractionSessionID } },
@@ -174,9 +196,7 @@ describe("plugin initialization", () => {
 
 // ─── PR 4 §12 F — minimum package / compile contract (Waves 2/6/7) ──────────
 // The plugin must inject `PluginInput.client` into efficiency registration and
-// never rely on a client invented on `ToolContext`. These fixtures fail today
-// because `registerEfficiencyTools()` takes no client and the wrappers read
-// `(context as any).client`.
+// never rely on a client invented on `ToolContext`.
 describe("PR 4 §12 F — client injection into efficiency registration", () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -186,21 +206,12 @@ describe("PR 4 §12 F — client injection into efficiency registration", () => 
     const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-client-inject-"))
     try {
       const fileRead = vi.fn(async () => ({ data: { content: "line1\nline2\nline3" } }))
-      const client = {
-        file: { read: fileRead },
-        app: { log: vi.fn() },
-      }
-      // v1.18.15 minimum PluginInput shape: client, project, directory,
-      // worktree, experimental_workspace, serverUrl, $.
-      const input = {
-        client: client as unknown as PluginInput["client"],
-        project: { id: "p1", worktree: project, time: { created: Date.now() } },
+      // v1.18.15 minimum PluginInput shape, checked with satisfies PluginInput.
+      const input = makePluginInput({
         directory: project,
         worktree: project,
-        experimental_workspace: { register: vi.fn() },
-        serverUrl: new URL("http://127.0.0.1:4096"),
-        $: {} as PluginInput["$"],
-      } satisfies PluginInput
+        client: makeClient({ file: { read: fileRead } }),
+      })
 
       const hooks = await TokenmaxxerPlugin(input)
       const invocationContext = { ...toolContext, directory: project, worktree: project }
@@ -221,18 +232,18 @@ describe("PR 4 §12 F — client injection into efficiency registration", () => 
 
   it("registerEfficiencyTools requires the initializer client (ToolContext.client is not a legitimate source)", async () => {
     const registrationRead = vi.fn(async () => ({ data: { content: "from-registration" } }))
-    const registrationClient = { file: { read: registrationRead } }
-    // Planned Wave 2 signature: registerEfficiencyTools(client: HostClient).
-    // The cast documents the boundary for the current zero-argument signature.
-    const registerWithClient = registerEfficiencyTools as (
-      client: unknown,
-    ) => ReturnType<typeof registerEfficiencyTools>
-    const registered = registerWithClient(registrationClient)
-    const sneaky = {
+    const registrationClient = makeClient({ file: { read: registrationRead } })
+    const registered = registerEfficiencyTools(registrationClient)
+    // A model-controlled context must NOT be able to smuggle a client in. The
+    // intersection is the adversarial shape: `ToolContext` plus an invented
+    // `client` — exactly what a hostile context object would look like. The
+    // supported `ToolContext` type itself still has no client member.
+    const sneaky: ToolContext & {
+      client: { file: { read: FileReadStub } }
+    } = {
       ...toolContext,
-      // A model-controlled context must NOT be able to smuggle a client in.
       client: { file: { read: vi.fn(async () => ({ data: { content: "from-context" } })) } },
-    } as unknown as ToolContext
+    }
 
     const result = await registered.tool.head_files.execute(
       { paths: ["a.ts"], lines: 5 },
