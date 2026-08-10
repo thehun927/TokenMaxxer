@@ -24,3 +24,9 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [test-gap] recall.test.ts extended with 10 failing-on-main tests (§8 authority-aware reads + §9 review-request tool); expected green in Wave 5.
 - [scope-deviation] Tests 22-28 reference _recallPromote({decision_id}) API; current API uses {topic}; the test file will need adapter shim during Wave 1B and the API change ships in Wave 5.
 - [scope-deviation] Test 45 references commitMemoryExact; ensure Wave 1B does not import implementation details that don't exist yet.
+
+## 2026-08-10 — wave-1A new test files
+- [test-gap] decision-authority.test.ts created with 10 failing-on-main tests; expected green in Wave 3 (decision-authority.ts) + Wave 2 (schema + repair).
+- [test-gap] decision-review.test.ts created with 7 failing-on-main tests; expected green in Wave 6 (decision-review.ts).
+- [test-gap] cli.test.ts created with 12 failing-on-main tests; expected green in Wave 6 (src/cli.ts).
+- [scope-deviation] tests 9 (pre-PR3 repair) and 10 (schema rejection of unverified human-review) reference schema.ts fields that don't exist yet; tests use typed casts at boundaries and will be updated in Wave 2 to use the new fields directly.
