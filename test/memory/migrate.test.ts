@@ -261,3 +261,92 @@ describe("loadAndMigrate", () => {
     expect(result!.decisions[0]!.foundational_requested).toBe(false)
   })
 })
+
+// ─── PR 3 §5 compatibility repair ────────────────────────────────────────────
+// These release-gate tests (implementation-plan §15 item 9) fail on the current
+// loadAndMigrate because it passes v3 rows with `extractor="human"` /
+// `confidence="human-reviewed"` but no `human_review` record straight through.
+// Wave 2 adds the conservative in-memory repair before v3 validation.
+describe("PR 3 §5 compatibility repair", () => {
+  function unverifiedHumanClaim(id: string, session: string, topic: string, decision: string) {
+    return {
+      id,
+      topic,
+      decision,
+      rationale: "Best JSON support",
+      timestamp: "2026-08-01T00:00:00.000Z",
+      session_id: session,
+      git_sha: "abc123",
+      still_valid: true,
+      foundational: true,
+      foundational_requested: false,
+      provenance: {
+        extractor: "human",
+        source_session_id: session,
+        confidence: "human-reviewed",
+        evidence: [{ kind: "transcript", ref: `tr-${id}`, digest: "a".repeat(64) }],
+      },
+    }
+  }
+
+  function v3StateWith(decisions: unknown[]): Record<string, unknown> {
+    return {
+      version: 3,
+      project_path: "/test/project",
+      last_updated: "2026-08-08T12:00:00.000Z",
+      last_git_sha: "abc123",
+      last_session_id: "session-v3",
+      active_files: [],
+      decisions,
+      blockers: [],
+      next_steps: [],
+      recent_sessions: [],
+    }
+  }
+
+  it("9. pre-PR3 human-reviewed row without human_review is reclassified on load", () => {
+    const result = loadAndMigrate(v3StateWith([
+      unverifiedHumanClaim("d-human", "sess-human", "database", "Use Postgres"),
+    ]))
+
+    expect(result).not.toBeNull()
+    const d = result!.decisions[0]!
+    // The unverified claim is conservatively reclassified for review.
+    expect(d.foundational).toBe(false)
+    expect(d.foundational_requested).toBe(true)
+    expect(d.provenance?.extractor).toBe("legacy")
+    expect(d.provenance?.confidence).toBe("legacy")
+    // Preserved identity and source fields.
+    expect(d.id).toBe("d-human")
+    expect(d.topic).toBe("database")
+    expect(d.decision).toBe("Use Postgres")
+    expect(d.timestamp).toBe("2026-08-01T00:00:00.000Z")
+    expect(d.session_id).toBe("sess-human")
+    // Existing source/evidence references are preserved.
+    expect(d.provenance?.evidence).toEqual([
+      { kind: "transcript", ref: "tr-d-human", digest: "a".repeat(64) },
+    ])
+    // The repair must NOT leak transcript or command text.
+    expect("transcript" in (d as unknown as Record<string, unknown>)).toBe(false)
+    expect("command" in (d as unknown as Record<string, unknown>)).toBe(false)
+  })
+
+  it("repairs every pre-PR3 legacy unverified human claim on load", () => {
+    const result = loadAndMigrate(v3StateWith([
+      unverifiedHumanClaim("d-human-a", "sess-a", "database", "Use Postgres"),
+      unverifiedHumanClaim("d-human-b", "sess-b", "auth", "Use JWT"),
+    ]))
+
+    expect(result).not.toBeNull()
+    expect(result!.decisions).toHaveLength(2)
+    for (const d of result!.decisions) {
+      expect(d.foundational).toBe(false)
+      expect(d.foundational_requested).toBe(true)
+      expect(d.provenance?.extractor).toBe("legacy")
+      expect(d.provenance?.confidence).toBe("legacy")
+    }
+    const [first, second] = result!.decisions
+    expect(first!.id).toBe("d-human-a")
+    expect(second!.id).toBe("d-human-b")
+  })
+})
