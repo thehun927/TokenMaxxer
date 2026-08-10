@@ -1,14 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { mkdir, mkdtemp, rm } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readFile, rm, utimes } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { tmpdir } from "node:os"
 
-import { readMemoryState } from "../../src/memory/store"
+import { readMemory, readMemoryState, writeMemory } from "../../src/memory/store"
 import {
   globalMemoryPath,
   projectMemoryPath,
 } from "../../src/memory/paths"
 import { emptyMemory } from "../../src/memory/schema"
+import { pruneOld } from "../../src/memory/writer"
 import { atomicWrite } from "../../src/util/fs"
 
 const worktrees: string[] = []
@@ -25,8 +26,20 @@ function memoryJson(project: string, revision: number): string {
   return JSON.stringify({ ...emptyMemory(project), revision }, null, 2)
 }
 
+/** A legacy pre-revision STATE.json document (no `revision` key on disk). */
+function legacyMemoryJson(project: string): string {
+  const { revision: _revision, ...legacy } = emptyMemory(project)
+  return JSON.stringify(legacy, null, 2)
+}
+
 async function writeState(path: string, content: string): Promise<void> {
   await atomicWrite(path, content)
+}
+
+/** Pin a file's mtime to an explicit instant (filesystem-clock independent). */
+async function pinMtime(path: string, iso: string): Promise<void> {
+  const at = new Date(iso)
+  await utimes(path, at, at)
 }
 
 /** Make the given STATE path an unreadable target by placing a directory there. */
@@ -103,37 +116,43 @@ describe("readMemoryState selection", () => {
 
   it("equal revision: project-local wins deterministically", async () => {
     const project = await makeWorktree()
-    await writeState(projectMemoryPath(project), memoryJson(project, 1))
-    await writeState(globalMemoryPath(project), memoryJson(project, 1))
+    const localPath = projectMemoryPath(project)
+    const globalPath = globalMemoryPath(project)
+    await writeState(localPath, memoryJson(project, 1))
+    await writeState(globalPath, memoryJson(project, 1))
+    // Pin BOTH mtimes to the same instant so the equal-revision + equal-mtime
+    // tie-break is exercised exactly.
+    await pinMtime(localPath, "2026-01-01T00:00:00.000Z")
+    await pinMtime(globalPath, "2026-01-01T00:00:00.000Z")
 
     const result = await readMemoryState({ worktree: project, directory: project })
 
+    expect(result.status).toBe("ok")
     expect(result.source).toBe("project")
     expect(result.revision).toBe(1)
   })
 
-  it("local unreadable + no global: no silent empty initialization", async () => {
+  it("local unreadable + no global: unavailable, never a silent empty initialization", async () => {
     const project = await makeWorktree()
     await makeUnreadable(projectMemoryPath(project))
 
     const result = await readMemoryState({ worktree: project, directory: project })
 
-    expect(result).toEqual({
-      memory: null,
-      source: null,
-      path: null,
-      sizeBytes: 0,
-      revision: 0,
-    })
+    expect(result.status).toBe("unavailable")
+    expect(result.memory).toBeNull()
+    expect(result.errors).toEqual([
+      expect.objectContaining({ source: "project", path: projectMemoryPath(project) }),
+    ])
   })
 
-  it("local unreadable + valid global: selects the global source", async () => {
+  it("local unreadable + valid global: selects the global source as ok", async () => {
     const project = await makeWorktree()
     await makeUnreadable(projectMemoryPath(project))
     await writeState(globalMemoryPath(project), memoryJson(project, 1))
 
     const result = await readMemoryState({ worktree: project, directory: project })
 
+    expect(result.status).toBe("ok")
     expect(result.source).toBe("global")
     expect(result.path).toBe(globalMemoryPath(project))
     expect(result.revision).toBe(1)
@@ -181,5 +200,163 @@ describe("readMemoryState selection", () => {
     expect(result.path).toBe(projectMemoryPath(directory))
     expect(result.path).not.toBe(projectMemoryPath("/"))
     expect(result.memory?.project_path).toBe(directory)
+  })
+})
+
+describe("revision monotonicity (PR 1 Blocker 1)", () => {
+  it("sequential writes advance revision 0 → 1 → 2", async () => {
+    const project = await makeWorktree()
+
+    expect(await writeMemory({ worktree: project, directory: project }, emptyMemory(project))).toBe(true)
+    const first = await readMemory({ worktree: project, directory: project })
+    expect(first?.revision).toBe(1)
+
+    expect(await writeMemory({ worktree: project, directory: project }, first!)).toBe(true)
+    const second = await readMemory({ worktree: project, directory: project })
+    expect(second?.revision).toBe(2)
+  })
+
+  it("pruneOld preserves a non-zero revision even when other fields are reduced", () => {
+    const memory = {
+      ...emptyMemory("/worktree"),
+      revision: 7,
+      next_steps: ["x".repeat(10_000)],
+    }
+
+    const result = pruneOld(memory)
+
+    expect(result.revision).toBe(7)
+    expect(result.next_steps).toHaveLength(0)
+  })
+
+  it("readMemory collapses an unavailable state to null for non-mutation callers", async () => {
+    const project = await makeWorktree()
+    await makeUnreadable(projectMemoryPath(project))
+
+    expect(await readMemory({ worktree: project, directory: project })).toBeNull()
+  })
+})
+
+describe("equal-revision mtime resolution (PR 1 Blocker 2)", () => {
+  it("equal revision, global has newer mtime → global wins", async () => {
+    const project = await makeWorktree()
+    const localPath = projectMemoryPath(project)
+    const globalPath = globalMemoryPath(project)
+    await writeState(localPath, memoryJson(project, 1))
+    await writeState(globalPath, memoryJson(project, 1))
+    await pinMtime(localPath, "2026-01-01T00:00:00.000Z")
+    await pinMtime(globalPath, "2026-01-02T00:00:00.000Z")
+
+    const result = await readMemoryState({ worktree: project, directory: project })
+
+    expect(result.status).toBe("ok")
+    expect(result.source).toBe("global")
+    expect(result.path).toBe(globalPath)
+  })
+
+  it("equal revision, local has newer mtime → local wins", async () => {
+    const project = await makeWorktree()
+    const localPath = projectMemoryPath(project)
+    const globalPath = globalMemoryPath(project)
+    await writeState(localPath, memoryJson(project, 1))
+    await writeState(globalPath, memoryJson(project, 1))
+    await pinMtime(localPath, "2026-01-02T00:00:00.000Z")
+    await pinMtime(globalPath, "2026-01-01T00:00:00.000Z")
+
+    const result = await readMemoryState({ worktree: project, directory: project })
+
+    expect(result.status).toBe("ok")
+    expect(result.source).toBe("project")
+    expect(result.path).toBe(localPath)
+  })
+
+  it("equal revision and exact mtime tie → local wins", async () => {
+    const project = await makeWorktree()
+    const localPath = projectMemoryPath(project)
+    const globalPath = globalMemoryPath(project)
+    await writeState(localPath, memoryJson(project, 1))
+    await writeState(globalPath, memoryJson(project, 1))
+    await pinMtime(localPath, "2026-01-01T00:00:00.000Z")
+    await pinMtime(globalPath, "2026-01-01T00:00:00.000Z")
+
+    const result = await readMemoryState({ worktree: project, directory: project })
+
+    expect(result.status).toBe("ok")
+    expect(result.source).toBe("project")
+  })
+
+  it("legacy dual-file states (both defaulted to revision 0) resolve by mtime: newer global wins", async () => {
+    const project = await makeWorktree()
+    const localPath = projectMemoryPath(project)
+    const globalPath = globalMemoryPath(project)
+    // Neither file carries a `revision` key; zod defaults both to 0.
+    await writeState(localPath, legacyMemoryJson(project))
+    await writeState(globalPath, legacyMemoryJson(project))
+    await pinMtime(localPath, "2026-01-01T00:00:00.000Z")
+    await pinMtime(globalPath, "2026-01-02T00:00:00.000Z")
+
+    const result = await readMemoryState({ worktree: project, directory: project })
+
+    expect(result.status).toBe("ok")
+    expect(result.revision).toBe(0)
+    expect(result.source).toBe("global")
+    expect(result.path).toBe(globalPath)
+  })
+
+  it("higher revision still wins regardless of mtime", async () => {
+    const project = await makeWorktree()
+    const localPath = projectMemoryPath(project)
+    const globalPath = globalMemoryPath(project)
+    await writeState(localPath, memoryJson(project, 5))
+    await writeState(globalPath, memoryJson(project, 3))
+    await pinMtime(localPath, "2026-01-01T00:00:00.000Z")
+    await pinMtime(globalPath, "2026-01-02T00:00:00.000Z")
+
+    const result = await readMemoryState({ worktree: project, directory: project })
+
+    expect(result.status).toBe("ok")
+    expect(result.source).toBe("project")
+    expect(result.revision).toBe(5)
+  })
+})
+
+describe("unavailable-state safety (PR 1 Blocker 3)", () => {
+  it("re-reads an unreadable candidate after permission is restored without an mtime change", async () => {
+    const project = await makeWorktree()
+    const path = projectMemoryPath(project)
+    await writeState(path, memoryJson(project, 3))
+
+    // chmod changes ctime, not mtime, so the cached mtime pair is identical
+    // after the permission flip. Only the error-derived cache skip can force
+    // a re-read on the next access.
+    await chmod(path, 0o000)
+    const before = await readMemoryState({ worktree: project, directory: project })
+    expect(before.status).toBe("unavailable")
+    expect(before.errors).toEqual([
+      expect.objectContaining({ source: "project", path }),
+    ])
+
+    await chmod(path, 0o644)
+    const after = await readMemoryState({ worktree: project, directory: project })
+    expect(after.status).toBe("ok")
+    expect(after.revision).toBe(3)
+  })
+
+  it("does not cache a directory-derived unavailable selection", async () => {
+    const project = await makeWorktree()
+    const path = projectMemoryPath(project)
+    await makeUnreadable(path)
+
+    const before = await readMemoryState({ worktree: project, directory: project })
+    expect(before.status).toBe("unavailable")
+
+    // Restore readability: replace the directory with a valid STATE file.
+    await rm(path, { recursive: true, force: true })
+    await writeState(path, memoryJson(project, 4))
+
+    // No bypassCache: the cached "unavailable" selection must not be reused.
+    const after = await readMemoryState({ worktree: project, directory: project })
+    expect(after.status).toBe("ok")
+    expect(after.revision).toBe(4)
   })
 })

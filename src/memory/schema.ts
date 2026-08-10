@@ -216,6 +216,7 @@ export const MemoryFileSchema = MemoryFileBaseSchema.superRefine((memory, ctx) =
 export type MemoryFile = Omit<
   z.input<typeof MemoryFileBaseSchema>,
   | "version"
+  | "revision"
   | "active_files"
   | "decisions"
   | "blockers"
@@ -224,6 +225,7 @@ export type MemoryFile = Omit<
   | "llm_extraction_cache"
 > & {
   version: number
+  revision: number
   active_files: ActiveFile[]
   decisions: Decision[]
   blockers: string[]

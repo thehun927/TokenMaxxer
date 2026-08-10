@@ -11,7 +11,7 @@ import type {
   Provenance,
 } from "./schema"
 import type { ExtractedFacts, TranscriptMessage } from "../types"
-import { readMemory, writeMemory, emptyMemory, resolveProjectPath } from "./store"
+import { readMemoryState, writeMemory, emptyMemory, resolveProjectPath } from "./store"
 import { enqueueProjectJob, setProjectQueueOutcome } from "./lock"
 import { getCurrentGitSha } from "../util/git"
 import { atomicWrite } from "../util/fs"
@@ -250,10 +250,22 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     if (!allMessages || allMessages.length === 0) return "no-messages"
 
     const messages = allMessages.slice(-TRANSCRIPT_WINDOW)
-    const existing = (await readMemory({ worktree, directory })) ?? emptyMemory(project)
+    // Fail closed on an unreadable STATE: an "unavailable" base must never be
+    // treated as permission to initialize empty memory (that would silently
+    // destroy durable facts on the next atomic rename).
+    const existingState = await readMemoryState({ worktree, directory })
+    if (existingState.status === "unavailable") {
+      void log(client, "warn", "memory read failed; refusing to mutate", { project })
+      return "write-failed"
+    }
+    const existing = existingState.memory ?? emptyMemory(project)
     // Operational audit guards, like the result cache itself, must not change
     // the identity of the same source transcript on a later idle/reload.
-    const canonicalPrior = { ...existing, llm_extraction_audits: undefined }
+    // `revision` is storage-freshness metadata, not semantic state: it bumps
+    // on every heuristic write, so normalizing it out of the fingerprint keeps
+    // the LLM cache stable across mutations that did not change the meaning of
+    // the prior state.
+    const canonicalPrior = { ...existing, llm_extraction_audits: undefined, revision: 0 }
     const canonicalInput = buildCanonicalInput(messages, canonicalPrior)
     const gitSha = await getCurrentGitSha(worktree)
     const extracted = extractFactsHeuristic(messages)
@@ -304,7 +316,15 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     // This is the first cache check under the project queue, immediately
     // before any retained audit session or prompt can be created.
     const cacheKey = extractionCacheKey(sessionId, canonicalInput, cacheConfig.model)
-    const afterHeuristic = (await readMemory({ worktree, directory })) ?? pruned
+    // Heuristic facts were already persisted above, but the authoritative
+    // state is now unreadable, so no cache check or LLM step may build on it.
+    // Stop at the heuristic-only boundary (matching the catch-all outcome).
+    const afterHeuristicState = await readMemoryState({ worktree, directory })
+    if (afterHeuristicState.status === "unavailable") {
+      void log(client, "warn", "memory read failed; refusing cache/LLM merge", { project })
+      return "heuristic-only"
+    }
+    const afterHeuristic = afterHeuristicState.memory ?? pruned
     const cachedEntry = readExtractionCacheEntry(afterHeuristic, cacheKey, {
       evidenceCandidateMap: candidates,
       evidenceDigestMap: digests,
@@ -353,7 +373,14 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     let extractionAuditSessionID: string | undefined
     const persistAudit: AuditCreatedCallback = async (audit) => {
       extractionAuditSessionID = audit.audit_session_id
-      const latest = (await readMemory({ worktree, directory })) ?? afterHeuristic
+      // Fail this audit registration on an unavailable STATE so the LLM step
+      // aborts instead of persisting an audit guard on an unknown base.
+      const latestState = await readMemoryState({ worktree, directory })
+      if (latestState.status === "unavailable") {
+        void log(client, "warn", "memory read failed; refusing audit registration", { project })
+        return false
+      }
+      const latest = latestState.memory ?? afterHeuristic
       const guarded = upsertAuditMetadata(latest, audit)
       return writeMemory({ worktree, directory, client }, pruneOld(guarded, client))
     }
@@ -361,7 +388,14 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       auditSessionID: string,
       outcome: Exclude<AuditTerminalOutcome, "pending">,
     ): Promise<void> => {
-      const latest = await readMemory({ worktree, directory })
+      // Swallow unavailability: skipping a terminal audit outcome is safe and
+      // preferable to writing one on an unknown base.
+      const latestState = await readMemoryState({ worktree, directory })
+      if (latestState.status === "unavailable") {
+        void log(client, "warn", "memory read failed; skipping audit terminal outcome", { project })
+        return
+      }
+      const latest = latestState.memory
       if (!latest) return
       const updated = setAuditTerminalOutcome(latest, auditSessionID, outcome)
       await writeMemory({ worktree, directory, client }, pruneOld(updated, client))
@@ -383,7 +417,14 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
         onAuditCreated: persistAudit,
         onAuditTerminal: persistTerminal,
         onHealthOutcome: async (report) => {
-          const latest = await readMemory({ worktree, directory })
+          // Swallow unavailability: a dropped model-health record is acceptable;
+          // writing one on an unknown base is not.
+          const latestState = await readMemoryState({ worktree, directory })
+          if (latestState.status === "unavailable") {
+            void log(client, "warn", "memory read failed; skipping model health update", { project })
+            return
+          }
+          const latest = latestState.memory
           if (!latest) return
           const updated = upsertModelHealth(latest, report)
           await writeMemory({ worktree, directory, client }, pruneOld(updated, client))
@@ -398,7 +439,14 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     // Re-read under the same project transaction immediately before the final
     // merge/upsert. A duplicate completion therefore replaces, rather than
     // appends, the same cache identity.
-    const latest = (await readMemory({ worktree, directory })) ?? pruned
+    const latestState = await readMemoryState({ worktree, directory })
+    if (latestState.status === "unavailable") {
+      // LLM facts exist but cannot be committed to an authoritatively readable
+      // base, so report the failure rather than merging onto empty memory.
+      void log(client, "warn", "memory read failed; refusing final LLM merge", { project })
+      return "llm-failed"
+    }
+    const latest = latestState.memory ?? pruned
     const cacheAlreadyCommitted = readExtractionCacheEntry(latest, selectedCacheKey, {
       evidenceCandidateMap: candidates,
       evidenceDigestMap: digests,
@@ -522,8 +570,14 @@ async function mergeAsyncFacts(
   mergeOptions: MergeOptions,
 ): Promise<boolean> {
   const project = resolveProjectPath(opts.worktree, opts.directory)
-  const latest = (await readMemory({ worktree: opts.worktree, directory: opts.directory }))
-    ?? emptyMemory(project)
+  // Fail closed: never merge async facts onto empty memory when the existing
+  // STATE is unreadable.
+  const latestState = await readMemoryState({ worktree: opts.worktree, directory: opts.directory })
+  if (latestState.status === "unavailable") {
+    void log(opts.client, "warn", "memory read failed; refusing async facts merge", { project })
+    return false
+  }
+  const latest = latestState.memory ?? emptyMemory(project)
   const merged = mergeMemory(latest, facts, {
     sessionId,
     gitSha,
@@ -1528,6 +1582,10 @@ export function pruneOld(mem: MemoryFile, client?: unknown, now = Date.now()): M
   // Deep clone (don't mutate input)
   const cloned: MemoryFile = {
     version: mem.version,
+    // revision is the monotonic freshness signal: it MUST survive every
+    // reconstruction, otherwise a nonzero revision would silently reset to 0
+    // and the resolver could resurrect stale global state.
+    revision: mem.revision,
     project_path: mem.project_path,
     last_updated: mem.last_updated,
     last_git_sha: mem.last_git_sha,

@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { mkdtemp, rm } from "node:fs/promises"
-import { join } from "node:path"
+import { chmod, mkdir, mkdtemp, readFile, rm } from "node:fs/promises"
+import { dirname, join } from "node:path"
 import { tmpdir } from "node:os"
 
 import { writeMemoryOnIdle } from "../../src/memory/writer"
 import { pruneOld } from "../../src/memory/writer"
 import { readMemory, writeMemory } from "../../src/memory/store"
+import { globalMemoryPath, projectMemoryPath } from "../../src/memory/paths"
 import { emptyMemory, type LLMAuditMetadata } from "../../src/memory/schema"
+import { atomicWrite } from "../../src/util/fs"
 import {
   isPersistedRetainedExtractionSession,
   extractFactsLLM,
@@ -412,5 +414,105 @@ describe("P0-A idle reliability", () => {
       entry?.body?.message === "sdk_host_version_gate" &&
       entry.body.extra?.reason === "unsupported-version"
     ))).toBe(true)
+  })
+
+  it("does not destroy durable local memory when STATE is unreadable and no global exists", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
+    const project = await worktree()
+    const statePath = projectMemoryPath(project)
+    const seeded = emptyMemory(project)
+    seeded.revision = 5
+    seeded.decisions = [{
+      id: "local-durable-1",
+      topic: "local-durable-topic",
+      decision: "Keep the local durable decision",
+      timestamp: "2026-08-09T00:00:00.000Z",
+      session_id: "source",
+      still_valid: true,
+      foundational: false,
+      provenance: {
+        extractor: "legacy",
+        source_session_id: "legacy",
+        confidence: "legacy",
+        evidence: [],
+      },
+    }]
+    await mkdir(join(project, ".opencode", "memory"), { recursive: true })
+    await atomicWrite(statePath, JSON.stringify(seeded, null, 2))
+
+    // Force EACCES with chmod 000 (non-root UID): readFile is genuinely
+    // denied while the file's content stays intact on disk. The parent
+    // directory remains writable, so any attempted atomic rename would
+    // succeed — exactly the destructive case the writer must refuse.
+    await chmod(statePath, 0o000)
+
+    const client = clientFor({ source: messages() })
+    const outcome = await writeMemoryOnIdle({
+      client,
+      worktree: project,
+      directory: project,
+      sessionId: "source",
+    })
+
+    // Fail closed: no mutation may proceed from an unknown base.
+    expect(outcome).toBe("write-failed")
+
+    // Durable memory must be untouched: restore readability and read the file
+    // directly (bypassing the store cache) to prove the decision + revision
+    // survived.
+    await chmod(statePath, 0o644)
+    const raw = await readFile(statePath, "utf-8")
+    const onDisk = JSON.parse(raw) as { revision: number; decisions: Array<{ topic: string }> }
+    expect(onDisk.revision).toBe(5)
+    expect(onDisk.decisions.some((decision) => decision.topic === "local-durable-topic")).toBe(true)
+  })
+
+  it("preserves durable global memory when only the local STATE is unreadable", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
+    const project = await worktree()
+    const localPath = projectMemoryPath(project)
+    const globalPath = globalMemoryPath(project)
+    const globalMemory = emptyMemory(project)
+    globalMemory.revision = 2
+    globalMemory.decisions = [{
+      id: "global-durable-1",
+      topic: "global-durable-topic",
+      decision: "Keep the global durable decision",
+      timestamp: "2026-08-09T00:00:00.000Z",
+      session_id: "source",
+      still_valid: true,
+      foundational: false,
+      provenance: {
+        extractor: "legacy",
+        source_session_id: "legacy",
+        confidence: "legacy",
+        evidence: [],
+      },
+    }]
+    await mkdir(dirname(globalPath), { recursive: true })
+    await atomicWrite(globalPath, JSON.stringify(globalMemory, null, 2))
+
+    // Local STATE becomes unreadable (directory surrogate); global remains the
+    // parseable authoritative candidate, so the writer must build on it.
+    await mkdir(join(project, ".opencode", "memory"), { recursive: true })
+    await mkdir(localPath)
+
+    const client = clientFor({ source: messages() })
+    const outcome = await writeMemoryOnIdle({
+      client,
+      worktree: project,
+      directory: project,
+      sessionId: "source",
+    })
+
+    // Project write fails (a directory sits at the STATE path), so the write
+    // lands on the global fallback — which must still carry the durable
+    // decision (revision 2 → 3 after the successful merge write).
+    expect(outcome).toBe("heuristic-only")
+
+    const raw = await readFile(globalPath, "utf-8")
+    const onDisk = JSON.parse(raw) as { revision: number; decisions: Array<{ topic: string }> }
+    expect(onDisk.revision).toBe(3)
+    expect(onDisk.decisions.some((decision) => decision.topic === "global-durable-topic")).toBe(true)
   })
 })

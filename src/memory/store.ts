@@ -6,7 +6,7 @@
  * "missing" from "unreadable".  A read error is never silently treated as a
  * missing file and never authorizes empty-memory initialization.
  */
-import { readFileResult, safeRead, getMtime, atomicWrite } from "../util/fs"
+import { readFileResult, getMtime, atomicWrite } from "../util/fs"
 import type { FileReadResult } from "../util/fs"
 import { resolveProjectPath, projectMemoryPath, globalMemoryPath } from "./paths"
 import { loadAndMigrate } from "./migrate"
@@ -17,13 +17,26 @@ import { MEMORY_MAX_BYTES, memorySizeBytes, serializeMemory } from "./memory-siz
 
 export type MemorySource = "project" | "global"
 
-export type MemoryReadResult = {
-  memory: MemoryFile | null
-  source: MemorySource | null
-  path: string | null
-  sizeBytes: number
-  revision: number
-}
+export type MemoryReadStatus = "ok" | "missing" | "unavailable"
+
+/**
+ * The authoritative read outcome, discriminated so the type system can switch
+ * on it. Mutation callers MUST consume `readMemoryState` and fail closed on
+ * `"unavailable"` — that status means the state could not be authoritatively
+ * read and must never be treated as permission to start from empty memory.
+ */
+export type MemoryReadResult =
+  | { status: "ok"; memory: MemoryFile; source: MemorySource; path: string; sizeBytes: number; revision: number }
+  | { status: "missing"; memory: null; source: null; path: null; sizeBytes: 0; revision: 0 }
+  | {
+      status: "unavailable"
+      memory: null
+      source: null
+      path: null
+      sizeBytes: 0
+      revision: 0
+      errors: Array<{ source: MemorySource; path: string; code?: string }>
+    }
 
 /** A single candidate file's cached read outcome plus its invalidation mtime. */
 type CacheEntry = { mtime: number | null; readResult: FileReadResult }
@@ -43,7 +56,7 @@ const cache = new Map<string, CacheValue>()
 
 /** Classification of one candidate after reading, parsing, and migrating. */
 type Candidate =
-  | { kind: "memory"; memory: MemoryFile; sizeBytes: number; revision: number }
+  | { kind: "memory"; memory: MemoryFile; sizeBytes: number; mtime: number | null; revision: number }
   | { kind: "error"; code?: string }
   | { kind: "none" }
 
@@ -51,7 +64,8 @@ type Candidate =
  * Turn a raw typed read into a candidate:
  *  - missing → none
  *  - error (unreadable) → explicit error state, never treated as missing
- *  - ok + parseable + valid → memory
+ *  - ok + parseable + valid → memory (carrying the file's mtime for the
+ *    equal-revision tie-break)
  *  - ok + corrupt (bad JSON or invalid shape) → backed up and treated as none
  */
 async function candidateFrom(path: string, result: FileReadResult): Promise<Candidate> {
@@ -76,10 +90,8 @@ async function candidateFrom(path: string, result: FileReadResult): Promise<Cand
     kind: "memory",
     memory: mem,
     sizeBytes: Buffer.byteLength(result.content, "utf8"),
-    // `MemoryFile` models the construction input shape, where the zod
-    // `default(0)` makes `revision` optional. `loadAndMigrate` always applies
-    // the default, so `?? 0` is a pure type-level guard.
-    revision: mem.revision ?? 0,
+    mtime: result.mtime,
+    revision: mem.revision,
   }
 }
 
@@ -89,6 +101,7 @@ function resultFromCandidate(
   candidate: Extract<Candidate, { kind: "memory" }>,
 ): MemoryReadResult {
   return {
+    status: "ok",
     memory: candidate.memory,
     source,
     path,
@@ -99,11 +112,12 @@ function resultFromCandidate(
 
 /**
  * Deterministic selection between the two candidates:
- *  - both parseable → higher revision wins; equal revision → project wins
+ *  - both parseable → higher revision wins; if revisions tie, newer mtime
+ *    wins; if both tie, project-local wins
  *  - exactly one parseable → it wins (even when the other is unreadable)
  *  - neither parseable:
- *      - both unreadable → no memory + a bounded warning (never empty init)
- *      - otherwise (missing/corrupt involved) → no memory, no warning
+ *      - any candidate unreadable → "unavailable" (never empty init)
+ *      - otherwise (missing/corrupt involved) → "missing"
  */
 function selectCandidate(
   localPath: string,
@@ -113,23 +127,60 @@ function selectCandidate(
   client?: unknown,
 ): MemoryReadResult {
   if (local.kind === "memory" && global.kind === "memory") {
+    // 1. Higher revision wins.
+    if (local.revision > global.revision) {
+      return resultFromCandidate("project", localPath, local)
+    }
     if (global.revision > local.revision) {
       return resultFromCandidate("global", globalPath, global)
     }
+    // 2. Revisions tied → newer candidate mtime wins. `mtime ?? 0` is the
+    //    correct comparison: legacy dual-file states carry both null mtimes
+    //    (0 === 0), falling through to the project-local preference below.
+    if ((global.mtime ?? 0) > (local.mtime ?? 0)) {
+      return resultFromCandidate("global", globalPath, global)
+    }
+    // 3. Revisions AND mtime tied → deterministic project-local preference.
     return resultFromCandidate("project", localPath, local)
   }
   if (local.kind === "memory") return resultFromCandidate("project", localPath, local)
   if (global.kind === "memory") return resultFromCandidate("global", globalPath, global)
 
-  if (local.kind === "error" && global.kind === "error") {
-    void log(client, "warn", "memory read failed for both candidates", {
-      project: localPath,
-      global: globalPath,
-      projectError: local.code ?? "",
-      globalError: global.code ?? "",
-    })
+  // Neither candidate parsed as memory. Collect every read error so the
+  // caller can distinguish "genuinely absent" from "cannot be determined".
+  const localError = local.kind === "error" ? local.code : undefined
+  const globalError = global.kind === "error" ? global.code : undefined
+  const errors: Array<{ source: MemorySource; path: string; code?: string }> = []
+  if (local.kind === "error") {
+    errors.push({ source: "project", path: localPath, code: localError })
   }
-  return { memory: null, source: null, path: null, sizeBytes: 0, revision: 0 }
+  if (global.kind === "error") {
+    errors.push({ source: "global", path: globalPath, code: globalError })
+  }
+
+  if (errors.length > 0) {
+    if (errors.length === 2) {
+      void log(client, "warn", "memory read failed for both candidates", {
+        project: localPath,
+        global: globalPath,
+        projectError: localError ?? "",
+        globalError: globalError ?? "",
+      })
+    }
+    // Any unreadable candidate means the authoritative state is unknown. This
+    // is NOT "missing" and must never authorize empty-memory initialization.
+    return {
+      status: "unavailable",
+      memory: null,
+      source: null,
+      path: null,
+      sizeBytes: 0,
+      revision: 0,
+      errors,
+    }
+  }
+
+  return { status: "missing", memory: null, source: null, path: null, sizeBytes: 0, revision: 0 }
 }
 
 /**
@@ -159,7 +210,13 @@ export async function readMemoryState(args: {
     !args.bypassCache &&
     cached &&
     cached.local?.mtime === localMtime &&
-    cached.global?.mtime === globalMtime
+    cached.global?.mtime === globalMtime &&
+    // A permission flip (chmod 000 -> readable) changes ctime, not mtime, so
+    // an mtime-identical cached pair can still be stale. Never reuse a cached
+    // selection that was derived from an error — re-read both candidates so
+    // restored permissions are honored on the next access.
+    cached.local.readResult.kind !== "error" &&
+    cached.global.readResult.kind !== "error"
   ) {
     return cached.selected
   }
@@ -190,12 +247,20 @@ export async function readMemoryState(args: {
 /**
  * Read the selected memory file for a project, or null when no authoritative
  * memory is available.  Compatibility wrapper over `readMemoryState`.
+ *
+ * Non-mutation callers may use this. Mutation callers MUST consume
+ * `readMemoryState` directly so an "unavailable" state (unreadable files) is
+ * never collapsed into a missing-file `null` that authorizes empty init.
  */
 export async function readMemory(args: {
   worktree: string
   directory: string
 }): Promise<MemoryFile | null> {
-  return (await readMemoryState(args)).memory
+  const result = await readMemoryState(args)
+  if (result.status === "ok") return result.memory
+  // "missing" and "unavailable" both collapse to null for the read-only
+  // wrapper; only true "missing" may authorize empty-memory initialization.
+  return null
 }
 
 /**
@@ -214,9 +279,15 @@ export async function writeMemory(
     // the final guard against an unproven LLM cache or provenance-less fact.
     return false
   }
+  // Every successful logical mutation advances revision by exactly one from
+  // the validated in-memory base. The increment lives INSIDE the write path so
+  // callers never need to pre-increment and can never accidentally persist an
+  // unchanged revision. Serialization, size accounting, and both write paths
+  // (project + global fallback) all use the incremented `next`.
+  const next = { ...validated.data, revision: validated.data.revision + 1 }
   const path = projectMemoryPath(project)
-  const json = serializeMemory(validated.data)
-  const bytes = memorySizeBytes(validated.data)
+  const json = serializeMemory(next)
+  const bytes = memorySizeBytes(next)
 
   if (bytes > MEMORY_MAX_BYTES) {
     // The size limit is a hard storage invariant. Callers may try pruning
