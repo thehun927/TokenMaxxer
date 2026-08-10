@@ -59,3 +59,10 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [test-fix] §12 C case 20 fixture was mathematically unsatisfiable as written: the hidden tail `"x".repeat(500)` is an indistinguishable substring of the visible 2000-char truncated line, so `not.toContain(tail)` can never pass for any correct formatter. Changed the long line to `"x".repeat(headLineChars) + "y".repeat(500)` so the tail is distinguishable; assertion and intent unchanged — test/tools/bounds.test.ts:150-165.
 - [test-fix] §12 C case 23 fixture was mathematically unsatisfiable as written: `hiddenTail` was placed inside EVERY section, so it landed in the 64 KB kept prefix (sections 1-4 fit fully under the cap) before the total marker. Moved the tail to only the long-line section (removed by the line marker) and the last section (beyond the total-output cut); the assertion `not.toContain(hiddenTail)` and the test intent are unchanged — test/tools/bounds.test.ts:181-204.
 - [test-gap] Full suite now fails only the out-of-scope Wave 1 fixtures: §12 D items 24/29 (llm-adapter), §12 E items 35-38 (writer-llm), §12 F item 45 (index tool-map merge), package-meta item 40 (peer range `>=1.0.0 <2.0.0`); §12 B 8-18 and §12 C 19-23 are green.
+
+## 2026-08-10 — wave-4 full-version runtime gating
+- [design-decision] Removed local VERIFIED_HOST_CONTRACT_VERSION and MINIMUM_HOST_CONTRACT constants from llm-adapter.ts; now imported from src/host/contract.ts so install-time and runtime claims cannot diverge.
+- [design-decision] Full-version gate uses isSupportedHostVersion from src/host/contract.ts; truth table matches plan §5.1.
+- [design-decision] Retained the pinned-compatibility path for the verified 1.18.15 minimum SDK that lacks global.health.
+- [design-decision] Structured-output compatibility casts remain centralized in llm-adapter.ts (V1ClientLike shape).
+- [test-gap] §12 D fixtures (items 24-34) now green.

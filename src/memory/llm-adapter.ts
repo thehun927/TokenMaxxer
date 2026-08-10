@@ -7,9 +7,11 @@
  * never need to inspect an SDK response body.
  */
 import { log } from "../util/log"
-
-export const VERIFIED_HOST_CONTRACT_VERSION = "1.18.15"
-export const MINIMUM_HOST_CONTRACT = "1.18"
+import {
+  MIN_SUPPORTED_OPENCODE_VERSION,
+  VERIFIED_HOST_CONTRACT_VERSION,
+  isSupportedHostVersion,
+} from "../host/contract"
 
 export type StructuredModel = {
   providerID: string
@@ -349,16 +351,6 @@ export async function requestStructuredOutput(
   }
 }
 
-function parseHostVersion(version: string): { major: number; minor: number } | null {
-  const match = /^(\d+)\.(\d+)(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?$/.exec(version)
-  if (!match) return null
-  const major = Number(match[1])
-  const minor = Number(match[2])
-  return Number.isSafeInteger(major) && Number.isSafeInteger(minor)
-    ? { major, minor }
-    : null
-}
-
 function healthGateFromResponse(response: unknown): HostHealthGate {
   if (!isRecord(response) || response.error != null || !isRecord(response.data)) {
     return { allowed: false, source: "health", reason: "malformed-health" }
@@ -376,9 +368,10 @@ function healthGateFromResponse(response: unknown): HostHealthGate {
     return { allowed: false, source: "health", reason: "malformed-health" }
   }
 
-  const parsed = parseHostVersion(health.version)
-  const minimum = parseHostVersion(MINIMUM_HOST_CONTRACT)
-  if (!parsed || !minimum || parsed.major !== minimum.major || parsed.minor < minimum.minor) {
+  // Full-version gate: compare the complete stable tuple (major/minor/patch)
+  // against the shared src/host/contract.ts policy.  Rejects too-old, 2.x,
+  // malformed, and prerelease versions (plan §5.1 / §8).
+  if (!isSupportedHostVersion(health.version)) {
     return {
       allowed: false,
       source: "health",
@@ -436,7 +429,7 @@ export async function getHostStructuredContractGate(
   }
   void log(clientValue, cachedHealthGate.allowed ? "debug" : "warn", "sdk_host_version_gate", {
     reason: cachedHealthGate.reason,
-    expected: `>=${MINIMUM_HOST_CONTRACT} (verified ${VERIFIED_HOST_CONTRACT_VERSION})`,
+    expected: `>=${MIN_SUPPORTED_OPENCODE_VERSION} (verified ${VERIFIED_HOST_CONTRACT_VERSION})`,
     ...(cachedHealthGate.hostVersion ? { host_version: cachedHealthGate.hostVersion } : {}),
   })
   return cachedHealthGate
