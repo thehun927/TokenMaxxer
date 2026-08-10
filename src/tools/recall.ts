@@ -6,7 +6,7 @@
  * for direct testability without invoking the opencode tool runtime.
  */
 import { tool } from "@opencode-ai/plugin"
-import { readMemory, writeMemory, resolveProjectPath } from "../memory/store"
+import { readMemory, mutateMemory, resolveProjectPath } from "../memory/store"
 import {
   queryDecisions,
   getActiveFiles,
@@ -93,28 +93,68 @@ export async function _recallPromote(
     // review after this tool returns.
     const operationKey = `recall-promote:${args.topic.trim().toLowerCase().slice(0, 256)}`
     return await enqueueProjectJob(project, operationKey, async () => {
+      // Read-only short-circuit: preserve the "no project memory" output and
+      // avoid a transaction when there is nothing to promote. This read does
+      // not need the lock (PR 2 §11.F); the authoritative mutation below does.
+      const pre = await readMemory({ worktree: context.worktree, directory: context.directory })
+      if (!pre) return "No project memory."
+      // PR 2 §11.G: promotion authority/human-review semantics are UNCHANGED
+      // (PR 3 will redesign them). Wave 5 only replaces the unsafe
+      // read/modify/write with a single transactional `mutateMemory` so a
+      // concurrent idle write cannot erase the promotion. The mutation runs
+      // on the authoritative lock-read base, not a stale pre-lock snapshot.
+      const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
+        { worktree: context.worktree, directory: context.directory },
+        (base) => {
+          const d = base.decisions.find(
+            (candidate) => candidate.topic.toLowerCase() === args.topic.toLowerCase(),
+          )
+          if (!d) {
+            return { kind: "noop", value: { outcome: "noop" } }
+          }
+          const promoted: typeof d = {
+            ...d,
+            foundational: true,
+            foundational_requested: false,
+          }
+          const reviewSession = context.sessionID ?? context.sessionId ?? d.session_id ?? "human-review"
+          promoted.provenance = {
+            ...(d.provenance ?? {
+              extractor: "legacy" as const,
+              source_session_id: d.session_id || "legacy",
+              confidence: "legacy" as const,
+              evidence: [],
+            }),
+            extractor: "human",
+            source_session_id: reviewSession,
+            confidence: "human-reviewed",
+          }
+          return {
+            kind: "commit",
+            memory: {
+              ...base,
+              decisions: base.decisions.map((candidate) =>
+                candidate.topic.toLowerCase() === args.topic.toLowerCase() ? promoted : candidate,
+              ),
+            },
+            value: { outcome: "committed" },
+          }
+        },
+      )
+
+      if (result.status === "lock-timeout" || result.status === "commit-failed" || result.status === "unavailable") {
+        // Best-effort promotion failure: bounded, non-throwing. PR 3 will
+        // redesign promotion authority; Wave 5 keeps the failure surface.
+        return "promotion-write-failed"
+      }
+      if (result.status === "noop") {
+        return `No decision with topic "${args.topic}".`
+      }
       const mem = await readMemory({ worktree: context.worktree, directory: context.directory })
-      if (!mem) return "No project memory."
-      const d = mem.decisions.find(
-        (d) => d.topic.toLowerCase() === args.topic.toLowerCase(),
+      const d = mem?.decisions.find(
+        (candidate) => candidate.topic.toLowerCase() === args.topic.toLowerCase(),
       )
       if (!d) return `No decision with topic "${args.topic}".`
-      d.foundational = true
-      d.foundational_requested = false
-      const reviewSession = context.sessionID ?? context.sessionId ?? d.session_id ?? "human-review"
-      d.provenance = {
-        ...(d.provenance ?? {
-          extractor: "legacy" as const,
-          source_session_id: d.session_id || "legacy",
-          confidence: "legacy" as const,
-          evidence: [],
-        }),
-        extractor: "human",
-        source_session_id: reviewSession,
-        confidence: "human-reviewed",
-      }
-      const persisted = await writeMemory({ worktree: context.worktree, directory: context.directory }, mem)
-      if (persisted === false) return "Promotion was not persisted."
       return `Promoted: ${d.topic}: ${d.decision}${d.provenance ? ` [${decisionProvenanceLabel(d)}]` : ""}`
     })
   } catch (e) {
