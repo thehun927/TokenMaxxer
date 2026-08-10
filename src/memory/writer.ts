@@ -4,6 +4,7 @@
  */
 import type {
   MemoryFile,
+  Decision,
   AuditTerminalOutcome,
   LLMAuditMetadata,
   Evidence,
@@ -1695,6 +1696,40 @@ function boundedModelHealth(memories: NonNullable<MemoryFile["model_health"]>): 
 }
 
 /**
+ * PR 3 §13 — foundational retention predicate.
+ *
+ * Post-repair `foundational` is a meaningful retention signal: the Wave 2
+ * compatibility repair removes unverified pre-PR3 `foundational=true`
+ * promotion claims on load, so a surviving `foundational === true` row is a
+ * confirmed retention intent. Only these rows are protected from ordinary
+ * pruning.
+ */
+function retentionProtected(decision: Decision): boolean {
+  return decision.foundational === true
+}
+
+/**
+ * Deterministic protected-first decision selection for the count-pressure
+ * stages (PR 3 §13.3).
+ *
+ * Every foundational decision is always retained. The numeric stage target
+ * (10 in stage 6, 5 in stage 7) is a target for DISPOSABLE (non-foundational)
+ * rows, NOT permission to delete protected state: up to `target` newest
+ * non-foundational rows fill the remainder. If foundational rows alone exceed
+ * the target, all of them are still kept and the function may intentionally
+ * over-cap — the commitMemoryExact size guard catches any unrepresentable
+ * state (PR 3 §13.4).
+ */
+function protectedFirstNewest(candidates: Decision[], target: number): Decision[] {
+  const foundationals = candidates.filter(retentionProtected)
+  const disposables = candidates
+    .filter((d) => !retentionProtected(d))
+    .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+  const disposablesToKeep = disposables.slice(0, Math.max(0, target))
+  return [...foundationals, ...disposablesToKeep]
+}
+
+/**
  * Prune a MemoryFile toward the 8KB cap.
  * Returns a NEW object (deep clone) — does not mutate input.
  * Full algorithm in docs/IMPLEMENTATION.md Appendix A.3.
@@ -1757,8 +1792,16 @@ export function pruneOld(mem: MemoryFile, client?: unknown, now = Date.now()): M
   // 1. Check if within cap
   if (jsonSize(cloned) <= MEMORY_MAX_BYTES) return cloned
 
-  // 2. Remove all decisions where still_valid === false
-  cloned.decisions = cloned.decisions.filter((d) => d.still_valid)
+  // 2. Remove all decisions where still_valid === false, UNLESS the row is a
+  //    protected foundational conflict record. Explicit human supersession
+  //    clears `foundational` on the old authority (supersedeHumanAuthority,
+  //    Wave 6), so deliberately superseded history becomes normally prunable
+  //    again here.
+  cloned.decisions = cloned.decisions.filter((d) => {
+    if (d.still_valid) return true
+    if (retentionProtected(d)) return true
+    return false
+  })
   if (jsonSize(cloned) <= MEMORY_MAX_BYTES) return cloned
 
   // 3. Cap active_files at 8 entries (sort by last_touched desc, keep top 8)
@@ -1767,8 +1810,10 @@ export function pruneOld(mem: MemoryFile, client?: unknown, now = Date.now()): M
     .slice(0, 8)
   if (jsonSize(cloned) <= MEMORY_MAX_BYTES) return cloned
 
-  // 4. Remove decisions older than 30 days
+  // 4. Remove decisions older than 30 days — never age-prune a foundational
+  //    decision (PR 3 §13.2).
   cloned.decisions = cloned.decisions.filter((d) => {
+    if (retentionProtected(d)) return true
     const ts = new Date(d.timestamp).getTime()
     return now - ts < THIRTY_DAYS_MS
   })
@@ -1784,19 +1829,22 @@ export function pruneOld(mem: MemoryFile, client?: unknown, now = Date.now()): M
   }))
   if (jsonSize(cloned) <= MEMORY_MAX_BYTES) return cloned
 
-  // 6. Keep only 10 most recent decisions
-  cloned.decisions = [...cloned.decisions]
-    .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
-    .slice(0, 10)
+  // 6. Keep 10 most recent decisions via protected-first selection: every
+  //    foundational decision survives; the numeric stage is a target for
+  //    disposable rows, not permission to delete protected state (PR 3 §13.3).
+  cloned.decisions = protectedFirstNewest(cloned.decisions, 10)
   if (jsonSize(cloned) <= MEMORY_MAX_BYTES) {
     void log(client, "warn", "tokenmaxxer: pruned decisions to 10 most recent to fit 8KB cap")
     return cloned
   }
 
-  // 7. Last resort: keep only current_task + 5 most recent decisions
-  cloned.decisions = [...cloned.decisions]
-    .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
-    .slice(0, 5)
+  // 7. Last resort: keep only current_task + 5 most recent decisions, still
+  //    with foundational rows protected. If protected state alone exceeds the
+  //    cap, this intentionally returns an irreducible over-cap state rather
+  //    than silently deleting a confirmed foundational decision (PR 3 §13.4);
+  //    commitMemoryExact's size guard rejects the commit and prior STATE
+  //    remains intact.
+  cloned.decisions = protectedFirstNewest(cloned.decisions, 5)
   cloned.active_files = []
   cloned.blockers = []
   cloned.next_steps = []

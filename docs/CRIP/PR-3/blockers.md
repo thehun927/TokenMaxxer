@@ -91,3 +91,12 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [bug-fix] test/cli.test.ts item 29 seeded auth-1 as both non-authoritative (older duplicate of auth-2's topic) and not review-requested, while its own assertion requires auth-1 listed with requested=true; fixture fixed so auth-1 is the review-requested authority and auth-2 moves to a distinct topic (db).
 - [design-decision] The supersede CLI confirmation token is the candidate ID (matches test 40's injected read value "candidate-1"); the promote confirmation token is the decision ID.
 - [test-gap] Full-suite failures remain exactly the intended 5: 4 Wave 7 prune tests (§13) + 1 Wave 8 cross-process recall update (PR 2 §11.G/§15.14). No new regressions.
+
+## 2026-08-10 — wave-7 foundational retention in pruneOld
+- [design-decision] retentionProtected predicate: decision.foundational === true.
+- [design-decision] Invalid-decision pruning retains foundational conflict records (still_valid=false AND foundational=true is kept).
+- [design-decision] 30-day age pruning never touches foundational rows.
+- [design-decision] 10/5 pressure stages: foundational-first selection; if foundational count exceeds target, all foundational rows are kept and the disposable limit is skipped.
+- [design-decision] The 10/5 pressure stage target applies to DISPOSABLE rows: all foundational rows plus up to `target` newest non-foundational rows are kept. This reconciles the plan §13.3 illustrative snippet (`target - foundationals.length`) with release-gate test 42, which requires the newest disposable row (recent-0) to survive alongside 10 foundationals; tests are the spec.
+- [design-decision] Irreducible over-cap behavior: pruneOld may intentionally return over-cap state; commitMemoryExact rejects the commit; prior STATE remains intact. NO silent foundational deletion.
+- [test-gap] 5 PR 3 prune tests now green; existing prune tests still pass. Full-suite failures are now exactly 1 intended Wave 8 cross-process recall update (PR 2 §11.G/§15.14).
