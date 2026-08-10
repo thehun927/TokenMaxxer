@@ -50,6 +50,20 @@ export function isTrustedHumanFoundational(decision: Decision): boolean {
 }
 
 /**
+ * A row carries the full trusted-human trust tuple regardless of
+ * `still_valid`. Used to reconstruct durable unresolved human conflicts from
+ * persisted non-authoritative rows (wave-9 Blocker 1).
+ */
+export function isHumanTrustRow(decision: Decision): boolean {
+  return (
+    decision.foundational === true &&
+    decision.provenance?.extractor === "human" &&
+    decision.provenance?.confidence === "human-reviewed" &&
+    decision.human_review?.channel === "interactive-cli"
+  )
+}
+
+/**
  * Trust rank used for tie-breaks and provenance reconciliation.
  * `human-reviewed` sits on top of the documented ladder for completeness; the
  * non-human conflict path only ever sees ranks 1-3.
@@ -116,8 +130,11 @@ function newestFirst(a: Decision, b: Decision): number {
  * All valid rows in the topic share one normalized decision text: they are
  * duplicate observations, not competing authorities. A trusted human row wins
  * if present; otherwise preserve the oldest semantic authority ID (timestamp
- * asc, then lexical ID). Copy the strongest trustworthy provenance/rationale
- * onto the winner and mark every other row historical.
+ * asc, then lexical ID). The winner keeps its OWN persisted
+ * provenance/rationale in the read view (plan §6.3, wave-9 Concern A):
+ * strongest-provenance enrichment is a WRITE-path action performed by
+ * `mergeDecisions` when the same-ID row is being upgraded, never a read-time
+ * upgrade. Every other row is marked historical.
  */
 function resolveEquivalentTexts(
   group: Decision[],
@@ -126,28 +143,8 @@ function resolveEquivalentTexts(
 ): void {
   const winner = (trustedHumans.length > 0 ? trustedHumans : group).slice().sort(oldestFirst)[0]!
 
-  // Strongest provenance/rationale source: highest trust rank, oldest first on
-  // ties for determinism.
-  const strongest = group
-    .slice()
-    .sort((a, b) => {
-      const byRank = trustRank(b.provenance?.confidence) - trustRank(a.provenance?.confidence)
-      if (byRank !== 0) return byRank
-      return oldestFirst(a, b)
-    })[0]!
-
-  if (strongest.provenance) {
-    winner.provenance = {
-      ...strongest.provenance,
-      evidence: [...strongest.provenance.evidence],
-    }
-  }
-  if (winner.rationale === undefined && strongest.rationale !== undefined) {
-    winner.rationale = strongest.rationale
-  }
-
   for (const row of group) {
-    if (row.id === winner.id) continue
+    if (row === winner) continue
     row.still_valid = false
     row.superseded_by = winner.id
   }
@@ -163,7 +160,7 @@ function resolveEquivalentTexts(
  */
 function resolveHumanVsConflicts(group: Decision[], human: Decision, authorities: Decision[]): void {
   for (const row of group) {
-    if (row.id === human.id) continue
+    if (row === human) continue
     row.still_valid = false
     row.foundational = false
     row.conflicts_with = [human.id]
@@ -177,6 +174,10 @@ function resolveHumanVsConflicts(group: Decision[], human: Decision, authorities
  * topic become non-authoritative, human rows keep their foundational/review
  * metadata, reciprocal bounded `conflicts_with` IDs are added, and one
  * `conflicting-human-foundational` record is emitted for readers/CLI.
+ *
+ * Wave-9 (Blocker 1): each human row is additionally marked
+ * `human_conflict_quarantined=true` so the write path persists the quarantine
+ * and the next read can reconstruct it from non-authoritative rows.
  */
 function resolveConflictingHumans(
   topic: string,
@@ -188,6 +189,7 @@ function resolveConflictingHumans(
 
   for (const human of trustedHumans) {
     human.still_valid = false
+    human.human_conflict_quarantined = true
     human.conflicts_with = humanIds.filter((id) => id !== human.id)
   }
 
@@ -213,11 +215,73 @@ function resolveConflictingHumans(
 function resolveConflictingNonHumans(group: Decision[], authorities: Decision[]): void {
   const selected = group.slice().sort(newestFirst)[0]!
   for (const row of group) {
-    if (row.id === selected.id) continue
+    if (row === selected) continue
     row.still_valid = false
     row.superseded_by = selected.id
   }
   authorities.push(selected)
+}
+
+/**
+ * Wave-9 (Blocker 1) — reconstruct unresolved human conflicts from DURABLE
+ * state.
+ *
+ * After a conflicting-human topic has been reconciled and persisted, the human
+ * rows are `still_valid=false` so the valid-row pass above cannot see them. A
+ * topic is still quarantined when at least two rows in it carry the full
+ * trusted-human tuple AND each qualifies as a conflict partner:
+ *
+ *  - still valid (`still_valid === true`), or
+ *  - durably marked `human_conflict_quarantined === true`, or
+ *  - linked to another human-trust row in the same topic via `conflicts_with`.
+ *
+ * When reconstructed, the read view re-applies the same quarantine state the
+ * valid-row pass applies (`still_valid=false`, reciprocal `conflicts_with`,
+ * durable flag on the humans) and emits one conflict record, deduplicated by
+ * topic.
+ */
+function resolveDurableHumanConflicts(
+  all: Decision[],
+  conflicts: DecisionAuthorityConflict[],
+): void {
+  const byTopic = new Map<string, Decision[]>()
+  for (const decision of all) {
+    const key = normalizeDecisionTopic(decision.topic)
+    const group = byTopic.get(key)
+    if (group) group.push(decision)
+    else byTopic.set(key, [decision])
+  }
+
+  for (const [topic, rows] of byTopic) {
+    if (conflicts.some((c) => c.normalized_topic === topic)) continue
+    const humans = rows.filter(isHumanTrustRow)
+    if (humans.length < 2) continue
+
+    const humanIds = new Set(humans.map((h) => h.id))
+    const partners = humans.filter((h) => (
+      h.human_conflict_quarantined === true ||
+      h.still_valid === true ||
+      (h.conflicts_with ?? []).some((id) => humanIds.has(id))
+    ))
+    if (partners.length < 2) continue
+
+    const conflictHumanIds = partners.map((h) => h.id).sort()
+    for (const row of rows) {
+      row.still_valid = false
+      if (humans.includes(row)) {
+        row.human_conflict_quarantined = true
+        row.conflicts_with = conflictHumanIds.filter((id) => id !== row.id)
+      } else {
+        row.foundational = false
+        row.conflicts_with = [...conflictHumanIds]
+      }
+    }
+    conflicts.push({
+      normalized_topic: topic,
+      decision_ids: conflictHumanIds,
+      kind: "conflicting-human-foundational",
+    })
+  }
 }
 
 /**
@@ -268,6 +332,10 @@ export function resolveDecisionAuthorities(
       resolveConflictingNonHumans(group, authorities)
     }
   }
+
+  // Wave-9 (Blocker 1): reconstruct unresolved human conflicts that were
+  // persisted in a non-authoritative form (post-reconciliation `still_valid=false`).
+  resolveDurableHumanConflicts(all, conflicts)
 
   return { decisions: all, authorities, conflicts }
 }

@@ -9,7 +9,7 @@ import { z } from "zod"
 import { ExtractedFactsSchema } from "./extract-schema"
 import type { ExtractedFacts as LegacyExtractedFacts } from "../types"
 
-const MAX_IDENTIFIER = 256
+export const MAX_IDENTIFIER = 256
 const MAX_REFERENCE = 128
 const MAX_CACHE_QUARANTINE_COUNT = 10_000
 export const MAX_MODEL_HEALTH_RECORDS = 10
@@ -66,7 +66,10 @@ export const ProvenanceSchema = z
 export type Provenance = z.infer<typeof ProvenanceSchema>
 
 export const DecisionSchema = z.object({
-  id: z.string(),
+  // PR 3 wave-9 (Blocker 2): the stable decision ID is the trust address for
+  // human review, so it shares the same identifier contract as the lineage
+  // fields (`superseded_by`, `conflicts_with`, `derived_from_decision_id`).
+  id: z.string().min(1).max(MAX_IDENTIFIER),
   topic: z.string(),
   decision: z.string(),
   rationale: z.string().optional(),
@@ -81,6 +84,16 @@ export const DecisionSchema = z.object({
   superseded_by: z.string().max(MAX_IDENTIFIER).optional(), // historical lineage for a deliberate replacement
   conflicts_with: z.array(z.string().max(MAX_IDENTIFIER)).max(8).optional(), // candidate/history disagreeing with protected authorities
   derived_from_decision_id: z.string().max(MAX_IDENTIFIER).optional(), // explicit human supersession lineage
+  /**
+   * PR 3 wave-9 (Blocker 1) — durable unresolved-human-conflict marker.
+   *
+   * The read view sets this on every trusted-human row inside a
+   * `conflicting-human-foundational` topic. The write path persists it so the
+   * next read can reconstruct the conflict even though those rows have been
+   * reconciled to `still_valid=false`. Additive with a default so pre-PR3
+   * STATE files continue to load.
+   */
+  human_conflict_quarantined: z.boolean().default(false),
   provenance: ProvenanceSchema,
 })
 
@@ -214,6 +227,12 @@ const MemoryFileBaseSchema = z.object({
  */
 export const DECISION_TRUST_ISSUE = "decision-trust-invariant"
 export const DECISION_LINEAGE_ISSUE = "decision-lineage-invariant"
+/**
+ * Stable issue code for the wave-9 duplicate-decision-ID persistence
+ * invariant. Callers (migration repair, defensive exact-ID helpers) branch on
+ * this to distinguish "ambiguous ID" from other validation failures.
+ */
+export const DUPLICATE_DECISION_ID = "DUPLICATE_DECISION_ID"
 
 export const MemoryFileSchema = MemoryFileBaseSchema.superRefine((memory, ctx) => {
   for (const [index, entry] of (memory.llm_extraction_cache ?? []).entries()) {
@@ -291,6 +310,24 @@ export const MemoryFileSchema = MemoryFileBaseSchema.superRefine((memory, ctx) =
         seen.add(id)
       }
     }
+  }
+
+  // PR 3 wave-9 (Blocker 2) — decision IDs must be unique. The stable ID is the
+  // human-review trust address, so a single confirmation token must never be
+  // able to upgrade two different rows. This is a persistence invariant, not a
+  // convention: legacy duplicate-ID files are repaired by `loadAndMigrate`
+  // before this rule is consulted.
+  const seenDecisionIds = new Set<string>()
+  for (const [index, decision] of memory.decisions.entries()) {
+    if (seenDecisionIds.has(decision.id)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["decisions", index, "id"],
+        params: { issue: DUPLICATE_DECISION_ID },
+        message: `duplicate decision id: ${decision.id}`,
+      })
+    }
+    seenDecisionIds.add(decision.id)
   }
 })
 

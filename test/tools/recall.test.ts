@@ -7,17 +7,26 @@ vi.mock("../../src/memory/store", () => ({
   resolveProjectPath: vi.fn((worktree: string, directory: string) => directory || worktree),
 }))
 
-vi.mock("../../src/memory/reader", () => ({
-  queryDecisions: vi.fn(),
-  getActiveFiles: vi.fn(),
-  getProjectState: vi.fn(),
-  getDecisionById: vi.fn(),
-  getDecisionAuthorityConflicts: vi.fn(),
-}))
+vi.mock("../../src/memory/reader", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/memory/reader")>()
+  return {
+    queryDecisions: vi.fn(),
+    getActiveFiles: vi.fn(),
+    getProjectState: vi.fn(),
+    getDecisionById: vi.fn(),
+    // `_recallPromote` routes through `requestFoundationalReview`, which needs
+    // the REAL exact-ID helper so the shared eligibility logic is exercised
+    // (wave-9 Concern D).
+    getExactDecisionById: actual.getExactDecisionById,
+    getDecisionAuthorityConflicts: vi.fn(),
+  }
+})
 
 import { readMemory, writeMemory, mutateMemory, resolveProjectPath } from "../../src/memory/store"
 import { queryDecisions, getActiveFiles, getProjectState } from "../../src/memory/reader"
 import { enqueueProjectJob, resetProjectQueues } from "../../src/memory/lock"
+import { requestFoundationalReview } from "../../src/memory/decision-review"
+import type { MemoryFile } from "../../src/memory/schema"
 import {
   _recallDecision,
   _getActiveFiles,
@@ -830,5 +839,159 @@ describe("PR 3 §8/§9 authority-aware reads and review request", () => {
     expect(target.provenance?.confidence).not.toBe("human-reviewed")
     expect((target as { human_review?: unknown }).human_review).toBeUndefined()
     expect(result).not.toContain("confidence=human-reviewed")
+  })
+})
+
+// ─── PR 3 wave-9 — duplicate-ID refusal + shared-helper routing ─────────────
+describe("PR 3 wave-9 — review-request duplicate-ID refusal and shared helper routing", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetProjectQueues()
+  })
+
+  function mockMutateCommitted(base: ReturnType<typeof makeMemory>) {
+    vi.mocked(mutateMemory).mockImplementation(async (_args, mutate) => {
+      const action = mutate(structuredClone(base), {
+        status: "ok",
+        memory: base,
+        source: "project",
+        path: "/state.json",
+        sizeBytes: 0,
+        revision: base.revision ?? 0,
+      })
+      if (action.kind === "noop") {
+        return { status: "noop", value: action.value, revision: base.revision ?? 0 }
+      }
+      vi.mocked(readMemory).mockResolvedValue(action.memory)
+      return { status: "committed", value: action.value, revision: (base.revision ?? 0) + 1 }
+    })
+  }
+
+  it("29. _recallPromote({decision_id}) refuses a duplicate-ID state with no mutation", async () => {
+    const mem = makeMemory({
+      decisions: [
+        makeDecision({
+          id: "dup-id",
+          topic: "database",
+          decision: "Use PostgreSQL",
+          timestamp: "2026-08-01T10:00:00.000Z",
+          foundational: false,
+          foundational_requested: true,
+        }),
+        makeDecision({
+          id: "dup-id",
+          topic: "database",
+          decision: "Use PostgreSQL",
+          timestamp: "2026-08-07T10:00:00.000Z",
+          foundational: false,
+          foundational_requested: false,
+        }),
+      ],
+    })
+    mockMutateCommitted(mem)
+    vi.mocked(readMemory).mockResolvedValue(mem)
+
+    const result = await _recallPromote({ decision_id: "dup-id" }, mockContext)
+
+    // Explicit ambiguous refusal, never a promotion or review request.
+    expect(result).not.toContain("Foundational review requested")
+    expect(result).toMatch(/ambiguous|duplicate|share this ID/i)
+    expect(writeMemory).not.toHaveBeenCalled()
+    // No mutation: both rows keep their original foundational_requested state.
+    const post = await readMemory({ worktree: mockContext.worktree, directory: mockContext.directory })
+    const rows = post!.decisions.filter((d) => d.id === "dup-id")
+    expect(rows).toHaveLength(2)
+    expect(rows.every((d) => d.foundational === false)).toBe(true)
+    const requestedCount = rows.filter((d) => d.foundational_requested === true).length
+    expect(requestedCount).toBe(1) // unchanged from the seed
+  })
+
+  it("30. _recallPromote({decision_id}) returns the same outcomes as requestFoundationalReview for the same locked state", async () => {
+    const cases: Array<{
+      name: string
+      decisions: ReturnType<typeof makeMemory>["decisions"]
+      decisionId: string
+      assertTool: (msg: string) => void
+      assertHelper: (kind: ReturnType<typeof requestFoundationalReview>["kind"]) => void
+    }> = [
+      {
+        name: "eligible authority",
+        decisions: [
+          makeDecision({ id: "llm-1", topic: "database", decision: "Use PostgreSQL", foundational: false, foundational_requested: false }),
+        ],
+        decisionId: "llm-1",
+        assertTool: (msg) => expect(msg).toContain("Foundational review requested for llm-1"),
+        assertHelper: (kind) => expect(kind).toBe("requested"),
+      },
+      {
+        name: "non-authoritative ID",
+        decisions: [
+          makeDecision({ id: "authority-1", topic: "database", decision: "Use PostgreSQL", timestamp: "2026-08-01T10:00:00.000Z", foundational: false }),
+          makeDecision({ id: "duplicate-2", topic: "database", decision: "Use PostgreSQL", timestamp: "2026-08-07T10:00:00.000Z", foundational: false }),
+        ],
+        decisionId: "duplicate-2",
+        assertTool: (msg) => expect(msg).toMatch(/not-authoritative|not authoritative/i),
+        assertHelper: (kind) => expect(kind).toBe("not-authoritative"),
+      },
+      {
+        name: "conflicting human topic",
+        decisions: [
+          makeDecision({
+            id: "human-a", topic: "database", decision: "Use Postgres",
+            foundational: true, foundational_requested: false,
+            human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00Z" },
+            provenance: { extractor: "human", source_session_id: "s-a", confidence: "human-reviewed", evidence: [] },
+          }),
+          makeDecision({
+            id: "human-b", topic: "database", decision: "Use MySQL",
+            foundational: true, foundational_requested: false,
+            human_review: { channel: "interactive-cli", reviewed_at: "2026-08-02T00:00:00Z" },
+            provenance: { extractor: "human", source_session_id: "s-b", confidence: "human-reviewed", evidence: [] },
+          }),
+        ],
+        decisionId: "human-a",
+        assertTool: (msg) => expect(msg).toMatch(/conflict/i),
+        assertHelper: (kind) => expect(kind).toBe("conflict"),
+      },
+      {
+        name: "duplicate-ID state",
+        decisions: [
+          makeDecision({ id: "dup-id", topic: "database", decision: "Use PostgreSQL", foundational: false }),
+          makeDecision({ id: "dup-id", topic: "database", decision: "Use PostgreSQL", timestamp: "2026-08-07T10:00:00.000Z", foundational: false }),
+        ],
+        decisionId: "dup-id",
+        assertTool: (msg) => expect(msg).toMatch(/ambiguous|share this ID/i),
+        assertHelper: (kind) => expect(kind).toBe("duplicate-id"),
+      },
+      {
+        name: "already-reviewed",
+        decisions: [
+          makeDecision({
+            id: "human-1", topic: "database", decision: "Use PostgreSQL",
+            foundational: true, foundational_requested: false,
+            human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00Z" },
+            provenance: { extractor: "human", source_session_id: "s-h", confidence: "human-reviewed", evidence: [] },
+          }),
+        ],
+        decisionId: "human-1",
+        assertTool: (msg) => expect(msg).toMatch(/already/i),
+        assertHelper: (kind) => expect(kind).toBe("already-reviewed"),
+      },
+    ]
+
+    for (const scenario of cases) {
+      const mem = makeMemory({ decisions: scenario.decisions as never[] })
+      mockMutateCommitted(mem)
+      vi.mocked(readMemory).mockResolvedValue(mem)
+
+      const toolResult = await _recallPromote({ decision_id: scenario.decisionId }, mockContext)
+      scenario.assertTool(toolResult)
+
+      // The shared helper decides the same outcome for the same locked state.
+      const helperResult = requestFoundationalReview(mem as unknown as MemoryFile, {
+        decision_id: scenario.decisionId,
+      })
+      scenario.assertHelper(helperResult.kind)
+    }
   })
 })

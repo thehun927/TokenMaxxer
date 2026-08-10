@@ -39,7 +39,7 @@ jobs:
           node --input-type=module <<'NODE'
           import { readFileSync, statSync } from "node:fs";
 
-          const bundles = ["dist/index.js", "dist/tui.js"];
+          const bundles = ["dist/index.js", "dist/tui.js", "dist/cli.js"];
           const generatedChunkImport = /(?:\bfrom\s+|\bimport\s*\()\s*["'](?:\.\/|\.\.\/)/;
 
           for (const file of bundles) {
@@ -54,5 +54,13 @@ jobs:
           }
           NODE
 
-      - name: Validate installer syntax
-        run: bash -n install.sh
+      - name: Verify CLI bundle + launcher + installer
+        run: npm run verify-cli-bundle
+
+      - name: Post-build CLI smoke
+        run: npm run smoke:cli
+
+      - name: Validate installer and launcher syntax
+        run: |
+          bash -n install.sh
+          bash -n bin/tokenmaxxer

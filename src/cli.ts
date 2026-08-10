@@ -25,7 +25,7 @@ import { readMemoryState, mutateMemory } from "./memory/store"
 import type { MemoryFile, Decision } from "./memory/schema"
 import {
   queryDecisions,
-  getDecisionById,
+  getExactDecisionById,
   getDecisionAuthorityConflicts,
 } from "./memory/reader"
 import {
@@ -210,7 +210,18 @@ async function cmdPromote(
   const mem = read.memory
   const resolution = resolveDecisionAuthorities(mem.decisions)
   const authority = resolution.authorities.find((a) => a.id === decisionId)
-  const raw = getDecisionById(mem, decisionId)
+
+  // Wave-9 (Blocker 2): refuse ambiguous duplicate-ID state BEFORE any
+  // confirmation prompt. `getExactDecisionById` returns `exact` only when
+  // exactly one raw row matches; `getDecisionById` would otherwise silently
+  // take the first match and could mint trust onto a different row.
+  const exact = getExactDecisionById(mem, decisionId)
+  if (exact.kind === "duplicate") {
+    const msg = `Refusing promote: ${decisionId} is ambiguous (${exact.ids.length} rows share this ID). Re-run 'tokenmaxxer decisions' and specify a unique decision ID.`
+    io.stderr.write(msg + "\n")
+    return { kind: "refused", message: msg }
+  }
+  const raw = exact.kind === "exact" ? exact.decision : undefined
   if (!raw || !authority) {
     const msg = `Refusing promote: ${decisionId} is not the current authority for its topic. Re-run 'tokenmaxxer decisions' for the exact ID.`
     io.stderr.write(msg + "\n")
@@ -269,7 +280,11 @@ async function cmdPromote(
       const currentAuthority = currentResolution.authorities.find(
         (a) => a.id === decisionId,
       )
-      const currentRaw = getDecisionById(memory, decisionId)
+      const currentExact = getExactDecisionById(memory, decisionId)
+      if (currentExact.kind === "duplicate") {
+        return { kind: "noop", value: { outcome: "decision-changed-during-review" } }
+      }
+      const currentRaw = currentExact.kind === "exact" ? currentExact.decision : undefined
       if (!currentRaw || !currentAuthority) {
         return { kind: "noop", value: { outcome: "decision-changed-during-review" } }
       }
@@ -357,8 +372,15 @@ async function cmdSupersede(
   }
 
   const mem = read.memory
-  const authority = getDecisionById(mem, authorityId)
-  const candidate = getDecisionById(mem, candidateId)
+  const authorityLookup = getExactDecisionById(mem, authorityId)
+  const candidateLookup = getExactDecisionById(mem, candidateId)
+  if (authorityLookup.kind === "duplicate" || candidateLookup.kind === "duplicate") {
+    const msg = `Refusing supersede: "${authorityId}" or "${candidateId}" is ambiguous (duplicate decision IDs). Repair the STATE before superseding.`
+    io.stderr.write(msg + "\n")
+    return { kind: "refused", message: msg }
+  }
+  const authority = authorityLookup.kind === "exact" ? authorityLookup.decision : undefined
+  const candidate = candidateLookup.kind === "exact" ? candidateLookup.decision : undefined
   if (!authority || !candidate) {
     const msg = `Refusing supersede: authority "${authorityId}" or candidate "${candidateId}" does not exist.`
     io.stderr.write(msg + "\n")
@@ -412,8 +434,18 @@ async function cmdSupersede(
   const result = await mutateMemory<SupersedeOutcome>(
     { worktree: project, directory: project },
     (memory) => {
-      const currentAuthority = getDecisionById(memory, authorityId)
-      const currentCandidate = getDecisionById(memory, candidateId)
+      const currentAuthorityLookup = getExactDecisionById(memory, authorityId)
+      const currentCandidateLookup = getExactDecisionById(memory, candidateId)
+      if (
+        currentAuthorityLookup.kind === "duplicate" ||
+        currentCandidateLookup.kind === "duplicate"
+      ) {
+        return { kind: "noop", value: { outcome: "decision-changed-during-review" } }
+      }
+      const currentAuthority =
+        currentAuthorityLookup.kind === "exact" ? currentAuthorityLookup.decision : undefined
+      const currentCandidate =
+        currentCandidateLookup.kind === "exact" ? currentCandidateLookup.decision : undefined
       if (
         !currentAuthority ||
         !currentCandidate ||

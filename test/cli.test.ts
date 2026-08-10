@@ -12,7 +12,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { spawn } from "node:child_process"
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
@@ -424,5 +424,140 @@ describe("PR 3 §11 human CLI", () => {
     expect(oldAuthority.still_valid).toBe(false)
     expect(oldAuthority.foundational).toBe(false)
     expect(oldAuthority.superseded_by).toBe(newAuthority.id)
+  })
+})
+
+// ─── PR 3 wave-9 — Blocker 2 CLI trust boundary ─────────────────────────────
+describe("PR 3 wave-9 — CLI duplicate-ID and display→confirmation TOCTOU", () => {
+  it("41. promote refuses a duplicate-ID STATE before interactive confirmation; no human trust is minted", async () => {
+    // A pre-PR3 STATE can carry two rows sharing one id. `writeMemory` now
+    // rejects duplicate IDs (v3 uniqueness invariant), so seed the file
+    // directly exactly as such a legacy file could exist on disk.
+    const duplicateState: MemoryFile = {
+      ...emptyMemory(project),
+      revision: 5,
+      decisions: [
+        mkDecision({
+          id: "dup-id",
+          topic: "auth",
+          decision: "Use JWT",
+          timestamp: "2026-08-01T00:00:00Z",
+          still_valid: false,
+          provenance: llmProv,
+          foundational_requested: true,
+        }),
+        mkDecision({
+          id: "dup-id",
+          topic: "auth",
+          decision: "Use OAuth2",
+          timestamp: "2026-08-02T00:00:00Z",
+          still_valid: true,
+          provenance: llmProv,
+        }),
+      ],
+    }
+    await mkdir(dirname(statePath), { recursive: true })
+    await writeFile(statePath, JSON.stringify(duplicateState, null, 2))
+
+    const io = makeIo("dup-id") // TTY-true; the human would type the stale ID.
+    await runCli(["promote", "dup-id"], { project, io })
+    const out = stdoutOf(io) + stderrOf(io)
+    // Refused before any confirmation prompt or mutation.
+    expect(out).toMatch(/refus|ambiguous|not the current authority|duplicate/i)
+
+    const state = await readState()
+    for (const d of state.decisions) {
+      expect(d.foundational).toBe(false)
+      expect(d.provenance?.extractor).not.toBe("human")
+      expect((d as { human_review?: unknown }).human_review).toBeUndefined()
+    }
+    // The refusal path must not have advanced the revision.
+    expect(state.revision).toBe(5)
+  })
+
+  it("42. a child invalidates the target during the display window; the CLI's locked re-read aborts and adds zero bytes", async () => {
+    const mem: MemoryFile = {
+      ...emptyMemory(project),
+      revision: 5,
+      decisions: [mkDecision({ id: "auth-1", topic: "auth", decision: "Use JWT", provenance: llmProv, foundational_requested: true })],
+    }
+    await seedState(mem)
+
+    // Barrier files: `ready` signals the child is up; `release` triggers the
+    // adversarial write while the CLI waits on stdin.
+    const ready = join(dir, "toctou-ready")
+    const release = `${ready}.release`
+    barrierFiles.push(ready, release)
+
+    // Adversary: invalidate auth-1 DURING the display window, exactly as a
+    // concurrent process could after the human saw the prompt.
+    const adversary = `
+      const { readFile, writeFile, access } = require("node:fs/promises");
+      const [statePath, readyPath, releasePath] = process.argv.slice(1);
+      (async () => {
+        await writeFile(readyPath, "ready", "utf-8");
+        for (;;) {
+          try { await access(releasePath); break; } catch { await new Promise((r) => setTimeout(r, 10)); }
+        }
+        const raw = await readFile(statePath, "utf-8");
+        const mem = JSON.parse(raw);
+        for (const d of mem.decisions) {
+          if (d.id === "auth-1") { d.still_valid = false; d.foundational_requested = false; }
+        }
+        await writeFile(statePath, JSON.stringify(mem, null, 2), "utf-8");
+        process.exit(0);
+      })().catch((e) => { console.error(e); process.exit(1); });
+    `
+    const child = spawn(process.execPath, ["-e", adversary, statePath, ready, release], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    })
+    await waitFor(ready)
+
+    // Barrier-driven stdin: the CLI displays the ORIGINAL auth-1 (still valid,
+    // review requested) and then blocks waiting for the human's exact ID.
+    let releaseRead!: (value: string) => void
+    let signalDisplay!: () => void
+    const readGate = new Promise<string>((resolve) => { releaseRead = resolve })
+    const displayReached = new Promise<void>((resolve) => { signalDisplay = resolve })
+    const io: CliIO = {
+      stdin: {
+        isTTY: true,
+        read: async () => {
+          signalDisplay()
+          return readGate
+        },
+      },
+      stdout: { write: vi.fn(), isTTY: true },
+      stderr: { write: vi.fn(), isTTY: true },
+    }
+
+    const cliPromise = runCli(["promote", "auth-1"], { project, io })
+    await displayReached // the CLI has displayed auth-1 and is waiting on stdin.
+
+    // The child now supersedes/invalidates the target the human is reviewing.
+    await writeFile(release, "go", "utf-8")
+    const childResult = await new Promise<{ code: number }>((resolve) => {
+      child.on("exit", (code) => resolve({ code: code ?? -1 }))
+    })
+    expect(childResult.code).toBe(0)
+    const stateBeforeConfirmation = await readFile(statePath, "utf-8")
+
+    // The human confirms the stale ID; the transaction re-reads the newest
+    // STATE, sees auth-1 is no longer an authority, and aborts without writing.
+    releaseRead("auth-1")
+    await cliPromise
+
+    const stateAfter = await readFile(statePath, "utf-8")
+    // Byte-for-byte: the CLI's failed attempt added nothing on top of the
+    // adversarial state it observed.
+    expect(stateAfter).toBe(stateBeforeConfirmation)
+
+    const state = await readState()
+    const target = state.decisions.find((d) => d.id === "auth-1")!
+    expect(target.still_valid).toBe(false)
+    expect(target.foundational).toBe(false)
+    expect(target.foundational_requested).toBe(false)
+    expect(target.provenance?.extractor).not.toBe("human")
   })
 })

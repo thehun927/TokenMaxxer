@@ -17,6 +17,7 @@ import type { EvidenceCandidateMap } from "./extract-llm"
 import { resolveEvidenceReferences } from "./extract-llm"
 import { sha256Hex, stableJson } from "./extract-prompt"
 import {
+  isHumanTrustRow,
   isTrustedHumanFoundational,
   normalizeDecisionText,
   normalizeDecisionTopic,
@@ -179,12 +180,51 @@ function isLegacyOnlyAuthority(authority: Decision): boolean {
 }
 
 /**
+ * Wave-9 (Blocker 1) — derive quarantined-human topics directly from the
+ * durable `human_conflict_quarantined` marker carried on the current result
+ * rows. This is the authoritative conflict state for the entire merge: it
+ * survives even an empty incoming list and it is re-derived from every
+ * re-resolution, so a topic that entered conflict quarantine in an earlier
+ * iteration stays quarantined for the rest of the batch.
+ */
+function quarantinedHumanConflicts(
+  decisions: readonly Decision[],
+): Map<string, DecisionAuthorityConflict> {
+  const byTopic = new Map<string, DecisionAuthorityConflict>()
+  const humanIdsByTopic = new Map<string, string[]>()
+  for (const decision of decisions) {
+    if (decision.human_conflict_quarantined !== true) continue
+    const key = normalizeDecisionTopic(decision.topic)
+    const ids = humanIdsByTopic.get(key)
+    if (ids) ids.push(decision.id)
+    else humanIdsByTopic.set(key, [decision.id])
+  }
+  for (const [key, ids] of humanIdsByTopic) {
+    if (ids.length < 2) continue
+    byTopic.set(key, {
+      normalized_topic: key,
+      decision_ids: ids.slice().sort(),
+      kind: "conflicting-human-foundational",
+    })
+  }
+  return byTopic
+}
+
+/**
  * Merge incoming extracted decisions into the existing decision list.
  *
  * Rules are documented in implementation-plan §7.1 (heuristic) and §7.2 (LLM).
  * The returned array is the post-merge state: existing reconciled historical
  * rows are kept, one or more new rows are added, and existing authorities may
  * be upgraded in place (same stable ID, updated provenance/rationale).
+ *
+ * Wave-9 (Blocker 1): an unresolved `conflicting-human-foundational` topic is
+ * quarantined for the ENTIRE merge. The initial reconciliation's conflict state
+ * is preserved, re-derived from the durable `human_conflict_quarantined`
+ * marker on every iteration, and never discarded — so even `mergeDecisions(existing,
+ * [], meta)` persists a STATE from which the next read still reconstructs the
+ * conflict, and incoming automation can only ever become an invalid conflict
+ * candidate linked to the quarantined human IDs.
  */
 export function mergeDecisions(
   existing: readonly Decision[],
@@ -194,20 +234,35 @@ export function mergeDecisions(
   const origin = meta.origin ?? "heuristic"
 
   // Start from the reconciled read view: existing rows carry repaired
-  // still_valid/conflicts_with/superseded_by state for their topic group.
+  // still_valid/conflicts_with/superseded_by state for their topic group,
+  // plus the durable `human_conflict_quarantined` marker on quarantined
+  // human rows.
   let result: Decision[] = resolveDecisionAuthorities(existing).decisions.map((d) => ({ ...d }))
+
+  // Wave-9 (Concern B): a supersession rewrite applies only to PRIOR VALID
+  // same-topic non-human authority rows. Rows valid in the raw input (even if
+  // the initial reconciliation invalidated them as duplicate observations) and
+  // rows still valid in the current result qualify; rows already invalid for an
+  // unrelated reason (e.g. a pre-existing LLM conflict candidate) keep their
+  // original lineage.
+  const priorValidIds = new Set(
+    existing.filter((d) => d.still_valid === true).map((d) => d.id),
+  )
 
   for (const inc of incoming) {
     // Re-resolve against the current group so later incoming items for the
-    // same topic judge the newest authority, never a stale mapped index.
+    // same topic judge the newest authority, never a stale mapped index. The
+    // durable conflict state is consulted on every iteration.
     const resolved = resolveDecisionAuthorities(result)
     const authoritiesByTopic = new Map<string, Decision>()
     for (const authority of resolved.authorities) {
       authoritiesByTopic.set(normalizeDecisionTopic(authority.topic), authority)
     }
-    const conflictsByTopic = new Map<string, DecisionAuthorityConflict>()
+    const conflictsByTopic = quarantinedHumanConflicts(result)
     for (const conflict of resolved.conflicts) {
-      conflictsByTopic.set(conflict.normalized_topic, conflict)
+      if (!conflictsByTopic.has(conflict.normalized_topic)) {
+        conflictsByTopic.set(conflict.normalized_topic, conflict)
+      }
     }
 
     const incTopic = normalizeDecisionTopic(inc.topic)
@@ -240,7 +295,9 @@ export function mergeDecisions(
 
     if (!authority) {
       // No authority / new topic: a heuristic observation may create one valid
-      // authority; an evidence-backed LLM observation may too.
+      // authority; an evidence-backed LLM observation may too. (A topic under
+      // conflict quarantine is handled above, so this branch never upgrades a
+      // quarantined topic.)
       result = [...result, newDecisionRow(inc, meta, provenance)]
       continue
     }
@@ -269,7 +326,8 @@ export function mergeDecisions(
       if (origin === "llm") {
         // Corroborate IN PLACE: keep the stable decision ID, the semantic
         // decision text, and the authority creation timestamp; upgrade
-        // provenance to the evidence-backed LLM provenance.
+        // provenance to the evidence-backed LLM provenance. This is the
+        // WRITE-path provenance enrichment (plan §6.2 rule 3, wave-9 Concern A).
         updated.provenance = provenance
       }
       const next = [...result]
@@ -295,12 +353,15 @@ export function mergeDecisions(
 
     if (origin === "heuristic") {
       // A later heuristic observation can represent a real user decision
-      // change: create one new valid heuristic authority and supersede ALL
-      // prior valid same-topic non-human authority rows (not one mapped index).
+      // change: create one new valid heuristic authority and supersede every
+      // PRIOR VALID same-topic non-human authority row (wave-9 Concern B: rows
+      // already invalid for another reason — e.g. an LLM conflict candidate —
+      // are left untouched).
       const newId = randomUUID()
       const superseded = result.map((row) => {
         if (normalizeDecisionTopic(row.topic) !== incTopic) return row
-        if (isTrustedHumanFoundational(row)) return row
+        if (isHumanTrustRow(row)) return row
+        if (row.still_valid !== true && !priorValidIds.has(row.id)) return row
         return { ...row, still_valid: false, superseded_by: newId }
       })
       result = [
@@ -313,11 +374,13 @@ export function mergeDecisions(
     // origin === "llm"
     if (isLegacyOnlyAuthority(authority)) {
       // An evidence-backed LLM observation may supersede a legacy-only
-      // authority (strictly stronger trust ladder); persist lineage.
+      // authority (strictly stronger trust ladder); persist lineage. The same
+      // prior-valid restriction applies as in the heuristic path.
       const newId = randomUUID()
       const superseded = result.map((row) => {
         if (normalizeDecisionTopic(row.topic) !== incTopic) return row
-        if (isTrustedHumanFoundational(row)) return row
+        if (isHumanTrustRow(row)) return row
+        if (row.still_valid !== true && !priorValidIds.has(row.id)) return row
         return { ...row, still_valid: false, superseded_by: newId }
       })
       result = [

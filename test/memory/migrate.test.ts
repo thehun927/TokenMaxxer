@@ -350,3 +350,152 @@ describe("PR 3 §5 compatibility repair", () => {
     expect(second!.id).toBe("d-human-b")
   })
 })
+
+// ─── PR 3 wave-9 — duplicate decision-ID migration repair (Blocker 2) ────────
+// Pre-PR3 files could contain two rows sharing one id because uniqueness was
+// never enforced. `loadAndMigrate` must repair such files deterministically
+// BEFORE the v3 schema's uniqueness invariant rejects them: fresh UUIDs for
+// every duplicate, lineage rewritten to the canonical (oldest) row, and any
+// duplicate group with `human_review` demoted to re-confirmation.
+describe("PR 3 wave-9 — duplicate decision-ID repair", () => {
+  const llmProvision = (source: string) => ({
+    extractor: "llm" as const,
+    source_session_id: source,
+    source_audit_session_id: `audit-${source}`,
+    confidence: "llm-corroborated" as const,
+    evidence: [] as never[],
+  })
+
+  function v3StateWith(decisions: unknown[]): Record<string, unknown> {
+    return {
+      version: 3,
+      project_path: "/test/project",
+      last_updated: "2026-08-08T12:00:00.000Z",
+      last_git_sha: "abc123",
+      last_session_id: "session-v3",
+      active_files: [],
+      decisions,
+      blockers: [],
+      next_steps: [],
+      recent_sessions: [],
+    }
+  }
+
+  it("assigns fresh UUIDs to every duplicate and updates all lineage references to the winner", () => {
+    const result = loadAndMigrate(v3StateWith([
+      {
+        id: "dup", topic: "database", decision: "Use Postgres", timestamp: "2026-08-01T00:00:00.000Z",
+        session_id: "s1", still_valid: false, foundational_requested: true, provenance: llmProvision("s1"),
+      },
+      {
+        id: "dup", topic: "database", decision: "Use MySQL", timestamp: "2026-08-02T00:00:00.000Z",
+        session_id: "s2", still_valid: true, provenance: llmProvision("s2"),
+      },
+      {
+        id: "hist", topic: "auth", decision: "Use JWT", timestamp: "2026-08-03T00:00:00.000Z",
+        session_id: "s3", still_valid: false,
+        conflicts_with: ["dup"], superseded_by: "dup", derived_from_decision_id: "dup",
+        provenance: llmProvision("s3"),
+      },
+    ]))
+
+    expect(result).not.toBeNull()
+    const ids = result!.decisions.map((d) => d.id)
+    // All IDs are unique and the old shared ID is gone.
+    expect(new Set(ids).size).toBe(ids.length)
+    expect(ids).not.toContain("dup")
+
+    const dbRows = result!.decisions.filter((d) => d.topic === "database")
+    expect(dbRows).toHaveLength(2)
+    // The deterministically-oldest row ("Use Postgres", timestamp asc) is the
+    // canonical winner and receives a fresh UUID.
+    const winner = dbRows.find((d) => d.decision === "Use Postgres")!
+    expect(winner.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+    expect(winner.topic).toBe("database")
+    expect(winner.decision).toBe("Use Postgres")
+    expect(winner.session_id).toBe("s1")
+    // Semantic fields are preserved on the non-winner duplicate too.
+    const loser = dbRows.find((d) => d.decision === "Use MySQL")!
+    expect(loser.session_id).toBe("s2")
+    expect(loser.still_valid).toBe(true)
+
+    // Every lineage reference that pointed at the old shared ID now points at
+    // the kept (winner) row's fresh ID.
+    const hist = result!.decisions.find((d) => d.id === "hist")!
+    expect(hist.conflicts_with).toEqual([winner.id])
+    expect(hist.superseded_by).toBe(winner.id)
+    expect(hist.derived_from_decision_id).toBe(winner.id)
+  })
+
+  it("demotes every duplicate to foundational=false + foundational_requested=true when any row has human_review", () => {
+    const humanProvision = {
+      extractor: "human" as const,
+      source_session_id: "s-h",
+      confidence: "human-reviewed" as const,
+      evidence: [] as never[],
+    }
+    const result = loadAndMigrate(v3StateWith([
+      {
+        id: "dup", topic: "database", decision: "Use Postgres", timestamp: "2026-08-01T00:00:00.000Z",
+        session_id: "s1", still_valid: true, foundational: true,
+        human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00.000Z" },
+        provenance: humanProvision,
+      },
+      {
+        id: "dup", topic: "database", decision: "Use MySQL", timestamp: "2026-08-02T00:00:00.000Z",
+        session_id: "s2", still_valid: true, provenance: llmProvision("s2"),
+      },
+      {
+        id: "dup", topic: "database", decision: "Use DynamoDB", timestamp: "2026-08-03T00:00:00.000Z",
+        session_id: "s3", still_valid: true, provenance: llmProvision("s3"),
+      },
+    ]))
+
+    expect(result).not.toBeNull()
+    const rows = result!.decisions.filter((d) => d.topic === "database")
+    expect(rows).toHaveLength(3)
+    const ids = result!.decisions.map((d) => d.id)
+    expect(new Set(ids).size).toBe(ids.length)
+    const humanRow = rows.find((d) => d.decision === "Use Postgres")!
+    for (const d of rows) {
+      // No duplicate may be silently treated as the confirmed human-review
+      // target: the whole group must be re-confirmed.
+      expect(d.foundational).toBe(false)
+      expect(d.foundational_requested).toBe(true)
+      expect((d as { human_review?: unknown }).human_review).toBeUndefined()
+    }
+    // The human trust claim is stripped (legacy downgrade) so the v3
+    // human-trust invariant still holds with foundational=false.
+    expect(humanRow.provenance?.extractor).toBe("legacy")
+    expect(humanRow.provenance?.confidence).toBe("legacy")
+    // Non-human duplicates keep their evidence-backed provenance.
+    const llmRow = rows.find((d) => d.decision === "Use MySQL")!
+    expect(llmRow.provenance?.extractor).toBe("llm")
+    expect(llmRow.provenance?.confidence).toBe("llm-corroborated")
+  })
+
+  it("updates a duplicate-ID reference that appears inside conflicts_with", () => {
+    const result = loadAndMigrate(v3StateWith([
+      {
+        id: "dup", topic: "database", decision: "Use Postgres", timestamp: "2026-08-01T00:00:00.000Z",
+        session_id: "s1", still_valid: false, provenance: llmProvision("s1"),
+      },
+      {
+        id: "dup", topic: "database", decision: "Use MySQL", timestamp: "2026-08-02T00:00:00.000Z",
+        session_id: "s2", still_valid: true, provenance: llmProvision("s2"),
+      },
+      {
+        id: "cand", topic: "database", decision: "Use SQLite", timestamp: "2026-08-03T00:00:00.000Z",
+        session_id: "s3", still_valid: false, conflicts_with: ["dup", "other"],
+        provenance: llmProvision("s3"),
+      },
+    ]))
+
+    expect(result).not.toBeNull()
+    const winner = result!.decisions.find((d) => d.decision === "Use Postgres")!
+    const cand = result!.decisions.find((d) => d.id === "cand")!
+    // The duplicate reference inside conflicts_with is rewritten to the winner;
+    // unrelated references are preserved.
+    expect(cand.conflicts_with).toEqual([winner.id, "other"])
+  })
+})

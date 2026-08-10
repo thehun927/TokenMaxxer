@@ -7,6 +7,7 @@ import {
   HumanReviewSchema,
   MemoryFileSchema,
   ModelHealthSchema,
+  MAX_IDENTIFIER,
   ProvenanceSchema,
   emptyMemory,
 } from "../../src/memory/schema"
@@ -238,5 +239,43 @@ describe("PR 3 §4.1 decision trust and lineage invariants", () => {
       reviewed_at: "x".repeat(65),
     }).success).toBe(false)
     expect(HumanReviewSchema.safeParse(humanReview).success).toBe(true)
+  })
+})
+
+// ─── PR 3 wave-9 — decision ID uniqueness (Blocker 2) ────────────────────────
+describe("PR 3 wave-9 — decision ID uniqueness", () => {
+  function memoryWith(decisions: unknown[]) {
+    return validV3({ decisions })
+  }
+
+  it("rejects two decisions with the same ID", () => {
+    const result = MemoryFileSchema.safeParse(memoryWith([
+      { ...validDecision, id: "dup-id" },
+      { ...validDecision, id: "dup-id", decision: "Use MySQL" },
+    ]))
+    expect(result.success).toBe(false)
+  })
+
+  it("rejects a duplicate ID with a stable DUPLICATE_DECISION_ID issue code", () => {
+    const result = MemoryFileSchema.safeParse(memoryWith([
+      { ...validDecision, id: "dup-id" },
+      { ...validDecision, id: "dup-id", decision: "Use MySQL" },
+    ]))
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      const messages = result.error.issues.map((issue) => issue.message)
+      expect(messages.some((m) => m.startsWith("duplicate decision id:"))).toBe(true)
+    }
+  })
+
+  it("accepts a single decision with a long ID up to MAX_IDENTIFIER", () => {
+    const atLimit = "x".repeat(MAX_IDENTIFIER)
+    expect(MemoryFileSchema.safeParse(memoryWith([{ ...validDecision, id: atLimit }])).success).toBe(true)
+    const overLimit = "x".repeat(MAX_IDENTIFIER + 1)
+    expect(MemoryFileSchema.safeParse(memoryWith([{ ...validDecision, id: overLimit }])).success).toBe(false)
+  })
+
+  it("rejects an empty decision ID", () => {
+    expect(MemoryFileSchema.safeParse(memoryWith([{ ...validDecision, id: "" }])).success).toBe(false)
   })
 })

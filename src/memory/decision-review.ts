@@ -16,7 +16,7 @@
  */
 import { randomUUID } from "node:crypto"
 import type { MemoryFile, Decision, Provenance } from "./schema"
-import { getDecisionById } from "./reader"
+import { getExactDecisionById } from "./reader"
 import {
   resolveDecisionAuthorities,
   isTrustedHumanFoundational,
@@ -72,6 +72,7 @@ export type DecisionReviewMutation =
     }
   | { kind: "conflict"; targetId: string; conflictingIds: string[] }
   | { kind: "ambiguous"; topic: string; candidateIds: string[] }
+  | { kind: "duplicate-id"; targetId: string; ids: string[] }
   // Wave 1A test-spec discriminants (test/memory/decision-review.test.ts).
   | { kind: "confirmed"; memory: MemoryFile; targetId: string }
   | { kind: "not-requested"; targetId: string }
@@ -96,8 +97,12 @@ export function requestFoundationalReview(
 }
 
 function requestByExactId(memory: MemoryFile, targetId: string): DecisionReviewMutation {
-  const raw = getDecisionById(memory, targetId)
-  if (!raw) return { kind: "not-found", targetId }
+  const lookup = getExactDecisionById(memory, targetId)
+  if (lookup.kind === "missing") return { kind: "not-found", targetId }
+  if (lookup.kind === "duplicate") {
+    return { kind: "duplicate-id", targetId, ids: lookup.ids }
+  }
+  const raw = lookup.decision
 
   const resolved = resolveDecisionAuthorities(memory.decisions)
   const resolvedTarget = resolved.decisions.find((d) => d.id === targetId)
@@ -203,8 +208,15 @@ export function confirmFoundationalReview(
   decisionId: string,
   reviewedAt: string,
 ): DecisionReviewMutation {
-  const target = getDecisionById(memory, decisionId)
-  if (!target) return { kind: "not-found", targetId: decisionId }
+  const lookup = getExactDecisionById(memory, decisionId)
+  if (lookup.kind === "missing") return { kind: "not-found", targetId: decisionId }
+  if (lookup.kind === "duplicate") {
+    // Wave-9 (Blocker 2): one confirmation token must never upgrade two rows.
+    // Refuse the ambiguous state even though the schema repair normally
+    // prevents duplicate IDs from reaching disk.
+    return { kind: "duplicate-id", targetId: decisionId, ids: lookup.ids }
+  }
+  const target = lookup.decision
 
   if (isTrustedHumanFoundational(target)) {
     return { kind: "already-reviewed", memory, targetId: decisionId }
@@ -252,15 +264,30 @@ export function supersedeHumanAuthority(
 ): DecisionReviewMutation {
   const { authorityId, candidateId, reviewedAt } = args
 
-  const authority = getDecisionById(memory, authorityId)
-  if (!authority) return { kind: "not-found", targetId: authorityId }
+  const authorityLookup = getExactDecisionById(memory, authorityId)
+  if (authorityLookup.kind === "missing") return { kind: "not-found", targetId: authorityId }
+  if (authorityLookup.kind === "duplicate") {
+    return { kind: "duplicate-id", targetId: authorityId, ids: authorityLookup.ids }
+  }
+  const authority = authorityLookup.decision
 
   if (!isTrustedHumanFoundational(authority)) {
     return { kind: "not-authority", targetId: authorityId }
   }
 
-  const candidate = getDecisionById(memory, candidateId)
-  if (!candidate) return { kind: "not-found", targetId: candidateId }
+  const candidateLookup = getExactDecisionById(memory, candidateId)
+  if (candidateLookup.kind === "missing") return { kind: "not-found", targetId: candidateId }
+  if (candidateLookup.kind === "duplicate") {
+    return { kind: "duplicate-id", targetId: candidateId, ids: candidateLookup.ids }
+  }
+  const candidate = candidateLookup.decision
+
+  // Wave-9 (Concern C): the plan requires the candidate to be an INVALID
+  // same-topic conflict candidate. A still-valid row is never a supersession
+  // candidate even when it is linked to the authority.
+  if (candidate.still_valid !== false) {
+    return { kind: "not-linked", targetId: candidateId }
+  }
 
   const sameTopic =
     normalizeDecisionTopic(candidate.topic) === normalizeDecisionTopic(authority.topic)

@@ -19,6 +19,11 @@ import {
 import type { Decision } from "../../src/memory/schema"
 import { emptyMemory, MemoryFileSchema } from "../../src/memory/schema"
 import { loadAndMigrate } from "../../src/memory/migrate"
+import {
+  requestFoundationalReview,
+  confirmFoundationalReview,
+  supersedeHumanAuthority,
+} from "../../src/memory/decision-review"
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -94,15 +99,22 @@ describe("PR 3 §6 decision authority", () => {
     expect(res.authorities[0]!.id).toBe("b")
   })
 
-  it("3. heuristic X + agreeing LLM X resolves to one authority with stronger LLM provenance", () => {
+  it("3. heuristic X + agreeing LLM X resolves to one authority; read view preserves the winner's original provenance", () => {
     const heuristic = mkDecision({ id: "h1", topic: "auth", decision: "Use JWT", timestamp: "2026-08-01T00:00:00Z", provenance: heuristicProv })
     const llm = mkDecision({ id: "l1", topic: "auth", decision: "Use JWT", timestamp: "2026-08-02T00:00:00Z", provenance: llmProv })
     const res = resolveDecisionAuthorities([heuristic, llm])
     expect(res.authorities).toHaveLength(1)
-    // Original heuristic ID is preserved; provenance is upgraded to LLM.
+    // Original heuristic ID is preserved.
     expect(res.authorities[0]!.id).toBe("h1")
-    expect(res.authorities[0]!.provenance?.extractor).toBe("llm")
-    expect(res.authorities[0]!.provenance?.confidence).toBe("llm-corroborated")
+    // Wave-9 (Concern A): the read view is an authority/lineage view only. The
+    // winner keeps its OWN persisted provenance; strongest-provenance
+    // enrichment is a WRITE-path action in mergeDecisions, never a read-time
+    // upgrade. The LLM row is marked historical.
+    expect(res.authorities[0]!.provenance?.extractor).toBe("heuristic")
+    expect(res.authorities[0]!.provenance?.confidence).toBe("heuristic")
+    const llmRow = res.decisions.find((d) => d.id === "l1")
+    expect(llmRow?.still_valid).toBe(false)
+    expect(lineageOf(llmRow).superseded_by).toBe("h1")
   })
 
   it("4. later heuristic Y after agreeing heuristic+LLM X leaves only Y authoritative", () => {
@@ -279,5 +291,159 @@ describe("resolveDecisionAuthorities shape", () => {
     const second = resolveDecisionAuthorities(input)
     expect(JSON.stringify(input)).toBe(snapshot)
     expect(JSON.stringify(first)).toBe(JSON.stringify(second))
+  })
+})
+
+// ─── PR 3 wave-9 — durable human conflict quarantine (Blocker 1) ─────────────
+describe("PR 3 wave-9 — durable human conflict quarantine", () => {
+  function humanRow(id: string, decision: string, timestamp: string, overrides: Record<string, unknown> = {}): Decision {
+    return mkDecision({
+      id,
+      topic: "auth",
+      decision,
+      timestamp,
+      foundational: true,
+      foundational_requested: false,
+      human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00Z" },
+      provenance: humanProv,
+      ...overrides,
+    })
+  }
+
+  it("two conflicting trusted humans with the durable flag set emit one conflict record and both rows stay quarantined", () => {
+    const humanA = humanRow("human-a", "Use JWT", "2026-08-01T00:00:00Z", {
+      still_valid: false,
+      human_conflict_quarantined: true,
+      conflicts_with: ["human-b"],
+    })
+    const humanB = humanRow("human-b", "Use OAuth2", "2026-08-02T00:00:00Z", {
+      still_valid: false,
+      human_conflict_quarantined: true,
+      conflicts_with: ["human-a"],
+    })
+    const res = resolveDecisionAuthorities([humanA, humanB])
+    expect(res.authorities).toHaveLength(0)
+    expect(res.conflicts).toHaveLength(1)
+    expect(res.conflicts[0]!.kind).toBe("conflicting-human-foundational")
+    expect([...res.conflicts[0]!.decision_ids].sort()).toEqual(["human-a", "human-b"])
+    const aRow = res.decisions.find((d) => d.id === "human-a")
+    const bRow = res.decisions.find((d) => d.id === "human-b")
+    expect(aRow?.still_valid).toBe(false)
+    expect(aRow?.human_conflict_quarantined).toBe(true)
+    expect(bRow?.still_valid).toBe(false)
+    expect(bRow?.human_conflict_quarantined).toBe(true)
+  })
+
+  it("resolver reconstructs the conflict from persisted non-authoritative rows without the flag (conflicts_with link + durable representation)", () => {
+    // Persisted post-reconciliation state: both human rows are still_valid=false
+    // and carry reciprocal conflicts_with, but the flag is absent (e.g. a file
+    // written by an earlier release).
+    const humanA = humanRow("human-a", "Use JWT", "2026-08-01T00:00:00Z", {
+      still_valid: false,
+      conflicts_with: ["human-b"],
+    })
+    const humanB = humanRow("human-b", "Use OAuth2", "2026-08-02T00:00:00Z", {
+      still_valid: false,
+      conflicts_with: ["human-a"],
+    })
+    const res = resolveDecisionAuthorities([humanA, humanB])
+    expect(res.authorities).toHaveLength(0)
+    expect(res.conflicts).toHaveLength(1)
+    expect(res.conflicts[0]!.kind).toBe("conflicting-human-foundational")
+    expect([...res.conflicts[0]!.decision_ids].sort()).toEqual(["human-a", "human-b"])
+    // The read view sets the durable flag so the next write persists it.
+    const aRow = res.decisions.find((d) => d.id === "human-a")
+    expect(aRow?.human_conflict_quarantined).toBe(true)
+    expect(aRow?.still_valid).toBe(false)
+    expect([...(aRow?.conflicts_with ?? [])].sort()).toEqual(["human-b"])
+  })
+
+  it("a duplicate-ID input still emits the correct authority view (winner is the oldest by timestamp)", () => {
+    const older = mkDecision({ id: "dup", topic: "auth", decision: "Use JWT", timestamp: "2026-08-01T00:00:00Z", provenance: heuristicProv })
+    const newer = mkDecision({ id: "dup", topic: "auth", decision: "Use JWT", timestamp: "2026-08-02T00:00:00Z", provenance: heuristicProv })
+    const res = resolveDecisionAuthorities([older, newer])
+    expect(res.authorities).toHaveLength(1)
+    // Equivalent duplicate observations: oldest timestamp asc wins.
+    expect(res.authorities[0]!.id).toBe("dup")
+    const newerRow = res.decisions.find((d) => d.timestamp === "2026-08-02T00:00:00Z")
+    expect(newerRow?.still_valid).toBe(false)
+    expect(lineageOf(newerRow).superseded_by).toBe("dup")
+  })
+})
+
+// ─── PR 3 wave-9 — defensive exact-ID duplicate refusal (Blocker 2) ──────────
+// The oracle Block verdict's second blocker: mutation helpers used `.map()` /
+// `.find()` semantics that could mint trust onto a different row sharing an ID.
+// The shared decision-review helpers must refuse a duplicate-ID state outright.
+// (decision-review.test.ts is outside the wave-9 touch scope, so these pin the
+// helper contract here.)
+describe("PR 3 wave-9 — decision-review duplicate-ID refusal", () => {
+  function memWith(...decisions: Decision[]) {
+    return { ...emptyMemory("/test"), decisions }
+  }
+
+  it("requestFoundationalReview refuses a duplicate-ID state", () => {
+    const t1 = mkDecision({ id: "dup", topic: "auth", decision: "Use JWT", provenance: llmProv })
+    const t2 = mkDecision({ id: "dup", topic: "auth", decision: "Use OAuth2", timestamp: "2026-08-02T00:00:00Z", provenance: llmProv })
+    const mutation = requestFoundationalReview(memWith(t1, t2), { decision_id: "dup" })
+    expect(mutation.kind).toBe("duplicate-id")
+  })
+
+  it("confirmFoundationalReview refuses a duplicate-ID state (no trust minted)", () => {
+    const t1 = mkDecision({ id: "dup", topic: "auth", decision: "Use JWT", foundational_requested: true, provenance: llmProv })
+    const t2 = mkDecision({ id: "dup", topic: "auth", decision: "Use OAuth2", foundational_requested: true, timestamp: "2026-08-02T00:00:00Z", provenance: llmProv })
+    const mutation = confirmFoundationalReview(memWith(t1, t2), "dup", "2026-08-09T00:00:00.000Z")
+    expect(mutation.kind).toBe("duplicate-id")
+    // No human trust was minted onto any row.
+    for (const d of mutation.kind === "duplicate-id" ? [t1, t2] : []) {
+      expect(d.foundational).toBe(false)
+      expect((d as { human_review?: unknown }).human_review).toBeUndefined()
+    }
+  })
+
+  it("supersedeHumanAuthority rejects duplicate authority and candidate IDs", () => {
+    const authority = mkDecision({
+      id: "authority-1", topic: "auth", decision: "Use JWT",
+      foundational: true,
+      human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00Z" },
+      provenance: humanProv,
+    })
+    const authorityDup = mkDecision({
+      id: "authority-1", topic: "auth", decision: "Use JWT",
+      foundational: true,
+      human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00Z" },
+      provenance: humanProv,
+    })
+    const candidate = mkDecision({ id: "candidate-1", topic: "auth", decision: "Use OAuth2", still_valid: false, conflicts_with: ["authority-1"], provenance: llmProv })
+
+    const dupAuthority = supersedeHumanAuthority(memWith(authority, authorityDup, candidate), {
+      authorityId: "authority-1", candidateId: "candidate-1", reviewedAt: "2026-08-09T00:00:00.000Z",
+    })
+    expect(dupAuthority.kind).toBe("duplicate-id")
+
+    const candidateDup = mkDecision({ id: "candidate-1", topic: "auth", decision: "Use OAuth2", still_valid: false, conflicts_with: ["authority-1"], provenance: llmProv })
+    const dupCandidate = supersedeHumanAuthority(memWith(authority, candidate, candidateDup), {
+      authorityId: "authority-1", candidateId: "candidate-1", reviewedAt: "2026-08-09T00:00:00.000Z",
+    })
+    expect(dupCandidate.kind).toBe("duplicate-id")
+  })
+
+  it("supersedeHumanAuthority refuses a same-topic, linked but STILL-VALID candidate (Concern C)", () => {
+    const authority = mkDecision({
+      id: "authority-1", topic: "auth", decision: "Use JWT",
+      foundational: true,
+      human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00Z" },
+      provenance: humanProv,
+    })
+    const candidate = mkDecision({
+      id: "candidate-1", topic: "auth", decision: "Use OAuth2",
+      still_valid: true, conflicts_with: ["authority-1"], provenance: llmProv,
+    })
+    const mutation = supersedeHumanAuthority(memWith(authority, candidate), {
+      authorityId: "authority-1", candidateId: "candidate-1", reviewedAt: "2026-08-09T00:00:00.000Z",
+    })
+    // The plan requires the candidate to be still_valid === false; a valid
+    // linked row is not a supersession candidate.
+    expect(mutation.kind).toBe("not-linked")
   })
 })

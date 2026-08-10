@@ -9,6 +9,7 @@
 import type { MemoryFile, Decision, ActiveFile } from "./schema"
 import { resolveDecisionAuthorities } from "./decision-authority"
 import type { DecisionAuthorityConflict } from "./decision-authority"
+import { log } from "../util/log"
 
 function provenanceLabel(value: { provenance?: Decision["provenance"] }): string {
   const provenance = value.provenance
@@ -66,9 +67,47 @@ export function queryDecisions(
  *
  * Returns the decision regardless of `still_valid`; callers check the
  * authority view / `still_valid` themselves (plan §8).
+ *
+ * Wave-9 (Blocker 2): decision IDs must be unique. `getDecisionById` therefore
+ * returns a row ONLY when there is exactly one raw match; a duplicate-ID state
+ * (which the v3 schema now rejects and `loadAndMigrate` repairs) returns
+ * `undefined` with a typed warning so `find()`-style first-match semantics can
+ * never mint trust onto the wrong row. Use `getExactDecisionById` when the
+ * caller needs to distinguish "duplicate" from "missing".
  */
 export function getDecisionById(mem: MemoryFile, decisionId: string): Decision | undefined {
-  return mem.decisions.find((d) => d.id === decisionId)
+  const matches = mem.decisions.filter((d) => d.id === decisionId)
+  if (matches.length > 1) {
+    void log(undefined, "warn", "getDecisionById: duplicate decision IDs", {
+      id: decisionId,
+      count: matches.length,
+    })
+    return undefined
+  }
+  return matches[0]
+}
+
+export type ExactDecisionLookup =
+  | { kind: "exact"; decision: Decision }
+  | { kind: "duplicate"; ids: string[] }
+  | { kind: "missing" }
+
+/**
+ * Wave-9 (Blocker 2) — defensive exact-ID lookup.
+ *
+ * Mutation paths (review request, confirmation, supersession, promotion) MUST
+ * use this helper and refuse on `{ kind: "duplicate" }` BEFORE any
+ * confirmation prompt or mutation. A duplicate-ID state is an explicit
+ * ambiguous/invalid result even if schema validation is accidentally bypassed
+ * by an in-memory test or a future internal caller.
+ */
+export function getExactDecisionById(mem: MemoryFile, decisionId: string): ExactDecisionLookup {
+  const matches = mem.decisions.filter((d) => d.id === decisionId)
+  if (matches.length === 0) return { kind: "missing" }
+  if (matches.length > 1) {
+    return { kind: "duplicate", ids: matches.map((d) => d.id) }
+  }
+  return { kind: "exact", decision: matches[0]! }
 }
 
 /**

@@ -1,7 +1,10 @@
 import { describe, it, expect } from "vitest"
 import { mergeMemory } from "../../src/memory/writer"
+import { mergeDecisions } from "../../src/memory/merge"
 import { emptyMemory } from "../../src/memory/schema"
 import type { MemoryFile, Decision } from "../../src/memory/schema"
+import { loadAndMigrate } from "../../src/memory/migrate"
+import { resolveDecisionAuthorities } from "../../src/memory/decision-authority"
 import type { ExtractedFacts } from "../../src/types"
 
 const meta = {
@@ -517,5 +520,190 @@ describe("PR 3 §7 merge semantics", () => {
     expect(target.foundational_requested).toBe(true)
     expect(target.foundational).toBe(false)
     expect(target.provenance?.extractor).not.toBe("human")
+  })
+})
+
+// ─── PR 3 wave-9 — durable human conflict quarantine (Blocker 1) ─────────────
+// The oracle Block verdict's first blocker: `mergeDecisions()` discarded the
+// initial `resolveDecisionAuthorities` conflicts, so an unresolved
+// conflicting-human topic lost its quarantine on the next write and automation
+// could mint a new authority for it. These tests pin the durable quarantine:
+// the conflict survives empty merges, heuristic and LLM automation cannot
+// create an authority, and persist/reload cycles never evaporate it.
+describe("PR 3 wave-9 — durable human conflict quarantine", () => {
+  const heuristicProvenance = {
+    extractor: "heuristic" as const,
+    source_session_id: "session-heuristic",
+    confidence: "heuristic" as const,
+    evidence: [] as never[],
+  }
+  const llmProvenance = {
+    extractor: "llm" as const,
+    source_session_id: "session-llm",
+    source_audit_session_id: "audit-llm",
+    confidence: "llm-corroborated" as const,
+    evidence: [] as never[],
+  }
+  const humanProvenance = {
+    extractor: "human" as const,
+    source_session_id: "s-human",
+    confidence: "human-reviewed" as const,
+    evidence: [] as never[],
+  }
+
+  const llmMeta = {
+    ...meta,
+    origin: "llm" as const,
+    auditSessionID: "audit-1",
+    evidenceCandidates: {
+      "tr-1": { kind: "transcript" as const, ref: "tr-1", digest: "b".repeat(64) },
+    },
+  }
+
+  function humanAuthority(id: string, decision: string, timestamp: string): Decision {
+    return makeDecision({
+      id,
+      topic: "database",
+      decision,
+      timestamp,
+      still_valid: true,
+      foundational: true,
+      foundational_requested: false,
+      human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00Z" },
+      provenance: humanProvenance,
+    })
+  }
+
+  function assertConflictState(decisions: readonly Decision[]): void {
+    const res = resolveDecisionAuthorities(decisions)
+    expect(res.authorities).toHaveLength(0)
+    expect(res.conflicts).toHaveLength(1)
+    expect(res.conflicts[0]!.kind).toBe("conflicting-human-foundational")
+    expect(res.conflicts[0]!.normalized_topic).toBe("database")
+    expect([...res.conflicts[0]!.decision_ids].sort()).toEqual(["human-a", "human-b"])
+    const quarantined = res.decisions.filter((d) => d.human_conflict_quarantined === true)
+    expect(quarantined.map((d) => d.id).sort()).toEqual(["human-a", "human-b"])
+  }
+
+  function persistAndReload(decisions: readonly Decision[]): MemoryFile {
+    const mem: MemoryFile = { ...emptyMemory("/test"), decisions: decisions as Decision[] }
+    const reloaded = loadAndMigrate(JSON.parse(JSON.stringify(mem)))
+    expect(reloaded).not.toBeNull()
+    return reloaded!
+  }
+
+  it("an empty incoming list preserves the durable conflict through persist/reload cycles", () => {
+    const existing = [
+      humanAuthority("human-a", "Use Postgres", "2026-08-01T00:00:00Z"),
+      humanAuthority("human-b", "Use MySQL", "2026-08-02T00:00:00Z"),
+    ]
+    let state = mergeDecisions(existing, [], meta)
+    assertConflictState(state)
+
+    // Repeated write/reload/write/reload cycles must never evaporate the
+    // quarantine or mint an authority.
+    for (let cycle = 0; cycle < 3; cycle++) {
+      const reloaded = persistAndReload(state)
+      assertConflictState(reloaded.decisions)
+      // The durable flag survives the round trip, so the next read still sees
+      // one conflict and zero authorities.
+      expect(reloaded.decisions.filter((d) => d.human_conflict_quarantined === true)).toHaveLength(2)
+      state = mergeDecisions(reloaded.decisions, [], meta)
+      assertConflictState(state)
+    }
+  })
+
+  it("an incoming heuristic observation cannot create an automated authority for a quarantined topic", () => {
+    const existing = [
+      humanAuthority("human-a", "Use Postgres", "2026-08-01T00:00:00Z"),
+      humanAuthority("human-b", "Use MySQL", "2026-08-02T00:00:00Z"),
+    ]
+    const merged = mergeDecisions(existing, [{ topic: "database", decision: "Use SQLite" }], meta)
+    assertConflictState(merged)
+
+    const sqlite = merged.find((d) => d.decision === "Use SQLite")
+    expect(sqlite).toBeDefined()
+    expect(sqlite!.still_valid).toBe(false)
+    expect(sqlite!.foundational).toBe(false)
+    expect([...(sqlite!.conflicts_with ?? [])].sort()).toEqual(["human-a", "human-b"])
+  })
+
+  it("an incoming evidence-backed LLM observation cannot create an automated authority for a quarantined topic", () => {
+    const existing = [
+      humanAuthority("human-a", "Use Postgres", "2026-08-01T00:00:00Z"),
+      humanAuthority("human-b", "Use MySQL", "2026-08-02T00:00:00Z"),
+    ]
+    const merged = mergeDecisions(
+      existing,
+      [{ topic: "database", decision: "Use SQLite", evidence_refs: ["tr-1"] } as never],
+      llmMeta,
+    )
+    assertConflictState(merged)
+
+    const sqlite = merged.find((d) => d.decision === "Use SQLite")
+    expect(sqlite).toBeDefined()
+    expect(sqlite!.still_valid).toBe(false)
+    expect(sqlite!.provenance?.extractor).toBe("llm")
+    expect([...(sqlite!.conflicts_with ?? [])].sort()).toEqual(["human-a", "human-b"])
+  })
+
+  it("a heuristic conflict rewrites only prior valid authorities, leaving a pre-existing LLM conflict candidate unchanged (Concern B)", () => {
+    const authority = makeDecision({
+      id: "h1",
+      topic: "database",
+      decision: "Use Postgres",
+      timestamp: "2026-08-01T00:00:00Z",
+      provenance: heuristicProvenance,
+    })
+    const llmCandidate = makeDecision({
+      id: "c1",
+      topic: "database",
+      decision: "Use MySQL",
+      timestamp: "2026-08-02T00:00:00Z",
+      still_valid: false,
+      foundational: false,
+      provenance: llmProvenance,
+      conflicts_with: ["h1"],
+    })
+    const existing = { ...emptyMemory("/test"), decisions: [authority, llmCandidate] }
+
+    const result = mergeMemory(existing, makeExtracted({
+      decisions: [{ topic: "database", decision: "Use DynamoDB" }],
+    }), meta)
+
+    const h = result.decisions.find((d) => d.id === "h1")!
+    const cand = result.decisions.find((d) => d.id === "c1")!
+    const incoming = result.decisions.find((d) => d.decision === "Use DynamoDB")!
+
+    // Only the prior VALID non-human authority is rewritten by the heuristic
+    // conflict; it is superseded by the new ID.
+    expect(h.still_valid).toBe(false)
+    expect((h as { superseded_by?: string }).superseded_by).toBe(incoming.id)
+    // The pre-existing invalid LLM conflict candidate keeps its original
+    // lineage untouched: no superseded_by is added, conflicts_with is intact.
+    expect(cand.still_valid).toBe(false)
+    expect((cand as { superseded_by?: string }).superseded_by).toBeUndefined()
+    expect(cand.conflicts_with).toEqual(["h1"])
+    expect(cand.provenance?.extractor).toBe("llm")
+  })
+
+  it("write-path enrichment: an agreeing LLM observation upgrades the persisted row's provenance (Concern A)", () => {
+    const existing = [makeDecision({
+      id: "h1",
+      topic: "database",
+      decision: "Use Postgres",
+      provenance: heuristicProvenance,
+    })]
+    const merged = mergeDecisions(
+      existing,
+      [{ topic: "database", decision: "Use Postgres", evidence_refs: ["tr-1"] } as never],
+      llmMeta,
+    )
+    expect(merged).toHaveLength(1)
+    expect(merged[0]!.id).toBe("h1")
+    // The WRITE path performs the strongest-provenance enrichment in place.
+    expect(merged[0]!.provenance?.extractor).toBe("llm")
+    expect(merged[0]!.provenance?.confidence).toBe("llm-corroborated")
+    expect(merged[0]!.provenance?.source_audit_session_id).toBe("audit-1")
   })
 })

@@ -7,6 +7,7 @@
  * filesystem behavior and can therefore leave the prior file untouched when
  * this function returns null.
  */
+import { randomUUID } from "node:crypto"
 import {
   CacheQuarantineMetadataSchema,
   LLMExtractionCacheEntrySchema,
@@ -101,6 +102,106 @@ function migrateActiveFile(value: unknown, fallbackSource: unknown): unknown {
     ...value,
     provenance: legacyProvenance(fallbackSource),
   }
+}
+
+/**
+ * PR 3 wave-9 (Blocker 2) — deterministic duplicate-decision-ID repair.
+ *
+ * Pre-PR3 files may contain two rows sharing one `id` because uniqueness was
+ * never enforced. Since the stable decision ID is the human-review trust
+ * address, a single confirmation token must never be able to upgrade two rows.
+ * On load we repair such files deterministically:
+ *
+ *  - every row in a duplicate-ID group receives a fresh UUID v4 `id`, keeping
+ *    its semantic fields (topic/decision/rationale/evidence/session);
+ *  - the deterministically-oldest row (timestamp asc, then lexical ID asc) is
+ *    the canonical "winner";
+ *  - any `superseded_by` / `conflicts_with` / `derived_from_decision_id`
+ *    reference that pointed at the old shared ID is rewritten to point at the
+ *    winner's fresh ID;
+ *  - if ANY row in the group carries `human_review`, ALL rows in the group are
+ *    demoted to `foundational=false` + `foundational_requested=true` (legacy
+ *    repair) so the human must re-confirm against the resolved unique row —
+ *    one duplicate is never silently treated as the confirmed review target.
+ */
+function repairDuplicateDecisionIds(decisions: unknown[]): unknown[] {
+  const rows = decisions.map((value) => (isRecord(value) ? { ...value } : value))
+
+  const byId = new Map<string, RawRecord[]>()
+  for (const row of rows) {
+    if (!isRecord(row)) continue
+    const id = row.id
+    if (typeof id !== "string" || id.length === 0) continue
+    const group = byId.get(id)
+    if (group) group.push(row)
+    else byId.set(id, [row])
+  }
+
+  const idRewrite = new Map<string, string>()
+
+  for (const [id, group] of byId) {
+    if (group.length < 2) continue
+
+    // Deterministic winner: oldest timestamp asc, then lexical ID asc.
+    const winner = group.slice().sort((a, b) => {
+      const ta = Date.parse(typeof a.timestamp === "string" ? a.timestamp : "")
+      const tb = Date.parse(typeof b.timestamp === "string" ? b.timestamp : "")
+      const aOk = Number.isFinite(ta)
+      const bOk = Number.isFinite(tb)
+      if (aOk && bOk && ta !== tb) return ta - tb
+      if (aOk && !bOk) return -1
+      if (!aOk && bOk) return 1
+      return String(a.id).localeCompare(String(b.id))
+    })[0]!
+
+    for (const row of group) {
+      row.id = randomUUID()
+    }
+    idRewrite.set(id, String(winner.id))
+
+    if (group.some((row) => row.human_review !== undefined)) {
+      for (const row of group) {
+        row.foundational = false
+        row.foundational_requested = true
+        delete row.human_review
+        // A surviving human trust claim would violate the v3 human-trust
+        // invariant (foundational must be true), so rows that carried human
+        // provenance are downgraded to legacy; non-human rows keep their
+        // evidence-backed provenance.
+        if (
+          isRecord(row.provenance) &&
+          (row.provenance.extractor === "human" || row.provenance.confidence === "human-reviewed")
+        ) {
+          row.provenance = {
+            ...row.provenance,
+            extractor: "legacy",
+            confidence: "legacy",
+          }
+        }
+      }
+    }
+  }
+
+  if (idRewrite.size === 0) return rows
+
+  // Rewrite lineage references that pointed at a now-removed duplicate ID.
+  for (const row of rows) {
+    if (!isRecord(row)) continue
+    for (const field of ["superseded_by", "derived_from_decision_id"] as const) {
+      const value = row[field]
+      if (typeof value === "string" && idRewrite.has(value)) {
+        row[field] = idRewrite.get(value)
+      }
+    }
+    if (Array.isArray(row.conflicts_with)) {
+      row.conflicts_with = row.conflicts_with.map((ref) => {
+        if (typeof ref !== "string" || !idRewrite.has(ref)) return ref
+        return idRewrite.get(ref)
+      })
+    }
+  }
+
+  return rows
 }
 
 function migrateCurrentTask(data: RawRecord, fallbackSource: unknown): RawRecord {
@@ -219,6 +320,17 @@ export function loadAndMigrate(raw: unknown): MemoryFile | null {
     data = {
       ...data,
       decisions: repairUnverifiedHumanClaims(data.decisions),
+    }
+  }
+
+  // PR 3 wave-9 (Blocker 2) — repair duplicate decision IDs before the v3
+  // schema's uniqueness invariant rejects the file. Fresh IDs are assigned to
+  // every duplicate and lineage references are rewritten to the canonical
+  // (deterministically-oldest) row.
+  if (Array.isArray(data.decisions)) {
+    data = {
+      ...data,
+      decisions: repairDuplicateDecisionIds(data.decisions),
     }
   }
 

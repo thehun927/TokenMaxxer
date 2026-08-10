@@ -11,17 +11,14 @@
  */
 import { tool } from "@opencode-ai/plugin"
 import { readMemory, mutateMemory, resolveProjectPath } from "../memory/store"
-import type { MemoryMutationResult } from "../memory/store"
+import type { MemoryMutationResult, MutationAction } from "../memory/store"
 import {
   queryDecisions,
   getActiveFiles,
   getProjectState,
 } from "../memory/reader"
-import {
-  resolveDecisionAuthorities,
-  isTrustedHumanFoundational,
-  normalizeDecisionTopic,
-} from "../memory/decision-authority"
+import { requestFoundationalReview } from "../memory/decision-review"
+import type { DecisionReviewMutation } from "../memory/decision-review"
 import { enqueueProjectJob } from "../memory/lock"
 
 function decisionProvenanceLabel(value: { provenance?: {
@@ -112,6 +109,7 @@ export type RecallPromoteOutcome =
   | { outcome: "not-authoritative"; id: string }
   | { outcome: "conflict"; id?: string; topic?: string }
   | { outcome: "ambiguous"; topic: string }
+  | { outcome: "duplicate-id"; id: string }
 
 function formatRecallPromoteResult(result: MemoryMutationResult<RecallPromoteOutcome>): string {
   if (result.status === "unavailable") {
@@ -137,6 +135,47 @@ function formatRecallPromoteResult(result: MemoryMutationResult<RecallPromoteOut
         : `Topic '${result.value.topic}' has an unresolved human-foundational conflict. Specify --decision-id from recall_decision.`
     case "ambiguous":
       return `Ambiguous topic '${result.value.topic}': multiple authorities exist. Specify --decision-id from recall_decision.`
+    case "duplicate-id":
+      return `Decision ${result.value.id} is ambiguous: multiple rows share this ID. Refusing review request; no state was changed.`
+  }
+}
+
+/**
+ * Wave-9 (Concern D) — map the shared `requestFoundationalReview` eligibility
+ * result onto the typed `RecallPromoteOutcome` and the `mutateMemory` action.
+ * The model tool and the human CLI now share one eligibility definition, so
+ * conflict/ID/topic policy cannot drift between the two callers.
+ */
+function reviewMutationToAction(
+  mutation: DecisionReviewMutation,
+  isTopic: boolean,
+): MutationAction<RecallPromoteOutcome> {
+  switch (mutation.kind) {
+    case "requested":
+      return {
+        kind: "commit",
+        memory: mutation.memory,
+        value: { outcome: "requested", id: mutation.targetId },
+      }
+    case "already-reviewed":
+      return { kind: "noop", value: { outcome: "already-reviewed", id: mutation.targetId } }
+    case "not-found":
+      return isTopic
+        ? { kind: "noop", value: { outcome: "not-found", topic: mutation.targetId } }
+        : { kind: "noop", value: { outcome: "not-found", id: mutation.targetId } }
+    case "not-authoritative":
+      return { kind: "noop", value: { outcome: "not-authoritative", id: mutation.targetId } }
+    case "conflict":
+      return isTopic
+        ? { kind: "noop", value: { outcome: "conflict", topic: mutation.targetId } }
+        : { kind: "noop", value: { outcome: "conflict", id: mutation.targetId } }
+    case "ambiguous":
+      return { kind: "noop", value: { outcome: "ambiguous", topic: mutation.topic } }
+    case "duplicate-id":
+      return { kind: "noop", value: { outcome: "duplicate-id", id: mutation.targetId } }
+    default:
+      // Safety: any future helper kind is a refusal, never a promotion.
+      return { kind: "noop", value: { outcome: "not-found", id: mutation.targetId } }
   }
 }
 
@@ -172,76 +211,15 @@ export async function _recallPromote(
       const result = await mutateMemory<RecallPromoteOutcome>(
         { worktree: context.worktree, directory: context.directory },
         (base) => {
-          const resolution = resolveDecisionAuthorities(base.decisions)
-          const authorities = resolution.authorities
-          const conflicts = resolution.conflicts
-
-          if (hasId) {
-            const id = args.decision_id!.trim()
-            const decision = base.decisions.find((d) => d.id === id)
-            if (!decision) {
-              return { kind: "noop", value: { outcome: "not-found", id } }
-            }
-            const normalizedTopic = normalizeDecisionTopic(decision.topic)
-            if (conflicts.some((c) => c.normalized_topic === normalizedTopic)) {
-              return { kind: "noop", value: { outcome: "conflict", id } }
-            }
-            const authority = authorities.find(
-              (a) => normalizeDecisionTopic(a.topic) === normalizedTopic,
-            )
-            if (!authority || authority.id !== id) {
-              return { kind: "noop", value: { outcome: "not-authoritative", id } }
-            }
-            if (isTrustedHumanFoundational(decision)) {
-              return { kind: "noop", value: { outcome: "already-reviewed", id } }
-            }
-            // PR 3 §9.1: the ONLY mutation is foundational_requested = true.
-            return {
-              kind: "commit",
-              memory: {
-                ...base,
-                decisions: base.decisions.map((d) =>
-                  d.id === id ? { ...d, foundational_requested: true } : d,
-                ),
-              },
-              value: { outcome: "requested", id },
-            }
-          }
-
-          // PR 3 §9.2 — temporary topic compatibility path: succeeds only for
-          // one unambiguous exact normalized authority with no conflict.
-          const topic = args.topic!.trim()
-          const normalizedTopic = normalizeDecisionTopic(topic)
-          if (conflicts.some((c) => c.normalized_topic === normalizedTopic)) {
-            return { kind: "noop", value: { outcome: "conflict", topic } }
-          }
-          const rawValid = base.decisions.filter(
-            (d) => d.still_valid === true && normalizeDecisionTopic(d.topic) === normalizedTopic,
-          )
-          if (rawValid.length === 0) {
-            return { kind: "noop", value: { outcome: "not-found", topic } }
-          }
-          if (rawValid.length > 1) {
-            return { kind: "noop", value: { outcome: "ambiguous", topic } }
-          }
-          const target = rawValid[0]!
-          const authority = authorities.find((a) => a.id === target.id)
-          if (!authority) {
-            return { kind: "noop", value: { outcome: "not-authoritative", id: target.id } }
-          }
-          if (isTrustedHumanFoundational(target)) {
-            return { kind: "noop", value: { outcome: "already-reviewed", id: target.id } }
-          }
-          return {
-            kind: "commit",
-            memory: {
-              ...base,
-              decisions: base.decisions.map((d) =>
-                d.id === target.id ? { ...d, foundational_requested: true } : d,
-              ),
-            },
-            value: { outcome: "requested", id: target.id },
-          }
+          // Wave-9 (Concern D): delegate to the shared eligibility helper. It
+          // performs the exact-ID/topic resolution, refuses unresolved human
+          // conflicts and duplicate-ID states, and is the ONLY code that may
+          // decide a row may be requested. The ONLY mutation it performs is
+          // `foundational_requested = true`.
+          const mutation = hasId
+            ? requestFoundationalReview(base, { decision_id: args.decision_id!.trim() })
+            : requestFoundationalReview(base, { topic: args.topic!.trim() })
+          return reviewMutationToAction(mutation, hasTopic)
         },
       )
       return formatRecallPromoteResult(result)
