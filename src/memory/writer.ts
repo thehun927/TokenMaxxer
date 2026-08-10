@@ -384,7 +384,10 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       })
       return "heuristic-only"
     }
-    const selectedCacheKey = extractionCacheKey(sessionId, canonicalInput, llmConfig.model)
+    // Narrowed reference so the final-merge transaction closure can use the
+    // resolved model without re-narrowing a mutable binding.
+    const selectedModel = llmConfig.model
+    const selectedCacheKey = extractionCacheKey(sessionId, canonicalInput, selectedModel)
     if (selectedCacheKey !== cacheKey) {
       const selectedCachedEntry = readExtractionCacheEntry(afterHeuristic, selectedCacheKey, {
         evidenceCandidateMap: candidates,
@@ -406,32 +409,61 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     let extractionAuditSessionID: string | undefined
     const persistAudit: AuditCreatedCallback = async (audit) => {
       extractionAuditSessionID = audit.audit_session_id
-      // Fail this audit registration on an unavailable STATE so the LLM step
-      // aborts instead of persisting an audit guard on an unknown base.
-      const latestState = await readMemoryState({ worktree, directory })
-      if (latestState.status === "unavailable") {
-        void log(client, "warn", "memory read failed; refusing audit registration", { project })
+      // Audit guard creation is one short transaction (PR 2 §11.B). On any
+      // lock/read/commit failure we return false so prompting does not continue
+      // without a durable guard (PR 2 §13).
+      const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
+        { worktree, directory, client },
+        (base) => {
+          const guarded = upsertAuditMetadata(base, audit)
+          return { kind: "commit", memory: pruneOld(guarded, client), value: { outcome: "committed" } }
+        },
+      )
+      if (result.status === "lock-timeout") {
+        void log(client, "warn", "audit guard transaction lock-timeout", { project })
         return false
       }
-      const latest = latestState.memory ?? afterHeuristic
-      const guarded = upsertAuditMetadata(latest, audit)
-      return writeMemory({ worktree, directory, client }, pruneOld(guarded, client))
+      if (result.status === "unavailable") {
+        void log(client, "warn", "audit guard transaction unavailable", { project })
+        return false
+      }
+      if (result.status === "commit-failed") {
+        void log(client, "warn", "audit guard transaction commit-failed", { project })
+        return false
+      }
+      return true
     }
     const persistTerminal = async (
       auditSessionID: string,
       outcome: Exclude<AuditTerminalOutcome, "pending">,
     ): Promise<void> => {
-      // Swallow unavailability: skipping a terminal audit outcome is safe and
-      // preferable to writing one on an unknown base.
-      const latestState = await readMemoryState({ worktree, directory })
-      if (latestState.status === "unavailable") {
-        void log(client, "warn", "memory read failed; skipping audit terminal outcome", { project })
+      // Terminal outcomes are best-effort (PR 2 §11.C, §13): on failure log a
+      // bounded warning and continue; never fall back to a stale full-state write.
+      const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
+        { worktree, directory, client },
+        (base) => {
+          const audits = base.llm_extraction_audits ?? []
+          if (!audits.some((a) => a.audit_session_id === auditSessionID)) {
+            // Audit row no longer exists; return noop rather than bumping revision.
+            return { kind: "noop", value: { outcome: "noop" } }
+          }
+          const updated = setAuditTerminalOutcome(base, auditSessionID, outcome)
+          return { kind: "commit", memory: pruneOld(updated, client), value: { outcome: "committed" } }
+        },
+      )
+      if (result.status === "noop") return
+      if (result.status === "lock-timeout") {
+        void log(client, "warn", "audit terminal transaction lock-timeout", { project })
         return
       }
-      const latest = latestState.memory
-      if (!latest) return
-      const updated = setAuditTerminalOutcome(latest, auditSessionID, outcome)
-      await writeMemory({ worktree, directory, client }, pruneOld(updated, client))
+      if (result.status === "unavailable") {
+        void log(client, "warn", "audit terminal transaction unavailable", { project })
+        return
+      }
+      if (result.status === "commit-failed") {
+        void log(client, "warn", "audit terminal transaction commit-failed", { project })
+        return
+      }
     }
 
     void log(client, "debug", "llm extraction audit session requested")
@@ -450,17 +482,28 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
         onAuditCreated: persistAudit,
         onAuditTerminal: persistTerminal,
         onHealthOutcome: async (report) => {
-          // Swallow unavailability: a dropped model-health record is acceptable;
-          // writing one on an unknown base is not.
-          const latestState = await readMemoryState({ worktree, directory })
-          if (latestState.status === "unavailable") {
-            void log(client, "warn", "memory read failed; skipping model health update", { project })
+          // Model health is best-effort (PR 2 §11.D, §13): on transaction
+          // failure log a bounded warning and return without retry; never fall
+          // back to a stale full-state write.
+          const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
+            { worktree, directory, client },
+            (base) => {
+              const updated = upsertModelHealth(base, report)
+              return { kind: "commit", memory: pruneOld(updated, client), value: { outcome: "committed" } }
+            },
+          )
+          if (result.status === "lock-timeout") {
+            void log(client, "warn", "model health transaction lock-timeout", { project })
             return
           }
-          const latest = latestState.memory
-          if (!latest) return
-          const updated = upsertModelHealth(latest, report)
-          await writeMemory({ worktree, directory, client }, pruneOld(updated, client))
+          if (result.status === "unavailable") {
+            void log(client, "warn", "model health transaction unavailable", { project })
+            return
+          }
+          if (result.status === "commit-failed") {
+            void log(client, "warn", "model health transaction commit-failed", { project })
+            return
+          }
         },
       },
     )
@@ -469,70 +512,82 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       return "llm-failed"
     }
 
-    // Re-read under the same project transaction immediately before the final
-    // merge/upsert. A duplicate completion therefore replaces, rather than
-    // appends, the same cache identity.
-    const latestState = await readMemoryState({ worktree, directory })
-    if (latestState.status === "unavailable") {
-      // LLM facts exist but cannot be committed to an authoritatively readable
-      // base, so report the failure rather than merging onto empty memory.
-      void log(client, "warn", "memory read failed; refusing final LLM merge", { project })
+    // Final LLM merge is one short transaction (PR 2 §11.E). The cache
+    // identity check runs INSIDE the transaction against the authoritative
+    // lock-read base, so a concurrent commit of the same cache identity is
+    // observed rather than a pre-lock snapshot.
+    const finalResult = await mutateMemory<{ outcome: "committed" | "noop"; memory: MemoryFile }>(
+      { worktree, directory, client },
+      (base) => {
+        const cacheAlreadyCommitted = readExtractionCacheEntry(base, selectedCacheKey, {
+          evidenceCandidateMap: candidates,
+          evidenceDigestMap: digests,
+        })
+        if (cacheAlreadyCommitted) {
+          const merged = mergeMemory(base, cacheAlreadyCommitted.facts, {
+            sessionId,
+            gitSha,
+            timestamp: new Date().toISOString(),
+            origin: "llm",
+            auditSessionID: cacheAlreadyCommitted.provenance?.source_audit_session_id,
+            evidenceCandidates: candidates,
+            provenanceEvidence: cacheAlreadyCommitted.provenance?.evidence,
+          })
+          const finalMemory = pruneOld(recordRecentSession(merged, sessionId), client)
+          return { kind: "commit", memory: finalMemory, value: { outcome: "committed", memory: finalMemory } }
+        }
+        const timestamp = new Date().toISOString()
+        const mergedLLM = mergeMemory(base, llmFacts, {
+          sessionId,
+          gitSha,
+          timestamp,
+          origin: "llm",
+          auditSessionID: extractionAuditSessionID,
+          evidenceCandidates: candidates,
+        })
+        const decisionEvidence = [
+          ...llmFacts.decisions.flatMap((decision) => candidateEvidence(
+            (decision as { evidence_refs?: unknown }).evidence_refs,
+            candidates,
+          )),
+        ].filter((evidence, index, all) => (
+          all.findIndex((candidate) => candidate.ref === evidence.ref) === index
+        ))
+        const cacheEvidence = decisionEvidence.length > 0
+          ? decisionEvidence
+          : firstCandidateEvidence(candidates)
+        const cacheCanRepresentAllEvidence = decisionEvidence.length <= 3
+        const withCache = cacheCanRepresentAllEvidence && cacheEvidence.length > 0 && extractionAuditSessionID
+          ? upsertExtractionCache(
+              recordRecentSession(mergedLLM, sessionId),
+              makeExtractionCacheEntry({
+                sourceSessionID: sessionId,
+                canonicalInput,
+                model: selectedModel,
+                facts: llmFacts,
+                auditSessionID: extractionAuditSessionID,
+                evidence: cacheEvidence,
+                completedAt: timestamp,
+              }),
+            )
+          : recordRecentSession(mergedLLM, sessionId)
+        const finalMemory = pruneOld(withCache, client)
+        return { kind: "commit", memory: finalMemory, value: { outcome: "committed", memory: finalMemory } }
+      },
+    )
+    if (finalResult.status === "lock-timeout") {
+      void log(client, "warn", "final llm transaction lock-timeout", { project })
       return "llm-failed"
     }
-    const latest = latestState.memory ?? heuristicMemory
-    const cacheAlreadyCommitted = readExtractionCacheEntry(latest, selectedCacheKey, {
-      evidenceCandidateMap: candidates,
-      evidenceDigestMap: digests,
-    })
-    if (cacheAlreadyCommitted) {
-      const merged = await mergeAsyncFacts(opts, cacheAlreadyCommitted.facts, gitSha, sessionId, {
-        origin: "llm",
-        auditSessionID: cacheAlreadyCommitted.provenance?.source_audit_session_id,
-        evidenceCandidates: candidates,
-        provenanceEvidence: cacheAlreadyCommitted.provenance?.evidence,
-      })
-      if (!merged) return "llm-failed"
-      return "cache-hit"
+    if (finalResult.status === "unavailable") {
+      void log(client, "warn", "final llm transaction unavailable", { project })
+      return "llm-failed"
     }
-
-    const timestamp = new Date().toISOString()
-    const mergedLLM = mergeMemory(latest, llmFacts, {
-      sessionId,
-      gitSha,
-      timestamp,
-      origin: "llm",
-      auditSessionID: extractionAuditSessionID,
-      evidenceCandidates: candidates,
-    })
-    const decisionEvidence = [
-      ...llmFacts.decisions.flatMap((decision) => candidateEvidence(
-        (decision as { evidence_refs?: unknown }).evidence_refs,
-        candidates,
-      )),
-    ].filter((evidence, index, all) => (
-      all.findIndex((candidate) => candidate.ref === evidence.ref) === index
-    ))
-    const cacheEvidence = decisionEvidence.length > 0
-      ? decisionEvidence
-      : firstCandidateEvidence(candidates)
-    const cacheCanRepresentAllEvidence = decisionEvidence.length <= 3
-    const withCache = cacheCanRepresentAllEvidence && cacheEvidence.length > 0 && extractionAuditSessionID
-      ? upsertExtractionCache(
-          recordRecentSession(mergedLLM, sessionId),
-          makeExtractionCacheEntry({
-            sourceSessionID: sessionId,
-            canonicalInput,
-            model: llmConfig.model,
-            facts: llmFacts,
-            auditSessionID: extractionAuditSessionID,
-            evidence: cacheEvidence,
-            completedAt: timestamp,
-          }),
-        )
-      : recordRecentSession(mergedLLM, sessionId)
-    const finalMemory = pruneOld(withCache, client)
-    const committed = await writeMemory({ worktree, directory, client }, finalMemory)
-    if (committed === false) return "llm-failed"
+    if (finalResult.status === "commit-failed") {
+      void log(client, "warn", "final llm transaction commit-failed", { project })
+      return "llm-failed"
+    }
+    const finalMemory = finalResult.value.memory
     await writeHeaderBestEffort(client, worktree, directory, finalMemory)
     void log(client, "info", "llm extraction facts merged")
     return "llm-success"
@@ -603,27 +658,35 @@ async function mergeAsyncFacts(
   mergeOptions: MergeOptions,
 ): Promise<boolean> {
   const project = resolveProjectPath(opts.worktree, opts.directory)
-  // Fail closed: never merge async facts onto empty memory when the existing
-  // STATE is unreadable.
-  const latestState = await readMemoryState({ worktree: opts.worktree, directory: opts.directory })
-  if (latestState.status === "unavailable") {
-    void log(opts.client, "warn", "memory read failed; refusing async facts merge", { project })
+  // Cache-hit merge is one short transaction (PR 2 §11.E). On any
+  // lock/read/commit failure return false so the writer maps it to "llm-failed".
+  const result = await mutateMemory<{ outcome: "committed" | "noop"; memory: MemoryFile }>(
+    { worktree: opts.worktree, directory: opts.directory, client: opts.client },
+    (base) => {
+      const merged = mergeMemory(base, facts, {
+        sessionId,
+        gitSha,
+        timestamp: new Date().toISOString(),
+        ...mergeOptions,
+      })
+      const finalMemory = pruneOld(recordRecentSession(merged, sessionId), opts.client)
+      return { kind: "commit", memory: finalMemory, value: { outcome: "committed", memory: finalMemory } }
+    },
+  )
+  if (result.status === "lock-timeout") {
+    void log(opts.client, "warn", "cache-hit transaction lock-timeout", { project })
     return false
   }
-  const latest = latestState.memory ?? emptyMemory(project)
-  const merged = mergeMemory(latest, facts, {
-    sessionId,
-    gitSha,
-    timestamp: new Date().toISOString(),
-    ...mergeOptions,
-  })
-  const finalMemory = pruneOld(recordRecentSession(merged, sessionId), opts.client)
-  const persisted = await writeMemory(
-    { worktree: opts.worktree, directory: opts.directory, client: opts.client },
-    finalMemory,
-  )
-  if (!persisted) return false
-  await writeHeaderBestEffort(opts.client, opts.worktree, opts.directory, finalMemory)
+  if (result.status === "unavailable") {
+    void log(opts.client, "warn", "cache-hit transaction unavailable", { project })
+    return false
+  }
+  if (result.status === "commit-failed") {
+    void log(opts.client, "warn", "cache-hit transaction commit-failed", { project })
+    return false
+  }
+  // HEADER is best-effort and lives outside the lock.
+  await writeHeaderBestEffort(opts.client, opts.worktree, opts.directory, result.value.memory)
   return true
 }
 
