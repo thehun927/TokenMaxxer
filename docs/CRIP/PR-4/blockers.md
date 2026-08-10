@@ -35,3 +35,14 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [test-gap] test/index.test.ts extended with failing client-injection + peer-range fixtures; expected to go green in Waves 2/6/7.
 - [test-gap] test/host/package-meta.test.ts created with peer range + dev dep + installed-version assertions; expected to go green in Wave 7.
 - [scope-deviation] Failing fixtures that reference not-yet-existing exports use `as any` at the call boundary to document the planned contract; they may compile-error or runtime-error today; that's intended.
+
+## 2026-08-10 — wave-2 dependency injection
+- [design-decision] registerEfficiencyTools now requires HostClient; the registered execute wraps it via closure; the legitimate PluginInput["client"] is the only accepted source.
+- [design-decision] Helper signatures are (args, context, client) — client is a separate typed parameter, not a property of the context type.
+- [design-decision] head_files routes through client.file.read with query.directory = context.directory; no process.cwd() fallback, no init directory capture, no Node readFile.
+- [design-decision] head_files tool description updated to match the v1.18.15 host behavior (paths routed through OpenCode using the current tool invocation directory; the `paths` arg no longer promises worktree-relative resolution).
+- [bug-fix] Removed (context as any).client; no production code reads a client from ToolContext.
+- [test-gap] 7 §12 A efficiency fixtures now green.
+- [scope-deviation] The return shape of registerEfficiencyTools keeps the `{ tool: { head_files, preview_compaction } }` wrapper (matching registerTools/registerStatusTools) instead of the bare `{ head_files, preview_compaction }` map sketched in §6: index.ts spreads the result into the Hooks `tool` map, and both test files address `registered.tool.head_files` — src/tools/efficiency.ts:104-141.
+- [test-gap] Pre-existing direct-helper tests in test/tools/efficiency.test.ts (the `_previewCompaction` and `_headFiles` describe blocks) were updated from the old `(args, contextWithClient)` call shape to the spec-mandated `(args, HostProjectContext, HostClient)` shape; they are the same tests, not new fixtures — test/tools/efficiency.test.ts:50-81, 89-181.
+- [bug-fix] test/index.test.ts §12 F item 45 still fails, but for a pre-existing reason unrelated to client injection: the plugin return object spreads `...registerTools(ctx)`, `...registerEfficiencyTools(client)`, and `...registerStatusTools()`, and every one of those returns a `tool` key, so the last spread wins and `hooks.tool` only ever contains `tokenmaxxer_status` — src/index.ts:116-120. Item 45's client-injection half is now proven by the second §12 F fixture, which is green. Tool-map merging is a separate wave concern; not fixed in Wave 2 per bounded scope.

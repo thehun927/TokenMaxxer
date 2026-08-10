@@ -52,9 +52,12 @@ describe("_previewCompaction", () => {
       "Project: /test\nCurrent task: testing",
     )
 
+    // Wave 2 signature: (args, HostProjectContext, HostClient) — the client is
+    // a separate positional argument, not a property of the context.
     const result = await _previewCompaction(
       {},
-      { worktree: "/test", directory: "/test", client: null },
+      { worktree: "/test", directory: "/test" },
+      null,
     )
 
     expect(result).toBe("Project: /test\nCurrent task: testing")
@@ -70,7 +73,8 @@ describe("_previewCompaction", () => {
 
     const result = await _previewCompaction(
       {},
-      { worktree: "/test", directory: "/test", client: null },
+      { worktree: "/test", directory: "/test" },
+      null,
     )
 
     expect(result).toContain("Error previewing compaction: Error: build failed")
@@ -90,7 +94,8 @@ describe("_headFiles", () => {
 
     const result = await _headFiles(
       { paths: ["src/index.ts"], lines: 3 },
-      { worktree: "/test", directory: "/test", client },
+      { worktree: "/test", directory: "/test" },
+      client,
     )
 
     expect(result).toContain("### src/index.ts")
@@ -107,7 +112,8 @@ describe("_headFiles", () => {
 
     const result = await _headFiles(
       { paths: ["short.ts"], lines: 5 },
-      { worktree: "/test", directory: "/test", client },
+      { worktree: "/test", directory: "/test" },
+      client,
     )
 
     expect(result).toContain("line1\nline2")
@@ -121,7 +127,8 @@ describe("_headFiles", () => {
 
     const result = await _headFiles(
       { paths: ["empty.ts"], lines: 40 },
-      { worktree: "/test", directory: "/test", client },
+      { worktree: "/test", directory: "/test" },
+      client,
     )
 
     expect(result).toContain("### empty.ts")
@@ -135,7 +142,8 @@ describe("_headFiles", () => {
 
     const result = await _headFiles(
       { paths: ["missing.ts"], lines: 40 },
-      { worktree: "/test", directory: "/test", client },
+      { worktree: "/test", directory: "/test" },
+      client,
     )
 
     expect(result).toContain("### missing.ts")
@@ -150,7 +158,8 @@ describe("_headFiles", () => {
 
     const result = await _headFiles(
       { paths: ["a.ts", "b.ts"], lines: 40 },
-      { worktree: "/test", directory: "/test", client },
+      { worktree: "/test", directory: "/test" },
+      client,
     )
 
     expect(result).toContain("### a.ts")
@@ -167,7 +176,8 @@ describe("_headFiles", () => {
 
     const result = await _headFiles(
       { paths: ["big.ts"], lines: 40 },
-      { worktree: "/test", directory: "/test", client },
+      { worktree: "/test", directory: "/test" },
+      client,
     )
 
     const contentLines = result.split("\n").filter((l) => l.startsWith("line"))

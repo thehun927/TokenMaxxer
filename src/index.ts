@@ -114,7 +114,9 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
 
     // Layer 2: custom tools (recall + efficiency + status)
     ...registerTools(ctx),
-    ...registerEfficiencyTools(),
+    // PR 4 §6: the legitimate `PluginInput["client"]` is injected into the
+    // efficiency tools by closure. A `ToolContext` never carries a client.
+    ...registerEfficiencyTools(client),
     ...registerStatusTools(),
 
   }
