@@ -62,6 +62,17 @@ export type ProjectLockOptions = {
    * recovery boundary. Only honored when provided; no effect on production.
    */
   waitForClassificationBarrier?: string
+  /**
+   * For tests: a barrier path. Immediately after a recovery claim has been
+   * acquired AND the owner revalidated as still-dead, but BEFORE the stale
+   * lock is quarantined, the caller writes `<path>.reached` and waits for
+   * `<path>` to exist. This lets a test deterministically pause a recoverer at
+   * the claim-revalidation → quarantine boundary to prove the canonical claim
+   * is exclusive across processes. Only honored when provided; no effect on
+   * production. These test-only hooks exist solely for adversarial tests and
+   * are never surfaced in production error paths.
+   */
+  waitForPostClaimBarrier?: string
 }
 
 export type LockClassification =
@@ -188,38 +199,80 @@ function isDestinationExists(error: unknown): boolean {
  * Identity-preserving recovery claim.
  *
  * Before quarantining a `dead-same-host` lock, a recoverer must atomically
- * create a claim file INSIDE the canonical lock directory and then re-read
- * `owner.json` to confirm the exact owner it classified is still present and
- * still dead. This closes the window between classification and quarantine
- * where another contender could replace the canonical lock with a live
- * replacement.
+ * create a CANONICAL claim directory INSIDE the canonical lock directory and
+ * then re-read `owner.json` to confirm the exact owner it classified is still
+ * present and still dead. This closes the window between classification and
+ * quarantine where another contender could replace the canonical lock with a
+ * live replacement.
  *
- * Returns the claim path on success, or `null` if the claim could not be
- * acquired or the owner identity changed (the current lock is NOT what we
- * classified — do not quarantine).
+ * CANONICAL IDENTITY: the claim path is derived ONLY from the stale owner's
+ * nonce (`.recovery-claim-<expected-owner-nonce>`), NOT from the recovering
+ * process's PID. Every compliant recoverer contending on the same stale owner
+ * attempts to create the SAME path with true create-if-absent semantics
+ * (`mkdir` with `recursive:false`). Only one process can hold the claim for a
+ * given stale lock at a time, so a second recoverer cannot replace the stale
+ * lock before the claimant quarantines it.
+ *
+ * Returns a claim handle on success, or `null` if the claim could not be
+ * acquired (another recoverer already holds it) or the owner identity changed
+ * (the current lock is NOT what we classified — do not quarantine).
  *
  * SOFT PROTOCOL: all compliant recoverers must honor the claim. A non-compliant
  * recoverer that ignores the claim can still race; the claim is a mutual
  * exclusion marker, not a hard filesystem primitive.
+ *
+ * AVAILABILITY TRADEOFF: a recoverer that crashes while holding the short
+ * claim leaves the claim directory behind, which blocks compliant recovery of
+ * that stale lock until manual cleanup. This is the documented tradeoff for
+ * safety against stealing a live lock.
  */
+type RecoveryClaim = {
+  /** Canonical claim directory path inside the stale lock. */
+  path: string
+  /** Bounded random token identifying this recoverer instance. */
+  nonce: string
+  /** The stale owner this claim is bound to. */
+  expectedOwner: ProjectLockOwner
+}
+
 async function acquireRecoveryClaim(
   project: string,
   expectedOwner: ProjectLockOwner,
-): Promise<string | null> {
+  postClaimBarrier?: string,
+): Promise<RecoveryClaim | null> {
   const lockDir = projectLockDir(project)
-  const claimPath = join(
-    lockDir,
-    `.recovery-claim-${process.pid}-${expectedOwner.nonce}`,
-  )
+  // Canonical claim identity: derived from the stale owner's nonce only, so
+  // every compliant recoverer of the same stale owner contends on one path.
+  const claimPath = join(lockDir, `.recovery-claim-${expectedOwner.nonce}`)
+  const recovererNonce = randomUUID()
   try {
-    // `wx` = create-if-absent. EEXIST means someone else is recovering.
+    // True cross-process create-if-absent: throws EEXIST if any file or
+    // directory already exists at the canonical claim path.
+    await mkdir(claimPath, { recursive: false })
+  } catch {
+    // EEXIST (another recoverer already holds the canonical claim) or ENOENT
+    // (canonical lock already gone). Do not recover.
+    return null
+  }
+
+  // Write bounded claimant metadata inside the claim directory.
+  try {
     await writeFile(
-      claimPath,
-      JSON.stringify({ pid: process.pid, nonce: expectedOwner.nonce }),
-      { flag: "wx" },
+      join(claimPath, "claim.json"),
+      JSON.stringify(
+        {
+          recoverer_pid: process.pid,
+          recoverer_nonce: recovererNonce,
+          claimed_at: new Date().toISOString(),
+          expected_owner_nonce: expectedOwner.nonce,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
     )
   } catch {
-    // EEXIST (another recoverer) or ENOENT (canonical lock already gone).
+    await rm(claimPath, { recursive: true, force: true }).catch(() => {})
     return null
   }
 
@@ -227,34 +280,43 @@ async function acquireRecoveryClaim(
   // classified, and still qualifies as dead (PID ESRCH).
   const current = await readOwner(lockDir)
   if (!current || current.nonce !== expectedOwner.nonce) {
-    await rm(claimPath, { force: true }).catch(() => {})
+    await rm(claimPath, { recursive: true, force: true }).catch(() => {})
     return null
   }
   try {
     process.kill(current.pid, 0)
     // Still alive: not dead anymore. Do not recover.
-    await rm(claimPath, { force: true }).catch(() => {})
+    await rm(claimPath, { recursive: true, force: true }).catch(() => {})
     return null
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
-    if (code === "ESRCH") {
-      return claimPath
+    if (code !== "ESRCH") {
+      // EPERM or unexpected: conservative, do not recover.
+      await rm(claimPath, { recursive: true, force: true }).catch(() => {})
+      return null
     }
-    // EPERM or unexpected: conservative, do not recover.
-    await rm(claimPath, { force: true }).catch(() => {})
-    return null
   }
+
+  // Test hook: pause AFTER claim acquisition AND revalidation, BEFORE
+  // quarantine. Writes `<path>.reached` and waits for `<path>` to exist. This
+  // lets a test deterministically prove the canonical claim is exclusive.
+  if (postClaimBarrier) {
+    await writeFile(`${postClaimBarrier}.reached`, "ready", "utf-8")
+    await waitFor(postClaimBarrier)
+  }
+
+  return { path: claimPath, nonce: recovererNonce, expectedOwner }
 }
 
 /**
- * Best-effort removal of a recovery claim. The claim is only a mutual-exclusion
- * marker during recovery; failure to remove it is non-fatal.
+ * Best-effort removal of a recovery claim directory. The claim is only a
+ * mutual-exclusion marker during recovery; failure to remove it is non-fatal.
  */
 async function retireRecoveryClaim(
   _project: string,
   claimPath: string,
 ): Promise<void> {
-  await rm(claimPath, { force: true }).catch(() => {})
+  await rm(claimPath, { recursive: true, force: true }).catch(() => {})
 }
 
 /**
@@ -262,6 +324,10 @@ async function retireRecoveryClaim(
  * a unique stale-recovery directory, then best-effort delete it. Only the
  * process that successfully renames owns the recovery. Returns true if we
  * quarantined the stale lock.
+ *
+ * The canonical recovery claim lives INSIDE `.state-lock`, so the rename moves
+ * the claim WITH the stale directory and the recursive delete removes it. We
+ * never try to remove a claim from a newly created canonical replacement.
  *
  * SOFT PROTOCOL ASSUMPTION: this function is only safe to call AFTER the
  * caller has acquired a recovery claim via `acquireRecoveryClaim` and verified
@@ -271,7 +337,10 @@ async function retireRecoveryClaim(
  * claim + revalidation is what closes that interval. Non-compliant callers that
  * call this without a claim can still race and must not be relied upon.
  */
-async function quarantineStaleLock(project: string): Promise<boolean> {
+async function quarantineStaleLock(
+  project: string,
+  claim: RecoveryClaim,
+): Promise<boolean> {
   const lockDir = projectLockDir(project)
   const parentDir = globalProjectStorageDir(project)
   const recoveryDir = join(
@@ -281,11 +350,40 @@ async function quarantineStaleLock(project: string): Promise<boolean> {
   try {
     await rename(lockDir, recoveryDir)
   } catch {
-    // Someone else renamed first or replaced `.state-lock`; re-classify.
+    // Someone else renamed first or replaced `.state-lock`. Clean up the claim
+    // ONLY if it is still demonstrably this recoverer's claim under the same
+    // expected owner. If the metadata file has been replaced by another
+    // recoverer, leave it alone and fail conservatively.
+    await cleanupClaimIfOwned(claim)
     return false
   }
   await rm(recoveryDir, { recursive: true, force: true }).catch(() => {})
   return true
+}
+
+/**
+ * Best-effort removal of a recovery claim directory, but ONLY if it is still
+ * demonstrably this recoverer's claim under the same expected owner. Re-checks
+ * the metadata file under the canonical claim path and confirms `recoverer_pid`
+ * matches this process AND `expected_owner_nonce` matches the expected stale
+ * nonce. If the metadata file has been replaced by another recoverer, leave it
+ * alone and fail conservatively.
+ */
+async function cleanupClaimIfOwned(claim: RecoveryClaim): Promise<void> {
+  try {
+    const raw = await readFile(join(claim.path, "claim.json"), "utf-8")
+    const meta = JSON.parse(raw)
+    if (
+      meta &&
+      meta.recoverer_pid === process.pid &&
+      meta.expected_owner_nonce === claim.expectedOwner.nonce
+    ) {
+      await rm(claim.path, { recursive: true, force: true }).catch(() => {})
+    }
+    // Otherwise the claim belongs to another recoverer; leave it alone.
+  } catch {
+    // Metadata unreadable or already gone; do nothing.
+  }
 }
 
 /** Build a release handle bound to the nonce we published. */
@@ -450,10 +548,14 @@ export async function tryAcquireProjectLock(
   })
 
   if (classification.kind === "dead-same-host") {
-    const claimPath = await acquireRecoveryClaim(project, classification.owner)
-    if (claimPath) {
-      const quarantined = await quarantineStaleLock(project)
-      await retireRecoveryClaim(project, claimPath)
+    const claim = await acquireRecoveryClaim(
+      project,
+      classification.owner,
+      options?.waitForPostClaimBarrier,
+    )
+    if (claim) {
+      const quarantined = await quarantineStaleLock(project, claim)
+      await retireRecoveryClaim(project, claim.path)
       if (quarantined) {
         const retry = await acquireOnce(project)
         if (retry.status === "acquired") return retry.handle
@@ -483,6 +585,7 @@ export async function withProjectLock<T>(
   const shouldAbort = options?.shouldAbort
   const onClassify = options?.onClassify
   const classificationBarrier = options?.waitForClassificationBarrier
+  const postClaimBarrier = options?.waitForPostClaimBarrier
 
   const lockDir = projectLockDir(project)
   const start = Date.now()
@@ -519,10 +622,14 @@ export async function withProjectLock<T>(
     }
 
     if (classification.kind === "dead-same-host") {
-      const claimPath = await acquireRecoveryClaim(project, classification.owner)
-      if (claimPath) {
-        const quarantined = await quarantineStaleLock(project)
-        await retireRecoveryClaim(project, claimPath)
+      const claim = await acquireRecoveryClaim(
+        project,
+        classification.owner,
+        postClaimBarrier,
+      )
+      if (claim) {
+        const quarantined = await quarantineStaleLock(project, claim)
+        await retireRecoveryClaim(project, claim.path)
         if (quarantined) {
           // Retry normal acquisition from the top.
           backoff = initialBackoffMs

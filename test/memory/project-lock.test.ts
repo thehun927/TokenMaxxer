@@ -547,3 +547,80 @@ describe("replacement between classification and quarantine (recovery claim)", (
     await expect(access(lockDir)).rejects.toThrow()
   })
 })
+
+describe("post-claim-revalidation barrier (canonical claim identity)", () => {
+  it("a second recoverer cannot replace the stale lock while C1 holds the canonical claim", async () => {
+    const project = "/p/postclaim"
+    const lockDir = projectLockDir(project)
+
+    // 1. Create a genuinely dead owner A via a SIGKILLed child.
+    const ready = join(homeDir, "postclaim-ready")
+    barrierFiles.push(ready)
+    const crash = spawnWorker([project, "crash-with-lock", ready])
+    await waitFor(ready)
+    process.kill(crash.pid, "SIGKILL")
+    await crash.exit
+
+    // Verify the stale owner.json exists and its PID is dead.
+    const rawA = await readFile(join(lockDir, "owner.json"), "utf-8")
+    const ownerA = JSON.parse(rawA)
+    expect(typeof ownerA.nonce).toBe("string")
+    expect(() => process.kill(ownerA.pid, 0)).toThrow()
+
+    // 2. C1 acquires, classifies dead A, acquires the canonical claim, and
+    //    pauses AFTER claim revalidation but BEFORE quarantine.
+    const postClaimBarrier = join(homeDir, "postclaim-c1")
+    barrierFiles.push(postClaimBarrier, `${postClaimBarrier}.reached`)
+    let c1Acquired = false
+    const c1Promise = withProjectLock(
+      project,
+      async () => {
+        c1Acquired = true
+      },
+      {
+        acquireTimeoutMs: 5000,
+        initialBackoffMs: 5,
+        maxBackoffMs: 20,
+        waitForPostClaimBarrier: postClaimBarrier,
+      },
+    )
+
+    // Wait for C1 to reach the post-claim barrier (claim acquired + revalidated).
+    await waitFor(`${postClaimBarrier}.reached`)
+
+    // 3. While C1 is paused, a second caller attempts to acquire. It classifies
+    //    dead A, tries to create the SAME canonical claim, hits EEXIST, and
+    //    backs off until its bounded timeout.
+    await expect(
+      withProjectLock(project, async () => {}, {
+        acquireTimeoutMs: 200,
+        initialBackoffMs: 5,
+        maxBackoffMs: 20,
+      }),
+    ).rejects.toBeInstanceOf(ProjectLockTimeoutError)
+
+    // The stale lock is still intact and untouched by the second caller.
+    await access(lockDir)
+    const rawA2 = await readFile(join(lockDir, "owner.json"), "utf-8")
+    expect(JSON.parse(rawA2).nonce).toBe(ownerA.nonce)
+
+    // 4. Resume C1. It quarantines the stale lock, acquires a fresh lock, runs
+    //    the op, and releases.
+    await writeFile(postClaimBarrier, "go", "utf-8")
+    await c1Promise
+    expect(c1Acquired).toBe(true)
+
+    // 5. Now the second caller may proceed. It acquires cleanly and the new
+    //    owner is NOT the stale A.
+    await withProjectLock(project, async () => {
+      const raw = await readFile(join(lockDir, "owner.json"), "utf-8")
+      const owner = JSON.parse(raw)
+      expect(owner.nonce).not.toBe(ownerA.nonce)
+      // Exactly one owner whose PID is alive.
+      expect(() => process.kill(owner.pid, 0)).not.toThrow()
+    })
+
+    // 6. After release the canonical lock is gone.
+    await expect(access(lockDir)).rejects.toThrow()
+  })
+})
