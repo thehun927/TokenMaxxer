@@ -17,11 +17,11 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
 
-import { runCli, type CliIO, type CliOptions } from "../../src/cli"
-import { emptyMemory } from "../../src/memory/schema"
-import type { MemoryFile, Decision } from "../../src/memory/schema"
-import { projectMemoryPath } from "../../src/memory/paths"
-import { writeMemory, readMemory, mutateMemory } from "../../src/memory/store"
+import { runCli, type CliIO, type CliOptions } from "../src/cli"
+import { emptyMemory } from "../src/memory/schema"
+import type { MemoryFile, Decision } from "../src/memory/schema"
+import { projectMemoryPath } from "../src/memory/paths"
+import { writeMemory, readMemory, mutateMemory } from "../src/memory/store"
 
 const WORKER = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -149,8 +149,8 @@ describe("PR 3 §11 human CLI", () => {
     await seedState({
       ...emptyMemory(project),
       decisions: [
-        mkDecision({ id: "auth-1", topic: "auth", decision: "Use JWT", provenance: llmProv }),
-        mkDecision({ id: "auth-2", topic: "auth", decision: "Use OAuth2", timestamp: "2026-08-02T00:00:00Z", provenance: llmProv, foundational_requested: true }),
+        mkDecision({ id: "auth-1", topic: "auth", decision: "Use JWT", provenance: llmProv, foundational_requested: true }),
+        mkDecision({ id: "auth-2", topic: "db", decision: "Use PostgreSQL", timestamp: "2026-08-02T00:00:00Z", provenance: llmProv }),
       ],
     })
     const io = makeIo()
@@ -277,7 +277,7 @@ describe("PR 3 §11 human CLI", () => {
     })
     // Test-only seam: the transaction revalidation detects the decision changed
     // during the confirmation window and fails closed.
-    vi.spyOn(await import("../../src/memory/store"), "mutateMemory").mockResolvedValue({
+    vi.spyOn(await import("../src/memory/store"), "mutateMemory").mockResolvedValue({
       status: "noop",
       value: { outcome: "decision-changed-during-review" },
       revision: 5,

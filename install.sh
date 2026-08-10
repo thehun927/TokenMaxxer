@@ -12,6 +12,8 @@ PLUGIN_URL="https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/dist/in
 PLUGIN_FILE="${PLUGINS_DIR}/tokenmaxxer.js"
 TUI_PLUGIN_URL="https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/dist/tui.js"
 TUI_PLUGIN_FILE="${PLUGINS_DIR}/tokenmaxxer-tui.js"
+CLI_PLUGIN_URL="https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/dist/cli.js"
+CLI_PLUGIN_FILE="${PLUGINS_DIR}/tokenmaxxer-cli.js"
 LAUNCHER_URL="https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/bin/tokenmaxxer"
 LAUNCHER_FILE="${BIN_DIR}/tokenmaxxer"
 
@@ -78,6 +80,11 @@ echo "  ✓ Plugin installed: $PLUGIN_FILE"
 echo "  ↓ Downloading TUI plugin..."
 download "$TUI_PLUGIN_URL" "$TUI_PLUGIN_FILE"
 echo "  ✓ TUI plugin installed: $TUI_PLUGIN_FILE"
+
+# 4b. Download the separate CLI bundle (human review boundary)
+echo "  ↓ Downloading CLI bundle..."
+download "$CLI_PLUGIN_URL" "$CLI_PLUGIN_FILE"
+echo "  ✓ CLI bundle installed: $CLI_PLUGIN_FILE"
 
 # 5. Ensure the server and TUI dependencies are in the global package.json
 if [ -f "$PACKAGE_JSON" ]; then
@@ -165,6 +172,7 @@ echo "║  • Layer 1: compaction hook fires on /compact               ║"
 echo "║  • Layer 2: memory + tools work on session idle              ║"
 echo "║  • 7 custom tools registered (get_project_state, etc.)      ║"
 echo "║  • TUI: right-side memory indicator only                     ║"
+echo "║  • Human CLI: tokenmaxxer decisions/promote/supersede        ║"
 echo "║                                                              ║"
 echo "║  No per-project config required. Just restart opencode.      ║"
 echo "║                                                              ║"

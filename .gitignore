@@ -8,3 +8,4 @@ node_modules/
 *.tsbuildinfo
 .slim/deepwork/
 docs/journal.md
+dist/

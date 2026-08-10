@@ -2,14 +2,47 @@
 set -euo pipefail
 
 usage() {
-  printf 'Usage: tokenmaxxer opencode [args...]\n' >&2
+  printf 'Usage: tokenmaxxer {opencode|decisions|promote|supersede} [args...]\n' >&2
 }
 
-if [ "${1-}" != "opencode" ]; then
-  usage
-  exit 2
-fi
+# Resolve the CLI bundle.
+#  - npm/package layout prefers the bundle relative to this launcher
+#    (<pkg>/dist/cli.js);
+#  - the raw installer layout falls back to the installed OpenCode plugin
+#    directory copy (~/.config/opencode/plugins/tokenmaxxer-cli.js).
+# Fails (exit 1) when no non-empty CLI bundle is present so we never silently
+# fall back to mutating STATE from shell.
+find_cli() {
+  local script_dir npm_bundle plugin_bundle
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  npm_bundle="${script_dir}/../dist/cli.js"
+  plugin_bundle="${HOME}/.config/opencode/plugins/tokenmaxxer-cli.js"
+  if [ -s "$npm_bundle" ]; then
+    printf '%s\n' "$npm_bundle"
+    return 0
+  fi
+  if [ -s "$plugin_bundle" ]; then
+    printf '%s\n' "$plugin_bundle"
+    return 0
+  fi
+  return 1
+}
 
-shift
-export TOKENMAXXER_LLM_EXTRACT=1
-exec opencode "$@"
+case "${1-}" in
+  opencode)
+    shift
+    export TOKENMAXXER_LLM_EXTRACT=1
+    exec opencode "$@"
+    ;;
+  decisions|promote|supersede)
+    if ! CLI_BUNDLE="$(find_cli)"; then
+      printf 'tokenmaxxer: CLI bundle not found. Reinstall or update tokenmaxxer (npm install -g tokenmaxxer@latest, or re-run the installer).\n' >&2
+      exit 3
+    fi
+    exec node "$CLI_BUNDLE" "$@"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

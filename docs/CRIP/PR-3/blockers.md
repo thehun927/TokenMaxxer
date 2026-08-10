@@ -72,3 +72,22 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] Topic compatibility additionally requires exactly ONE raw still_valid row for the normalized topic (test 27 refuses two conflicting raw-valid rows even though resolution picks one authority); unresolved duplicate-valid raw state is refused rather than resolved silently.
 - [design-decision] Typed outcomes: requested / already-reviewed / not-found / not-authoritative / conflict / ambiguous; unavailable STATE maps to 'No project memory.', lock-timeout/commit-failed map to bounded 'promotion-write-failed'.
 - [test-gap] test/memory/recall.test.ts PR 2 §11.G/§15.14 cross-process test asserts pre-PR3 promotion semantics ("Promoted:", "confidence=human-reviewed", foundational=true on disk). It already failed at baseline (Wave 2 schema validation rejected the old human-minting mutation), and cannot pass under PR 3 §9 without updating the test. Out of Wave 5 scope (only test/tools/recall.test.ts is touchable); the PR 2 cross-process promotion test needs a Wave 8 test update to assert review-request semantics. Full-suite failures reduced from 14 to 5 (2 Wave 6 module-load + 4 Wave 7 prune + this one pre-existing).
+
+## 2026-08-10 — wave-6 decision-review + CLI + launcher
+- [design-decision] decision-review.ts pure helpers; no I/O; callers wrap in mutateMemory.
+- [design-decision] supersedeHumanAuthority always creates a new decision (UUID v4) rather than reactivating the candidate, preserving lineage.
+- [design-decision] CLI commands require interactive TTY for promote and supersede; no --yes, no env bypass, no piped confirmation.
+- [design-decision] CLI's promote / supersede revalidates the exact ID inside the mutateMemory transaction after the human has already typed confirmation; if the state changed, the transaction aborts.
+- [design-decision] Human confirmation happens BEFORE mutateMemory acquires the lock (no lock held while waiting on stdin).
+- [design-decision] Launcher dispatch: opencode | decisions | promote | supersede; falls back to installed plugin dir for raw installer.
+- [design-decision] Tsup CLI entry produces dist/cli.js + dist/cli.d.ts; listed in package.json files.
+- [test-gap] 22 tests (10 decision-review + 12 cli) now green.
+- [design-decision] DecisionReviewMutation kind names follow the Wave 1A test spec (requested/already-reviewed/not-found/not-authoritative/conflict/ambiguous PLUS confirmed/not-requested/superseded+newAuthorityId/not-authority/not-linked). The plan §10 draft "reuse requested as success kind" is not what test/memory/decision-review.test.ts asserts; tests are the spec.
+- [design-decision] requestFoundationalReview topic path counts RAW still_valid rows (not the resolved authority count) so two conflicting raw-valid rows are refused as ambiguous — matching Wave 5 recall.ts and test C; substring matching is never used ("auth" != "authentication").
+- [design-decision] supersedeHumanAuthority downgrades the old authority's provenance to extractor=legacy/confidence=legacy and clears human_review when clearing foundational; schema §4.1 rejects a human trust claim without foundational=true, so the superseded row cannot keep human provenance.
+- [design-decision] confirmFoundationalReview preserves source_session_id / source_audit_session_id / evidence while changing only extractor/confidence to human-reviewed (PR 3 §11.2).
+- [design-decision] `tokenmaxxer decisions` default lists the authority-aware view (queryDecisions); `--all` lists every row plus lineage and unresolved human conflicts.
+- [bug-fix] test/cli.test.ts Wave 1A fixture used ../../src/... imports from test/ (one level deep), resolving outside the repo; corrected to ../src/... — the fixture could never load otherwise.
+- [bug-fix] test/cli.test.ts item 29 seeded auth-1 as both non-authoritative (older duplicate of auth-2's topic) and not review-requested, while its own assertion requires auth-1 listed with requested=true; fixture fixed so auth-1 is the review-requested authority and auth-2 moves to a distinct topic (db).
+- [design-decision] The supersede CLI confirmation token is the candidate ID (matches test 40's injected read value "candidate-1"); the promote confirmation token is the decision ID.
+- [test-gap] Full-suite failures remain exactly the intended 5: 4 Wave 7 prune tests (§13) + 1 Wave 8 cross-process recall update (PR 2 §11.G/§15.14). No new regressions.
