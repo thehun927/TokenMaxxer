@@ -13,7 +13,7 @@ This directory is the canonical home for TokenMaxxer's **Concrete Reliability Im
 |---|---|---|---|
 | PR 1 | Storage authority and read semantics | **Complete** | [`PR-1/`](./PR-1/) |
 | PR 2 | Cross-process transactions | **Complete — Ship** | [`PR-2/`](./PR-2/) |
-| PR 3 | Decision authority and promotion trust | **Next** | `PR-3/` |
+| PR 3 | Decision authority and promotion trust | **Implementation plan ready** | [`PR-3/`](./PR-3/) |
 | PR 4 | OpenCode host contract | Planned | `PR-4/` |
 | PR 5 | Source idempotency and truthful outcomes | Planned | `PR-5/` |
 | PR 6 | Complete LLM trust boundary | Planned | `PR-6/` |
