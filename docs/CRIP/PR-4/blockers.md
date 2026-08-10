@@ -77,3 +77,9 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] src/index.ts plugin init no longer uses any/never casts at the host boundary; the legitimate PluginInput["client"] is the only accepted source.
 - [design-decision] test/index.test.ts uses a real PluginInput-shape via satisfies PluginInput; no invented ToolContext.client fields.
 - [test-gap] §12 F item 45 (test/index.test.ts) now green.
+
+## 2026-08-10 — wave-7 peer range + CI integration
+- [design-decision] peerDependencies[@opencode-ai/plugin] tightened to exactly ">=1.18.15 <2.0.0"; devDependencies[@opencode-ai/plugin] kept exactly "1.18.15" with no ^ or ~ prefix.
+- [design-decision] scripts/verify-host-contract.mjs asserts the peer range, dev dep, and installed version match the approved minimum contract.
+- [design-decision] .github/workflows/ci.yml runs verify-host-contract after tsc --noEmit and before build so host drift fails early.
+- [test-gap] §12 F package-meta fixtures (items 40-42) all green.

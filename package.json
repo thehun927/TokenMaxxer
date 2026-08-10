@@ -39,10 +39,12 @@
     "verify-cli-bundle": "bash -n install.sh && bash -n bin/tokenmaxxer && npm run check-cli-bundle && grep -q 'CLI_PLUGIN_URL=.*dist/cli.js' install.sh && echo 'verify-cli-bundle: OK'",
     "smoke:cli": "bash test/cli-smoke/smoke.sh",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck:host-contract": "tsc -p tsconfig.host-contract.json --noEmit",
+    "verify:host-contract": "node scripts/verify-host-contract.mjs && npm run typecheck:host-contract"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.0.0 <2.0.0",
+    "@opencode-ai/plugin": ">=1.18.15 <2.0.0",
     "@opentui/core": ">=0.4.5",
     "@opentui/keymap": ">=0.4.5",
     "@opentui/solid": ">=0.4.5",
