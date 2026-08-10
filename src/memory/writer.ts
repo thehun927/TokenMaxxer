@@ -11,7 +11,8 @@ import type {
   Provenance,
 } from "./schema"
 import type { ExtractedFacts, TranscriptMessage } from "../types"
-import { readMemoryState, writeMemory, emptyMemory, resolveProjectPath, mutateMemory } from "./store"
+import { readMemoryState, emptyMemory, resolveProjectPath, mutateMemory } from "./store"
+import type { MemoryMutationResult } from "./store"
 import { enqueueProjectJob, setProjectQueueOutcome } from "./lock"
 import type { ProjectLockOptions } from "./project-lock"
 import { getCurrentGitSha } from "../util/git"
@@ -39,7 +40,10 @@ import {
   type EvidenceCandidateMap,
   type LLMExtractionDiagnostic,
   type AuditCreatedCallback,
+  type LLMHealthOutcomeReport,
+  type SmallModel,
 } from "./extract-llm"
+import type { CanonicalExtractionInput } from "./extract-prompt"
 import { log } from "../util/log"
 import { beginMemoryActivity } from "./activity-state"
 import { MEMORY_MAX_BYTES, memorySizeBytes } from "./memory-size"
@@ -412,26 +416,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
       // Audit guard creation is one short transaction (PR 2 §11.B). On any
       // lock/read/commit failure we return false so prompting does not continue
       // without a durable guard (PR 2 §13).
-      const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
-        { worktree, directory, client },
-        (base) => {
-          const guarded = upsertAuditMetadata(base, audit)
-          return { kind: "commit", memory: pruneOld(guarded, client), value: { outcome: "committed" } }
-        },
-      )
-      if (result.status === "lock-timeout") {
-        void log(client, "warn", "audit guard transaction lock-timeout", { project })
-        return false
-      }
-      if (result.status === "unavailable") {
-        void log(client, "warn", "audit guard transaction unavailable", { project })
-        return false
-      }
-      if (result.status === "commit-failed") {
-        void log(client, "warn", "audit guard transaction commit-failed", { project })
-        return false
-      }
-      return true
+      return persistAuditGuard({ client, worktree, directory }, audit)
     }
     const persistTerminal = async (
       auditSessionID: string,
@@ -439,31 +424,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     ): Promise<void> => {
       // Terminal outcomes are best-effort (PR 2 §11.C, §13): on failure log a
       // bounded warning and continue; never fall back to a stale full-state write.
-      const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
-        { worktree, directory, client },
-        (base) => {
-          const audits = base.llm_extraction_audits ?? []
-          if (!audits.some((a) => a.audit_session_id === auditSessionID)) {
-            // Audit row no longer exists; return noop rather than bumping revision.
-            return { kind: "noop", value: { outcome: "noop" } }
-          }
-          const updated = setAuditTerminalOutcome(base, auditSessionID, outcome)
-          return { kind: "commit", memory: pruneOld(updated, client), value: { outcome: "committed" } }
-        },
-      )
-      if (result.status === "noop") return
-      if (result.status === "lock-timeout") {
-        void log(client, "warn", "audit terminal transaction lock-timeout", { project })
-        return
-      }
-      if (result.status === "unavailable") {
-        void log(client, "warn", "audit terminal transaction unavailable", { project })
-        return
-      }
-      if (result.status === "commit-failed") {
-        void log(client, "warn", "audit terminal transaction commit-failed", { project })
-        return
-      }
+      await persistTerminalTransaction({ client, worktree, directory }, auditSessionID, outcome)
     }
 
     void log(client, "debug", "llm extraction audit session requested")
@@ -485,25 +446,7 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
           // Model health is best-effort (PR 2 §11.D, §13): on transaction
           // failure log a bounded warning and return without retry; never fall
           // back to a stale full-state write.
-          const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
-            { worktree, directory, client },
-            (base) => {
-              const updated = upsertModelHealth(base, report)
-              return { kind: "commit", memory: pruneOld(updated, client), value: { outcome: "committed" } }
-            },
-          )
-          if (result.status === "lock-timeout") {
-            void log(client, "warn", "model health transaction lock-timeout", { project })
-            return
-          }
-          if (result.status === "unavailable") {
-            void log(client, "warn", "model health transaction unavailable", { project })
-            return
-          }
-          if (result.status === "commit-failed") {
-            void log(client, "warn", "model health transaction commit-failed", { project })
-            return
-          }
+          await persistModelHealth({ client, worktree, directory }, report)
         },
       },
     )
@@ -516,63 +459,18 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
     // identity check runs INSIDE the transaction against the authoritative
     // lock-read base, so a concurrent commit of the same cache identity is
     // observed rather than a pre-lock snapshot.
-    const finalResult = await mutateMemory<{ outcome: "committed" | "noop"; memory: MemoryFile }>(
-      { worktree, directory, client },
-      (base) => {
-        const cacheAlreadyCommitted = readExtractionCacheEntry(base, selectedCacheKey, {
-          evidenceCandidateMap: candidates,
-          evidenceDigestMap: digests,
-        })
-        if (cacheAlreadyCommitted) {
-          const merged = mergeMemory(base, cacheAlreadyCommitted.facts, {
-            sessionId,
-            gitSha,
-            timestamp: new Date().toISOString(),
-            origin: "llm",
-            auditSessionID: cacheAlreadyCommitted.provenance?.source_audit_session_id,
-            evidenceCandidates: candidates,
-            provenanceEvidence: cacheAlreadyCommitted.provenance?.evidence,
-          })
-          const finalMemory = pruneOld(recordRecentSession(merged, sessionId), client)
-          return { kind: "commit", memory: finalMemory, value: { outcome: "committed", memory: finalMemory } }
-        }
-        const timestamp = new Date().toISOString()
-        const mergedLLM = mergeMemory(base, llmFacts, {
-          sessionId,
-          gitSha,
-          timestamp,
-          origin: "llm",
-          auditSessionID: extractionAuditSessionID,
-          evidenceCandidates: candidates,
-        })
-        const decisionEvidence = [
-          ...llmFacts.decisions.flatMap((decision) => candidateEvidence(
-            (decision as { evidence_refs?: unknown }).evidence_refs,
-            candidates,
-          )),
-        ].filter((evidence, index, all) => (
-          all.findIndex((candidate) => candidate.ref === evidence.ref) === index
-        ))
-        const cacheEvidence = decisionEvidence.length > 0
-          ? decisionEvidence
-          : firstCandidateEvidence(candidates)
-        const cacheCanRepresentAllEvidence = decisionEvidence.length <= 3
-        const withCache = cacheCanRepresentAllEvidence && cacheEvidence.length > 0 && extractionAuditSessionID
-          ? upsertExtractionCache(
-              recordRecentSession(mergedLLM, sessionId),
-              makeExtractionCacheEntry({
-                sourceSessionID: sessionId,
-                canonicalInput,
-                model: selectedModel,
-                facts: llmFacts,
-                auditSessionID: extractionAuditSessionID,
-                evidence: cacheEvidence,
-                completedAt: timestamp,
-              }),
-            )
-          : recordRecentSession(mergedLLM, sessionId)
-        const finalMemory = pruneOld(withCache, client)
-        return { kind: "commit", memory: finalMemory, value: { outcome: "committed", memory: finalMemory } }
+    const finalResult = await finalLLMMerge(
+      { client, worktree, directory },
+      {
+        sessionId,
+        gitSha,
+        canonicalInput,
+        selectedModel,
+        selectedCacheKey,
+        llmFacts,
+        extractionAuditSessionID,
+        candidates,
+        digests,
       },
     )
     if (finalResult.status === "lock-timeout") {
@@ -597,12 +495,198 @@ async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<Idle
   }
 }
 
+/**
+ * Final LLM merge in one short transaction (PR 2 §11.E). The cache identity
+ * check runs INSIDE the transaction against the authoritative lock-read base,
+ * so a concurrent commit of the same cache identity is observed rather than a
+ * pre-lock snapshot. Exported as a test seam for the Wave-4/6 cross-process
+ * and no-lock-prompt-zone tests.
+ */
+export async function finalLLMMerge(
+  opts: { client: unknown; worktree: string; directory: string },
+  args: {
+    sessionId: string
+    gitSha: string | null
+    canonicalInput: CanonicalExtractionInput
+    selectedModel: SmallModel
+    selectedCacheKey: string
+    llmFacts: ExtractedFacts
+    extractionAuditSessionID?: string
+    candidates: EvidenceCandidateMap
+    digests: Readonly<Record<string, string>>
+  },
+): Promise<MemoryMutationResult<{ outcome: "committed" | "noop"; memory: MemoryFile }>> {
+  const { client, worktree, directory } = opts
+  return mutateMemory<{ outcome: "committed" | "noop"; memory: MemoryFile }>(
+    { worktree, directory, client },
+    (base) => {
+      const cacheAlreadyCommitted = readExtractionCacheEntry(base, args.selectedCacheKey, {
+        evidenceCandidateMap: args.candidates,
+        evidenceDigestMap: args.digests,
+      })
+      if (cacheAlreadyCommitted) {
+        const merged = mergeMemory(base, cacheAlreadyCommitted.facts, {
+          sessionId: args.sessionId,
+          gitSha: args.gitSha,
+          timestamp: new Date().toISOString(),
+          origin: "llm",
+          auditSessionID: cacheAlreadyCommitted.provenance?.source_audit_session_id,
+          evidenceCandidates: args.candidates,
+          provenanceEvidence: cacheAlreadyCommitted.provenance?.evidence,
+        })
+        const finalMemory = pruneOld(recordRecentSession(merged, args.sessionId), client)
+        return { kind: "commit", memory: finalMemory, value: { outcome: "committed", memory: finalMemory } }
+      }
+      const timestamp = new Date().toISOString()
+      const mergedLLM = mergeMemory(base, args.llmFacts, {
+        sessionId: args.sessionId,
+        gitSha: args.gitSha,
+        timestamp,
+        origin: "llm",
+        auditSessionID: args.extractionAuditSessionID,
+        evidenceCandidates: args.candidates,
+      })
+      const decisionEvidence = [
+        ...args.llmFacts.decisions.flatMap((decision) => candidateEvidence(
+          (decision as { evidence_refs?: unknown }).evidence_refs,
+          args.candidates,
+        )),
+      ].filter((evidence, index, all) => (
+        all.findIndex((candidate) => candidate.ref === evidence.ref) === index
+      ))
+      const cacheEvidence = decisionEvidence.length > 0
+        ? decisionEvidence
+        : firstCandidateEvidence(args.candidates)
+      const cacheCanRepresentAllEvidence = decisionEvidence.length <= 3
+      const withCache = cacheCanRepresentAllEvidence && cacheEvidence.length > 0 && args.extractionAuditSessionID
+        ? upsertExtractionCache(
+            recordRecentSession(mergedLLM, args.sessionId),
+            makeExtractionCacheEntry({
+              sourceSessionID: args.sessionId,
+              canonicalInput: args.canonicalInput,
+              model: args.selectedModel,
+              facts: args.llmFacts,
+              auditSessionID: args.extractionAuditSessionID,
+              evidence: cacheEvidence,
+              completedAt: timestamp,
+            }),
+          )
+        : recordRecentSession(mergedLLM, args.sessionId)
+      const finalMemory = pruneOld(withCache, client)
+      return { kind: "commit", memory: finalMemory, value: { outcome: "committed", memory: finalMemory } }
+    },
+  )
+}
+
 function upsertAuditMetadata(mem: MemoryFile, audit: LLMAuditMetadata): MemoryFile {
   const audits = (mem.llm_extraction_audits ?? [])
     .filter((candidate) => candidate.audit_session_id !== audit.audit_session_id)
   return {
     ...mem,
     llm_extraction_audits: boundedAuditMetadata([...audits, audit]),
+  }
+}
+
+/**
+ * Persist the audit guard in one short transaction (PR 2 §11.B). Returns
+ * `false` on any lock/read/commit failure so prompting does not continue
+ * without a durable guard (PR 2 §13). Exported as a test seam so the
+ * Wave-4/6 cross-process and failure-injection tests can drive it directly.
+ */
+export async function persistAuditGuard(
+  opts: { client: unknown; worktree: string; directory: string },
+  audit: LLMAuditMetadata,
+): Promise<boolean> {
+  const project = resolveProjectPath(opts.worktree, opts.directory)
+  const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
+    { worktree: opts.worktree, directory: opts.directory, client: opts.client },
+    (base) => {
+      const guarded = upsertAuditMetadata(base, audit)
+      return { kind: "commit", memory: pruneOld(guarded, opts.client), value: { outcome: "committed" } }
+    },
+  )
+  if (result.status === "lock-timeout") {
+    void log(opts.client, "warn", "audit guard transaction lock-timeout", { project })
+    return false
+  }
+  if (result.status === "unavailable") {
+    void log(opts.client, "warn", "audit guard transaction unavailable", { project })
+    return false
+  }
+  if (result.status === "commit-failed") {
+    void log(opts.client, "warn", "audit guard transaction commit-failed", { project })
+    return false
+  }
+  return true
+}
+
+/**
+ * Persist the terminal audit outcome in one short transaction (PR 2 §11.C).
+ * Returns `noop` (no revision bump) when the audit row no longer exists in the
+ * locked read base. Best-effort: failures log a bounded warning and continue
+ * without a stale fallback write. Exported as a test seam.
+ */
+export async function persistTerminalTransaction(
+  opts: { client: unknown; worktree: string; directory: string },
+  auditSessionID: string,
+  outcome: Exclude<AuditTerminalOutcome, "pending">,
+): Promise<void> {
+  const project = resolveProjectPath(opts.worktree, opts.directory)
+  const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
+    { worktree: opts.worktree, directory: opts.directory, client: opts.client },
+    (base) => {
+      const audits = base.llm_extraction_audits ?? []
+      if (!audits.some((a) => a.audit_session_id === auditSessionID)) {
+        // Audit row no longer exists; return noop rather than bumping revision.
+        return { kind: "noop", value: { outcome: "noop" } }
+      }
+      const updated = setAuditTerminalOutcome(base, auditSessionID, outcome)
+      return { kind: "commit", memory: pruneOld(updated, opts.client), value: { outcome: "committed" } }
+    },
+  )
+  if (result.status === "noop") return
+  if (result.status === "lock-timeout") {
+    void log(opts.client, "warn", "audit terminal transaction lock-timeout", { project })
+    return
+  }
+  if (result.status === "unavailable") {
+    void log(opts.client, "warn", "audit terminal transaction unavailable", { project })
+    return
+  }
+  if (result.status === "commit-failed") {
+    void log(opts.client, "warn", "audit terminal transaction commit-failed", { project })
+    return
+  }
+}
+
+/**
+ * Persist one model-health outcome in a short transaction (PR 2 §11.D).
+ * Best-effort: on transaction failure log a bounded warning and return without
+ * retry; never fall back to a stale full-state write. Exported as a test seam.
+ */
+export async function persistModelHealth(
+  opts: { client: unknown; worktree: string; directory: string },
+  report: LLMHealthOutcomeReport,
+): Promise<void> {
+  const project = resolveProjectPath(opts.worktree, opts.directory)
+  const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
+    { worktree: opts.worktree, directory: opts.directory, client: opts.client },
+    (base) => {
+      const updated = upsertModelHealth(base, report)
+      return { kind: "commit", memory: pruneOld(updated, opts.client), value: { outcome: "committed" } }
+    },
+  )
+  if (result.status === "lock-timeout") {
+    void log(opts.client, "warn", "model health transaction lock-timeout", { project })
+    return
+  }
+  if (result.status === "unavailable") {
+    void log(opts.client, "warn", "model health transaction unavailable", { project })
+    return
+  }
+  if (result.status === "commit-failed") {
+    void log(opts.client, "warn", "model health transaction commit-failed", { project })
+    return
   }
 }
 
@@ -650,7 +734,7 @@ function setAuditTerminalOutcome(
 }
 
 /** Merge cache/LLM facts against the state that exists at merge time. */
-async function mergeAsyncFacts(
+export async function mergeAsyncFacts(
   opts: { client: unknown; worktree: string; directory: string; sessionId: string },
   facts: ExtractedFacts,
   gitSha: string | null,

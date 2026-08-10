@@ -22,9 +22,11 @@
  * This fixture exercises the real `mutateMemory` / `withProjectLock`
  * implementations, proving cross-process correctness through the actual code.
  */
-import { writeFile, access } from "node:fs/promises"
+import { writeFile, access, readFile } from "node:fs/promises"
 import { mutateMemory } from "../../src/memory/store"
 import { withProjectLock } from "../../src/memory/project-lock"
+import { atomicWrite } from "../../src/util/fs"
+import { projectMemoryPath } from "../../src/memory/paths"
 
 const [, , project, command, ...args] = process.argv
 
@@ -104,6 +106,25 @@ async function main(): Promise<void> {
     process.exit(0)
   }
 
+  if (command === "hold-lock-after") {
+    // Wait for <signal-path> to exist, then acquire the lock, write
+    // <barrier-path>, and hold until <barrier-path>.release. This lets a test
+    // coordinate so the lock is acquired only AFTER a prior in-process
+    // transaction has released it.
+    const signalPath = args[0]
+    const barrierPath = args[1]
+    if (!signalPath || !barrierPath) {
+      console.error("hold-lock-after requires <signal-path> <barrier-path>")
+      process.exit(2)
+    }
+    await waitFor(signalPath)
+    await withProjectLock(project, async () => {
+      await writeFile(barrierPath, "ready", "utf-8")
+      await waitFor(`${barrierPath}.release`)
+    })
+    process.exit(0)
+  }
+
   if (command === "noop-write") {
     const result = await mutateMemory(
       { worktree: project, directory: project },
@@ -115,6 +136,50 @@ async function main(): Promise<void> {
     }
     printResult({ status: result.status })
     process.exit(1)
+  }
+
+  if (command === "replace-state") {
+    // Replace the durable STATE at a higher revision with a cache entry whose
+    // facts carry a distinct identity. Used to prove the final-LLM transaction
+    // observes the cache identity under the lock, not a pre-lock snapshot.
+    const revision = Number(args[0])
+    const cacheKey = args[1]
+    const factId = args[2]
+    const evidenceRef = args[3] ?? "tr-1"
+    const evidenceDigest = args[4] ?? "a".repeat(64)
+    if (!Number.isFinite(revision) || !cacheKey || !factId) {
+      console.error("replace-state requires <revision> <cache-key> <fact-id>")
+      process.exit(2)
+    }
+    const statePath = projectMemoryPath(project)
+    const raw = await readFile(statePath, "utf-8")
+    const mem = JSON.parse(raw)
+    mem.revision = revision
+    mem.llm_extraction_cache = [{
+      cache_key: cacheKey,
+      source_session_id: `worker-${factId}`,
+      canonical_input_sha256: "a".repeat(64),
+      provider_id: "provider",
+      model_id: "model",
+      completed_at: new Date().toISOString(),
+      provenance: {
+        extractor: "llm",
+        source_session_id: `worker-${factId}`,
+        source_audit_session_id: `audit-${factId}`,
+        confidence: "llm-corroborated",
+        evidence: [{ kind: "transcript", ref: evidenceRef, digest: evidenceDigest }],
+      },
+      facts: {
+        current_task: `task-${factId}`,
+        active_files: [],
+        decisions: [],
+        blockers: [],
+        next_steps: [],
+      },
+    }]
+    await atomicWrite(statePath, JSON.stringify(mem, null, 2))
+    printResult({ status: "ok", revision })
+    process.exit(0)
   }
 
   console.error(`unknown command: ${command}`)

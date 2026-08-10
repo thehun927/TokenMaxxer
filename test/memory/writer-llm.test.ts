@@ -1,9 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { mkdtemp, rm } from "node:fs/promises"
-import { join } from "node:path"
+import { spawn } from "node:child_process"
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
 
-import { writeMemoryOnIdle } from "../../src/memory/writer"
+import {
+  writeMemoryOnIdle,
+  persistAuditGuard,
+  persistTerminalTransaction,
+  persistModelHealth,
+  mergeAsyncFacts,
+  finalLLMMerge,
+} from "../../src/memory/writer"
+import * as storeModule from "../../src/memory/store"
 import { readMemory, writeMemory } from "../../src/memory/store"
 import { emptyMemory } from "../../src/memory/schema"
 import {
@@ -14,7 +24,57 @@ import {
 import { makeExtractionCacheEntry } from "../../src/memory/extract-llm"
 import type { TranscriptMessage } from "../../src/types"
 
+const WORKER = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "fixtures",
+  "transaction-worker.ts",
+)
+
 const directories: string[] = []
+let homeDir: string
+const barrierFiles: string[] = []
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitFor(path: string, timeoutMs = 5000): Promise<void> {
+  const start = Date.now()
+  for (;;) {
+    try {
+      await access(path)
+      return
+    } catch {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`timed out waiting for ${path}`)
+      }
+      await sleep(10)
+    }
+  }
+}
+
+/** Spawn the transaction-worker fixture and resolve with its stdout + exit code. */
+function runWorker(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--import", "tsx", WORKER, ...args], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    })
+    let stdout = ""
+    let stderr = ""
+    child.stdout.on("data", (d) => {
+      stdout += String(d)
+    })
+    child.stderr.on("data", (d) => {
+      stderr += String(d)
+    })
+    child.on("error", reject)
+    child.on("exit", (code) => {
+      resolve({ code: code ?? -1, stdout, stderr })
+    })
+  })
+}
 
 function sourceMessages(): TranscriptMessage[] {
   return [
@@ -37,7 +97,14 @@ async function makeWorktree() {
 
 afterEach(async () => {
   vi.unstubAllEnvs()
+  vi.restoreAllMocks()
+  await Promise.all(
+    barrierFiles.map((p) => rm(p, { recursive: true, force: true }).catch(() => {})),
+  )
+  barrierFiles.length = 0
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
+  if (homeDir) await rm(homeDir, { recursive: true, force: true }).catch(() => {})
+  homeDir = undefined as unknown as string
 })
 
 describe("writeMemoryOnIdle v1 dispatch", () => {
@@ -388,5 +455,320 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
     const decision = memory?.decisions.find((candidate) => candidate.topic === "transport-policy")
     expect(decision).toMatchObject({ foundational: false, foundational_requested: true })
     expect(decision?.provenance?.confidence).toBe("llm-corroborated")
+  })
+})
+
+// ─── Wave 4 deferred: LLM lifecycle transaction tests (PR 2 §11.B–E, §15) ────
+
+function auditRecord(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    audit_session_id: "audit-1",
+    source_session_id: "source-1",
+    cache_key: "cache-key-1",
+    provider_id: "provider",
+    model_id: "model",
+    created_at: new Date().toISOString(),
+    terminal_outcome: "pending",
+    ...overrides,
+  }
+}
+
+function healthReport(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    providerID: "provider",
+    modelID: "model",
+    outcome: "success",
+    reason: "accepted-extraction",
+    ...overrides,
+  }
+}
+
+function llmFacts(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    current_task: "LLM task",
+    active_files: [],
+    decisions: [],
+    blockers: [],
+    next_steps: [],
+    ...overrides,
+  }
+}
+
+describe("Wave 4 deferred — audit-guard transaction failure does not prompt", () => {
+  it("returns a bounded failure and never calls session.prompt", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const prompt = vi.fn()
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: sourceMessages() })),
+        create: vi.fn(async () => ({ data: { id: "audit-guard-fail" } })),
+        prompt,
+      },
+    }
+
+    // Force ONLY the audit-guard transaction to fail with lock-timeout. The
+    // heuristic transaction (first mutateMemory call) must succeed so the flow
+    // reaches the audit-guard step.
+    const spy = vi.spyOn(storeModule, "mutateMemory")
+    let callCount = 0
+    spy.mockImplementation(async (_args, mutate) => {
+      callCount += 1
+      if (callCount === 1) {
+        const action = mutate(emptyMemory(worktree), {
+          status: "missing",
+          memory: null,
+          source: null,
+          path: null,
+          sizeBytes: 0,
+          revision: 0,
+        })
+        if (action.kind === "noop") {
+          return { status: "noop", value: action.value, revision: 0 }
+        }
+        return { status: "committed", value: action.value, revision: 1 }
+      }
+      return { status: "lock-timeout" }
+    })
+
+    const outcome = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId: "source-guard-fail",
+    })
+
+    // The audit guard failed, so prompting must not continue.
+    expect(prompt).not.toHaveBeenCalled()
+    // The outcome is a bounded failure, not "llm-success".
+    expect(outcome).not.toBe("llm-success")
+    expect(["llm-failed", "heuristic-only"]).toContain(outcome)
+  })
+})
+
+describe("Wave 4 deferred — audit-terminal noop does not bump revision", () => {
+  it("leaves revision and the pending audit row unchanged for a missing audit", async () => {
+    const worktree = await makeWorktree()
+    const prior = emptyMemory(worktree)
+    prior.revision = 3
+    prior.llm_extraction_audits = [auditRecord() as never]
+    await writeMemory({ worktree, directory: worktree }, prior)
+
+    // Drive persistTerminal for a non-existent audit session.
+    await persistTerminalTransaction(
+      { client: {}, worktree, directory: worktree },
+      "audit-does-not-exist",
+      "success",
+    )
+
+    const memory = await readMemory({ worktree, directory: worktree })
+    expect(memory?.revision).toBe(3)
+    expect(memory?.llm_extraction_audits).toHaveLength(1)
+    expect(memory?.llm_extraction_audits?.[0]?.terminal_outcome).toBe("pending")
+  })
+})
+
+describe("Wave 4 deferred — model-health transaction failure is best-effort", () => {
+  it("does not throw and does not fall back to writeMemory", async () => {
+    const worktree = await makeWorktree()
+    const writeSpy = vi.spyOn(storeModule, "writeMemory")
+    const mutateSpy = vi.spyOn(storeModule, "mutateMemory")
+    mutateSpy.mockResolvedValue({ status: "lock-timeout" })
+
+    await expect(
+      persistModelHealth({ client: {}, worktree, directory: worktree }, healthReport() as never),
+    ).resolves.toBeUndefined()
+
+    // No fallback writeMemory after the transaction failure.
+    expect(writeSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe("Wave 4 deferred — cache-hit transaction is inside the lock", () => {
+  it("times out against a held lock and writes no STATE", async () => {
+    const worktree = await makeWorktree()
+    const project = worktree
+    const barrier = join(tmpdir(), `w4-cache-lock-${Date.now()}-${Math.random()}`)
+    barrierFiles.push(barrier, `${barrier}.release`)
+
+    // Seed a cache row so the cache-hit path is exercised.
+    const prior = emptyMemory(project)
+    const messages = sourceMessages()
+    const model = { providerID: "provider", modelID: "model" }
+    const cachedFacts = llmFacts({ current_task: "Cached task" })
+    const cachedEvidenceRef = makeTranscriptEvidenceRef("m1")
+    const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[cachedEvidenceRef]!
+    prior.llm_extraction_cache = [makeExtractionCacheEntry({
+      sourceSessionID: "source-cache",
+      canonicalInput: buildCanonicalInput(messages, prior),
+      model,
+      facts: cachedFacts as never,
+      auditSessionID: "audit-cache",
+      evidence: [{ kind: "transcript", ref: cachedEvidenceRef, digest: cachedEvidence.digest }],
+    })]
+    await writeMemory({ worktree, directory: worktree }, prior)
+
+    // A child holds the project lock behind a barrier.
+    const child = runWorker([project, "hold-lock", barrier])
+    await waitFor(barrier)
+
+    const result = await mergeAsyncFacts(
+      { client: {}, worktree, directory: worktree, sessionId: "source-cache" },
+      cachedFacts as never,
+      null,
+      "source-cache",
+      { origin: "llm", auditSessionID: "audit-cache", evidenceCandidates: {} },
+    )
+
+    expect(result).toBe(false)
+    // No STATE was written while the lock was held.
+    const memory = await readMemory({ worktree, directory: worktree })
+    expect(memory?.revision).toBe(0)
+
+    await writeFile(`${barrier}.release`, "go", "utf-8")
+    const { code } = await child
+    expect(code).toBe(0)
+  })
+})
+
+describe("Wave 4 deferred — final-LLM transaction reads cache identity under the lock", () => {
+  it("observes a cache entry committed at a higher revision by another process", async () => {
+    const worktree = await makeWorktree()
+    const project = worktree
+    const messages = sourceMessages()
+    const model = { providerID: "provider", modelID: "model" }
+    const prior = emptyMemory(project)
+    prior.revision = 1
+    const cacheKey = "cache-key-identity"
+    // Seed cache entry X at revision 1.
+    const cachedFactsX = llmFacts({ current_task: "task-X" })
+    const cachedEvidenceRef = makeTranscriptEvidenceRef("m1")
+    const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[cachedEvidenceRef]!
+    prior.llm_extraction_cache = [makeExtractionCacheEntry({
+      sourceSessionID: "source-X",
+      canonicalInput: buildCanonicalInput(messages, prior),
+      model,
+      facts: cachedFactsX as never,
+      auditSessionID: "audit-X",
+      evidence: [{ kind: "transcript", ref: cachedEvidenceRef, digest: cachedEvidence.digest }],
+    })]
+    await writeMemory({ worktree, directory: worktree }, prior)
+
+    // A child replaces STATE at a higher revision with cache entry Y.
+    const candidates = buildTranscriptEvidenceCandidateMap(messages)
+    // The writer wraps transcript candidates with `kind: "transcript"`; mirror
+    // that shape so the cache identity check resolves Y's provenance.
+    const transcriptCandidates: Record<string, { kind: "transcript"; ref: string; digest: string }> = {}
+    const digests: Record<string, string> = {}
+    for (const [ref, candidate] of Object.entries(candidates)) {
+      transcriptCandidates[ref] = { kind: "transcript", ref, digest: candidate.digest }
+      digests[ref] = candidate.digest
+    }
+    const child = runWorker([
+      project,
+      "replace-state",
+      "5",
+      cacheKey,
+      "Y",
+      cachedEvidenceRef,
+      cachedEvidence.digest,
+    ])
+    const { code } = await child
+    expect(code).toBe(0)
+
+    // The final transaction must observe Y (the locked read), not the pre-lock X.
+    const result = await finalLLMMerge(
+      { client: {}, worktree, directory: worktree },
+      {
+        sessionId: "source-final",
+        gitSha: null,
+        canonicalInput: buildCanonicalInput(messages, prior),
+        selectedModel: model,
+        selectedCacheKey: cacheKey,
+        llmFacts: llmFacts({ current_task: "task-final" }) as never,
+        extractionAuditSessionID: "audit-final",
+        candidates: transcriptCandidates,
+        digests,
+      },
+    )
+    expect(result.status).toBe("committed")
+    if (result.status === "committed") {
+      // The merged memory reflects cache entry Y's identity (task-Y), proving
+      // the cache identity check ran against the locked read at revision 5.
+      expect(result.value.memory.current_task).toBe("task-Y")
+      expect(result.revision).toBe(6)
+    }
+  })
+})
+
+describe("Wave 4 deferred — LLM prompt is not held under the lock", () => {
+  it("a child idle-write completes while the prompt is pending and survives the final merge", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const project = worktree
+    const barrier = join(tmpdir(), `w4-prompt-${Date.now()}-${Math.random()}`)
+    barrierFiles.push(barrier, `${barrier}.release`)
+
+    const messages = sourceMessages()
+    const model = { providerID: "provider", modelID: "model" }
+
+    // A deferred prompt that resolves only after the child idle-write finishes.
+    const prompt = vi.fn(async () => {
+      // Signal that the prompt is pending (no lock is held here).
+      await writeFile(barrier, "pending", "utf-8")
+      // Block until the test releases the prompt after the child idle-write.
+      await waitFor(`${barrier}.release`)
+      return {
+        data: {
+          info: {
+            structured: {
+              current_task: "LLM final task",
+              active_files: [],
+              decisions: [],
+              blockers: [],
+              next_steps: [],
+            },
+          },
+        },
+      }
+    })
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: messages })),
+        create: vi.fn(async () => ({ data: { id: "audit-prompt" } })),
+        prompt,
+      },
+    }
+
+    // Start the idle write; it will block inside the prompt (no lock held).
+    const idlePromise = writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId: "source-prompt",
+    })
+
+    // Wait until the prompt is actually pending (audit session created).
+    await waitFor(barrier)
+
+    // A child idle-write for the same project must acquire the lock and finish
+    // while the parent's prompt is still pending.
+    const child = runWorker([project, "idle-write", "child"])
+    const { code } = await child
+    expect(code).toBe(0)
+
+    // Now release the prompt; the parent's final transaction must preserve the
+    // child's mutation.
+    await writeFile(`${barrier}.release`, "go", "utf-8")
+    const outcome = await idlePromise
+    expect(outcome).toBe("llm-success")
+
+    const memory = await readMemory({ worktree, directory: worktree })
+    const ids = memory?.decisions.map((d) => d.id) ?? []
+    expect(ids).toContain("fact-child")
   })
 })
