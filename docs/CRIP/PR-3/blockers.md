@@ -38,3 +38,12 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [bug-fix] loadAndMigrate now repairs pre-PR3 unverified human-review claims BEFORE final MemoryFileSchema.safeParse() so they validate cleanly as legacy+foundational_requested.
 - [test-gap] schema.test.ts extended with 10 tests for the new validation invariants; existing tests updated minimally where invariants changed.
 - [flakiness] targeted run green; full suite shows only the intended remaining failing fixtures (3 new test files + merge.test.ts/prune.test.ts/migrate.test.ts/recall.test.ts from Wave 1).
+
+## 2026-08-10 — wave-3 decision-authority (retry)
+- [design-decision] normalizeDecisionTopic/Text: NFKC, lowercase, trim, collapse whitespace.
+- [design-decision] isTrustedHumanFoundational: all five conditions must hold.
+- [design-decision] resolveDecisionAuthorities is pure; returns copies; never mutates the input.
+- [design-decision] Trust-rank tie-break: llm-corroborated(3) > heuristic(2) > legacy(1); then lexical ID.
+- [design-decision] Conflicting non-human rows in a human-foundational topic get conflicts_with (NOT superseded_by).
+- [test-gap] 13 tests in decision-authority.test.ts now green.
+- [scope-deviation] The first Wave 3 attempt by another agent produced an empty result with no file changes; this is the successful retry.
