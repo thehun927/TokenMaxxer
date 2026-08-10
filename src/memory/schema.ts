@@ -39,6 +39,20 @@ export const ConfidenceSchema = z.enum([
 ])
 export type Confidence = z.infer<typeof ConfidenceSchema>
 
+/**
+ * Proof that the trusted human-review boundary was crossed interactively.
+ * Deliberately minimal: no OS usernames, terminal contents, commands, or
+ * prompts. `reviewed_at` is bounded to match the project's string-length
+ * pattern.
+ */
+export const HumanReviewSchema = z
+  .object({
+    channel: z.literal("interactive-cli"),
+    reviewed_at: z.string().datetime({ offset: true }).max(64).or(z.string().max(64)),
+  })
+  .strict()
+export type HumanReview = z.infer<typeof HumanReviewSchema>
+
 /** Provenance shared by decisions, files, and current-task state. */
 export const ProvenanceSchema = z
   .object({
@@ -60,9 +74,13 @@ export const DecisionSchema = z.object({
   git_sha: z.string().optional(),
   session_id: z.string(),
   still_valid: z.boolean().default(true),
-  foundational: z.boolean().optional(),             // M4.5: promoted by model or auto-detected (undefined = false)
+  foundational: z.boolean().default(false),         // confirmed retention intent (human-reviewed state)
   foundational_requested: z.boolean().default(false), // Human promotion request; not a promotion itself.
   last_used_in_session: z.string().optional(),    // M4.5: set by writer when decision is referenced
+  human_review: HumanReviewSchema.optional(),       // proof the trusted review boundary was crossed
+  superseded_by: z.string().max(MAX_IDENTIFIER).optional(), // historical lineage for a deliberate replacement
+  conflicts_with: z.array(z.string().max(MAX_IDENTIFIER)).max(8).optional(), // candidate/history disagreeing with protected authorities
+  derived_from_decision_id: z.string().max(MAX_IDENTIFIER).optional(), // explicit human supersession lineage
   provenance: ProvenanceSchema,
 })
 
@@ -190,6 +208,13 @@ const MemoryFileBaseSchema = z.object({
  * entry schema remains constructible by the pre-v3 extraction code, while a
  * complete MemoryFile cannot expose an unproven cache hit.
  */
+/**
+ * Stable issue codes for the decision trust invariants so callers can branch
+ * on them programmatically.
+ */
+export const DECISION_TRUST_ISSUE = "decision-trust-invariant"
+export const DECISION_LINEAGE_ISSUE = "decision-lineage-invariant"
+
 export const MemoryFileSchema = MemoryFileBaseSchema.superRefine((memory, ctx) => {
   for (const [index, entry] of (memory.llm_extraction_cache ?? []).entries()) {
     const provenance = entry.provenance
@@ -205,6 +230,66 @@ export const MemoryFileSchema = MemoryFileBaseSchema.superRefine((memory, ctx) =
         path: ["llm_extraction_cache", index, "provenance"],
         message: "cache entry lacks evidence-backed provenance",
       })
+    }
+  }
+
+  // PR 3 §4.1 — decision trust + lineage invariants. A human trust claim must
+  // be self-consistent, and malformed lineage is rejected.
+  for (const [index, decision] of memory.decisions.entries()) {
+    const path = (field: string) => ["decisions", index, field]
+
+    const claimsHumanTrust =
+      decision.provenance?.extractor === "human" ||
+      decision.provenance?.confidence === "human-reviewed" ||
+      decision.human_review !== undefined
+
+    if (claimsHumanTrust) {
+      const trustOk =
+        decision.foundational === true &&
+        decision.provenance?.extractor === "human" &&
+        decision.provenance?.confidence === "human-reviewed" &&
+        decision.human_review?.channel === "interactive-cli"
+
+      if (!trustOk) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: path("provenance"),
+          message:
+            "a human trust claim requires foundational=true, extractor=human, " +
+            "confidence=human-reviewed, and human_review.channel=interactive-cli",
+        })
+      }
+    }
+
+    // Malformed lineage: a decision cannot supersede or conflict with itself.
+    if (decision.superseded_by === decision.id) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: path("superseded_by"),
+        message: "a decision cannot supersede itself",
+      })
+    }
+
+    if (decision.conflicts_with?.includes(decision.id)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: path("conflicts_with"),
+        message: "a decision cannot conflict with itself",
+      })
+    }
+
+    if (decision.conflicts_with) {
+      const seen = new Set<string>()
+      for (const id of decision.conflicts_with) {
+        if (seen.has(id)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: path("conflicts_with"),
+            message: `duplicate conflict id: ${id}`,
+          })
+        }
+        seen.add(id)
+      }
     }
   }
 })

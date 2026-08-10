@@ -64,6 +64,37 @@ function migrateDecision(value: unknown, fallbackSource: unknown): unknown {
   }
 }
 
+/**
+ * PR 3 §5 — conservatively reclassify pre-PR3 unverified human-review claims.
+ *
+ * Before PR 3 the model-callable promotion path could mint `extractor="human"` /
+ * `confidence="human-reviewed"` provenance without an explicit interactive
+ * human-review record. Such rows cannot be trusted as proof of human action, so
+ * on load we downgrade them to `legacy` provenance and mark them
+ * `foundational_requested=true` for re-confirmation. This runs in memory only;
+ * it persists naturally on the next successful STATE mutation.
+ */
+function repairUnverifiedHumanClaims(decisions: unknown[]): unknown[] {
+  return decisions.map((value) => {
+    if (!isRecord(value)) return value
+    const provenance = isRecord(value.provenance) ? value.provenance : undefined
+    const claimsHumanTrust =
+      provenance?.extractor === "human" || provenance?.confidence === "human-reviewed"
+    if (!claimsHumanTrust || hasOwn(value, "human_review")) return value
+
+    return {
+      ...value,
+      foundational: false,
+      foundational_requested: true,
+      provenance: {
+        ...provenance,
+        extractor: "legacy",
+        confidence: "legacy",
+      },
+    }
+  })
+}
+
 function migrateActiveFile(value: unknown, fallbackSource: unknown): unknown {
   if (!isRecord(value)) return value
   return {
@@ -181,6 +212,15 @@ export function loadAndMigrate(raw: unknown): MemoryFile | null {
     data = migrateV2ToV3(data)
   }
   if (data.version !== CURRENT_VERSION) return null
+
+  // PR 3 §5 — repair pre-PR3 unverified human-review claims before v3
+  // validation so they validate cleanly as legacy + foundational_requested.
+  if (Array.isArray(data.decisions)) {
+    data = {
+      ...data,
+      decisions: repairUnverifiedHumanClaims(data.decisions),
+    }
+  }
 
   const parsed = MemoryFileSchema.safeParse(data)
   if (!parsed.success) {

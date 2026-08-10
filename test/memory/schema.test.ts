@@ -4,6 +4,7 @@ import {
   CacheQuarantineMetadataSchema,
   DecisionSchema,
   EvidenceSchema,
+  HumanReviewSchema,
   MemoryFileSchema,
   ModelHealthSchema,
   ProvenanceSchema,
@@ -139,5 +140,103 @@ describe("MemoryFile v3 bounded schemas", () => {
     expect("revision" in raw).toBe(false)
     const parsed = MemoryFileSchema.parse(raw)
     expect(parsed.revision).toBe(0)
+  })
+})
+
+// ─── PR 3 §4.1 decision trust + lineage invariants ───────────────────────────
+describe("PR 3 §4.1 decision trust and lineage invariants", () => {
+  const humanProvenance = {
+    extractor: "human" as const,
+    source_session_id: "sess-human",
+    confidence: "human-reviewed" as const,
+    evidence: [{ kind: "transcript" as const, ref: "tr-1", digest: "a".repeat(64) }],
+  }
+
+  const humanReview = {
+    channel: "interactive-cli" as const,
+    reviewed_at: "2026-08-10T00:00:00.000Z",
+  }
+
+  function humanDecision(overrides: Record<string, unknown> = {}) {
+    return {
+      ...validDecision,
+      id: "d-human",
+      foundational: true,
+      foundational_requested: false,
+      human_review: humanReview,
+      provenance: humanProvenance,
+      ...overrides,
+    }
+  }
+
+  function memoryWith(decisions: unknown[]) {
+    return validV3({ decisions })
+  }
+
+  it("accepts a fully self-consistent human trust claim", () => {
+    expect(MemoryFileSchema.safeParse(memoryWith([humanDecision()])).success).toBe(true)
+  })
+
+  it("rejects a human trust claim without human_review", () => {
+    const result = MemoryFileSchema.safeParse(memoryWith([
+      humanDecision({ human_review: undefined }),
+    ]))
+    expect(result.success).toBe(false)
+  })
+
+  it("rejects a human trust claim that is not foundational", () => {
+    const result = MemoryFileSchema.safeParse(memoryWith([
+      humanDecision({ foundational: false }),
+    ]))
+    expect(result.success).toBe(false)
+  })
+
+  it("rejects a human trust claim with non-human provenance", () => {
+    const result = MemoryFileSchema.safeParse(memoryWith([
+      humanDecision({
+        provenance: { ...humanProvenance, extractor: "llm", confidence: "llm-corroborated" },
+      }),
+    ]))
+    expect(result.success).toBe(false)
+  })
+
+  it("rejects a human_review record with a non-interactive channel", () => {
+    const result = MemoryFileSchema.safeParse(memoryWith([
+      humanDecision({ human_review: { ...humanReview, channel: "cli" } }),
+    ]))
+    expect(result.success).toBe(false)
+  })
+
+  it("rejects a decision that supersedes itself", () => {
+    const result = MemoryFileSchema.safeParse(memoryWith([
+      humanDecision({ superseded_by: "d-human" }),
+    ]))
+    expect(result.success).toBe(false)
+  })
+
+  it("rejects a decision that conflicts with itself", () => {
+    const result = MemoryFileSchema.safeParse(memoryWith([
+      humanDecision({ conflicts_with: ["d-human"] }),
+    ]))
+    expect(result.success).toBe(false)
+  })
+
+  it("rejects duplicate IDs inside conflicts_with", () => {
+    const result = MemoryFileSchema.safeParse(memoryWith([
+      humanDecision({ conflicts_with: ["d-other", "d-other"] }),
+    ]))
+    expect(result.success).toBe(false)
+  })
+
+  it("accepts a valid non-human decision without any trust metadata", () => {
+    expect(MemoryFileSchema.safeParse(memoryWith([validDecision])).success).toBe(true)
+  })
+
+  it("bounds HumanReviewSchema reviewed_at length", () => {
+    expect(HumanReviewSchema.safeParse({
+      channel: "interactive-cli",
+      reviewed_at: "x".repeat(65),
+    }).success).toBe(false)
+    expect(HumanReviewSchema.safeParse(humanReview).success).toBe(true)
   })
 })
