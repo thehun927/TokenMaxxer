@@ -132,6 +132,14 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
           // output.prompt remains undefined (native augmentation)
         }
 
+        // PR 7 B3: bound the fallback reason exactly once and reuse the same
+        // value in both diagnostics — the structured app.log metadata
+        // (extra.fallback_reason) and the file snapshot — so no unbounded host
+        // error text reaches either path.
+        const boundedFallbackReason = fallbackReason
+          ? boundReason(fallbackReason, 500)
+          : undefined
+
         setLastCompaction(new Date().toISOString())
 
         await log(client, "info", "compaction hook fired", {
@@ -139,7 +147,7 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
           requested_mode: requestedMode,
           effective_mode: effectiveMode,
           durableLength: durable.length,
-          ...(fallbackReason ? { fallback_reason: fallbackReason } : {}),
+          ...(boundedFallbackReason ? { fallback_reason: boundedFallbackReason } : {}),
         })
 
         // last_compaction_prompt.log is intentionally a last-only snapshot, not a
@@ -153,7 +161,7 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
             `requested_mode=${requestedMode}`,
             `effective_mode=${effectiveMode}`,
             `kind=${effectiveMode === "replace" ? "replacement-prompt" : "context-augmentation"}`,
-            ...(fallbackReason ? [`fallback_reason=${boundReason(fallbackReason, 500)}`] : []),
+            ...(boundedFallbackReason ? [`fallback_reason=${boundedFallbackReason}`] : []),
             tokenMaxxerPayload,
             "---",
             "",

@@ -281,3 +281,12 @@ decisions, and validation results; do not rewrite prior entries.
   verification, distribution build, self-contained bundle verification, CLI
   bundle/launcher/installer verification, post-build CLI smoke, and syntax
   validation.
+
+## 2026-08-11 — Final Oracle residual remediation started
+
+- Accepted the two residual blockers from
+  `docs/CRIP/PR-7/oracle-final-rereview.md` at remote head
+  `9bfaf239505dedb11315e77eb15a69faac15e54b`.
+- Scope is limited to B1 adversarial history regressions and B3 reuse of the
+  existing bounded fallback reason in structured app-log metadata. No B2/B4,
+  PR 8, or PR 9 changes are authorized.

@@ -549,6 +549,62 @@ describe("PR 7 B3 — last_compaction_prompt.log diagnostics", () => {
       }
     })
 
+    it("passes the same bounded fallback_reason to app.log extra and the file snapshot", async () => {
+      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-b3-applog-"))
+      buildDurableBlock.mockResolvedValueOnce("durable for app-log bound test")
+      process.env.TOKENMAXXER_COMPACTION_MODE = "replace"
+
+      // Client whose session.messages throws a very long history error
+      const longReason = "Q".repeat(800)
+      const appLog = vi.fn()
+      const mockClient = {
+        app: { log: appLog },
+        session: {
+          messages: vi.fn(async () => {
+            throw new Error(longReason)
+          }),
+        },
+      }
+
+      try {
+        const hooks = await TokenmaxxerPlugin({
+          ...makePluginInput({ directory: project, worktree: project }),
+          client: mockClient as unknown as PluginInput["client"],
+        })
+
+        const output = { context: [] as string[] }
+        await hooks["experimental.session.compacting"]?.(
+          { sessionID: "applog-session" },
+          output,
+        )
+
+        // The structured app.log payload receives the bounded reason as
+        // extra.fallback_reason (no unbounded host error text).
+        const hookLogCall = appLog.mock.calls.find((call) => {
+          const arg = call[0] as { body?: { message?: string } } | undefined
+          return arg?.body?.message === "compaction hook fired"
+        })
+        expect(hookLogCall).toBeDefined()
+        const body = (hookLogCall![0] as { body: { extra: Record<string, unknown> } }).body
+        const loggedReason = body.extra.fallback_reason as string
+        expect(loggedReason).toContain("[truncated")
+        expect(loggedReason).toContain("QQQ")
+        expect(loggedReason.length).toBeLessThanOrEqual(550) // 500 cap + " [truncated ...]" suffix
+
+        // The file snapshot preserves the exact same bounded value
+        const memoryDir = join(project, ".opencode", "memory")
+        const snapshot = await readFile(join(memoryDir, "last_compaction_prompt.log"), "utf-8")
+        const reasonMatch = snapshot.match(/fallback_reason=(.+)/)
+        expect(reasonMatch).not.toBeNull()
+        expect(reasonMatch![1]).toBe(loggedReason)
+
+        // Fallback still routes to augment and leaves output.prompt unset
+        expect(output.prompt).toBeUndefined()
+      } finally {
+        await rm(project, { recursive: true, force: true })
+      }
+    })
+
     it("does not include fallback_reason line when no fallback occurred", async () => {
       const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-b3-no-fallback-"))
       buildDurableBlock.mockResolvedValueOnce("normal augment durable")

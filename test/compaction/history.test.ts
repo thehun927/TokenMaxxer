@@ -194,6 +194,93 @@ describe("extractLatestCompactionSummary", () => {
     const result = extractLatestCompactionSummary(messages)
     expect(result).toBe("Valid summary")
   })
+
+  it("ignores summary:true with finish missing", () => {
+    const messages: TranscriptMessage[] = [
+      {
+        info: { id: "msg-1", role: "user", parentID: undefined },
+        parts: [{ type: "compaction", text: "Compaction request" }],
+      },
+      {
+        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true },
+        parts: [{ type: "text", text: "Summary without finish" }],
+      },
+    ]
+    const result = extractLatestCompactionSummary(messages)
+    expect(result).toBeUndefined()
+  })
+
+  it("ignores summary:true with finish:false", () => {
+    const messages: TranscriptMessage[] = [
+      {
+        info: { id: "msg-1", role: "user", parentID: undefined },
+        parts: [{ type: "compaction", text: "Compaction request" }],
+      },
+      {
+        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, finish: false },
+        parts: [{ type: "text", text: "Summary with finish:false" }],
+      },
+    ]
+    const result = extractLatestCompactionSummary(messages)
+    expect(result).toBeUndefined()
+  })
+
+  it("older finished summary wins over newer summary:true without finish", () => {
+    const messages: TranscriptMessage[] = [
+      {
+        info: { id: "msg-1", role: "user", parentID: undefined },
+        parts: [{ type: "compaction", text: "Compaction request" }],
+      },
+      {
+        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
+        parts: [{ type: "text", text: "Older finished summary" }],
+      },
+      {
+        info: { id: "msg-3", role: "assistant", parentID: "msg-1", summary: true },
+        parts: [{ type: "text", text: "Newer summary without finish" }],
+      },
+    ]
+    const result = extractLatestCompactionSummary(messages)
+    expect(result).toBe("Older finished summary")
+  })
+
+  it("ignores finished errored summary", () => {
+    const messages: TranscriptMessage[] = [
+      {
+        info: { id: "msg-1", role: "user", parentID: undefined },
+        parts: [{ type: "compaction", text: "Compaction request" }],
+      },
+      {
+        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, error: "some error", finish: "stop" },
+        parts: [{ type: "text", text: "Errored summary" }],
+      },
+      {
+        info: { id: "msg-3", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
+        parts: [{ type: "text", text: "Valid summary" }],
+      },
+    ]
+    const result = extractLatestCompactionSummary(messages)
+    expect(result).toBe("Valid summary")
+  })
+
+  it("newest finished, non-error, non-empty summary wins", () => {
+    const messages: TranscriptMessage[] = [
+      {
+        info: { id: "msg-1", role: "user", parentID: undefined },
+        parts: [{ type: "compaction", text: "Compaction request" }],
+      },
+      {
+        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
+        parts: [{ type: "text", text: "Older summary" }],
+      },
+      {
+        info: { id: "msg-3", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
+        parts: [{ type: "text", text: "Newer summary" }],
+      },
+    ]
+    const result = extractLatestCompactionSummary(messages)
+    expect(result).toBe("Newer summary")
+  })
 })
 
 describe("readPreviousCompactionSummary", () => {
