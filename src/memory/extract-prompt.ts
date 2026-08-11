@@ -6,6 +6,9 @@ import { createHash } from "node:crypto"
 import type { MemoryFile } from "./schema"
 import type { TranscriptMessage } from "../types"
 
+/** Contract version for source/prompt identity hashing. Independent of MemoryFile.version. */
+export const EXTRACTION_CONTRACT_VERSION = 2
+
 const MAX_PRIOR_STATE_CHARS = 8_000
 const MAX_TRANSCRIPT_MESSAGES = 20
 const MAX_MESSAGE_CHARS = 500
@@ -14,6 +17,18 @@ const MAX_EVIDENCE_REF_CHARS = 128
 
 const FILE_TOOL_NAMES = new Set(["read", "edit", "write", "glob", "grep", "bash"])
 
+/** Source input for extraction identity hashing (§3.1). */
+export interface ExtractionSourceInput {
+  /** Capped transcript from source messages only. */
+  compressedTranscript: string
+  /** Unique, normalized, sorted tool-derived file candidates. */
+  fileCandidates: string[]
+  /** Contract version at time of hashing. */
+  extractionContractVersion: number
+  /** SHA-256 of serializeExtractionSourceInput output. */
+  sourceInputSha256: string
+}
+
 export interface CanonicalExtractionInput {
   /** Capped, cache-free prior STATE.json content. */
   priorStateJson: string
@@ -21,8 +36,10 @@ export interface CanonicalExtractionInput {
   compressedTranscript: string
   /** Unique, normalized, sorted tool-derived file candidates. */
   fileCandidates: string[]
-  /** SHA-256 of the canonical representation of the three fields above. */
+  /** SHA-256 of the canonical representation of the three fields above (priorStateJson, compressedTranscript, fileCandidates). Kept for backward compatibility. */
   sha256: string
+  /** SHA-256 of the prompt input including prior STATE. This is the new authority for prompt identity (§5.4). */
+  promptInputSha256: string
 }
 
 /**
@@ -461,6 +478,76 @@ export function serializeCanonicalInput(
   })
 }
 
+/** Serialize only the source-identity fields (§3.1). File candidates are sorted before hashing. */
+export function serializeExtractionSourceInput(
+  input: Pick<ExtractionSourceInput, "compressedTranscript" | "fileCandidates" | "extractionContractVersion">,
+): string {
+  return stableJson({
+    extraction_contract_version: input.extractionContractVersion,
+    source_transcript: input.compressedTranscript,
+    file_candidates: [...input.fileCandidates].sort(),
+  })
+}
+
+/** Build source input from messages. Pure function - never reads prior STATE (§3.1). */
+export function buildExtractionSourceInput(
+  messages: readonly TranscriptMessage[],
+): ExtractionSourceInput {
+  const compressedTranscript = compressTranscript(messages)
+  const fileCandidates = extractFileCandidates(messages)
+  const source = {
+    compressedTranscript,
+    fileCandidates,
+    extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
+  }
+  const serialized = serializeExtractionSourceInput(source)
+  return {
+    ...source,
+    sourceInputSha256: sha256Hex(serialized),
+  }
+}
+
+/** Build source-version key: v2s:<64 hex> (§3.2). */
+export function makeSourceVersionKey(args: {
+  sourceSessionID: string
+  sourceInputSha256: string
+  extractionContractVersion: number
+}): string {
+  const { sourceSessionID, sourceInputSha256, extractionContractVersion } = args
+  const payload = stableJson({
+    extraction_contract_version: extractionContractVersion,
+    source_input_sha256: sourceInputSha256,
+    source_session_id: sourceSessionID,
+  })
+  return `v2s:${sha256Hex(payload)}`
+}
+
+/** Build extraction-cache key: v2e:<64 hex> (§3.4). New signature with source version key. */
+export function makeExtractionCacheKey(args: {
+  sourceVersionKey: string
+  extractionContractVersion: number
+  model: { providerID: string; modelID: string; variant?: string }
+}): string {
+  const { sourceVersionKey, extractionContractVersion, model } = args
+  const payload = stableJson({
+    extraction_contract_version: extractionContractVersion,
+    model_id: model.modelID,
+    provider_id: model.providerID,
+    source_version_key: sourceVersionKey,
+    variant: model.variant,
+  })
+  return `v2e:${sha256Hex(payload)}`
+}
+
+/** Legacy cache key format for backward compatibility with existing audit/cache records and tests. */
+export function makeExtractionCacheKeyLegacy(
+  sourceSessionID: string,
+  canonicalInputSha256: string,
+  model: { providerID: string; modelID: string },
+): string {
+  return `${sourceSessionID}:${canonicalInputSha256}:${model.providerID}/${model.modelID}`
+}
+
 export function buildCanonicalInput(
   messages: readonly TranscriptMessage[],
   priorState: CacheBearingMemory | MemoryFile | null,
@@ -475,22 +562,20 @@ export function buildCanonicalInput(
     compressedTranscript,
     fileCandidates,
   })
+  const promptInput = stableJson({
+    extraction_contract_version: EXTRACTION_CONTRACT_VERSION,
+    file_candidates: fileCandidates,
+    prior_state_json: priorStateJson,
+    source_transcript: compressedTranscript,
+  })
 
   return {
     priorStateJson,
     compressedTranscript,
     fileCandidates,
     sha256: sha256Hex(canonical),
+    promptInputSha256: sha256Hex(promptInput),
   }
-}
-
-/** Compose the source-session/model-specific cache identity. */
-export function makeExtractionCacheKey(
-  sourceSessionID: string,
-  canonicalInputSha256: string,
-  model: { providerID: string; modelID: string },
-): string {
-  return `${sourceSessionID}:${canonicalInputSha256}:${model.providerID}/${model.modelID}`
 }
 
 /**

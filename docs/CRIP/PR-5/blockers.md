@@ -39,3 +39,11 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] Item 41 specifically asserts that the broad catch (-> 'heuristic-only') is replaced by an explicit 'error' outcome.
 - [design-decision] The remaining §18.E items 42-58 (write-failed, queue-failed, llm-failed, the lastOutcome alignment, etc.) are deferred to Wave 6 when the truthful outcome state machine is implemented.
 - [scope-deviation] Items 26-31 (barrier-driven concurrent cases, §18.C) are deferred to Wave 4 where the source-version queue key is implemented.
+
+## 2026-08-11 — wave-2 source/prompt identity implementation
+- [design-decision] EXTRACTION_CONTRACT_VERSION = 2 lives in src/memory/extract-prompt.ts.
+- [design-decision] Source serializer is stableJson({ extraction_contract_version, source_transcript, file_candidates }) — sorts fileCandidates before hashing.
+- [design-decision] Source-version key: v2s:<sha256(...)>; extraction-cache key: v2e:<sha256(...)>; both domain-separated.
+- [design-decision] CanonicalExtractionInput exposes promptInputSha256 as the new identity; old `sha256` field is kept for compatibility with callers that read it.
+- [test-gap] §18.A items 1-10 now green (10 tests in test/memory/extract.test.ts).
+- [scope-deviation] extract-llm.ts / writer.ts call sites are updated to populate the new identity fields but the schema/mutable STATE persistence lands in Wave 5.

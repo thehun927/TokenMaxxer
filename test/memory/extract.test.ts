@@ -15,7 +15,7 @@ import {
   compressTranscript,
   digestTranscriptEvidenceCandidate,
   makeTranscriptEvidenceRef,
-  makeExtractionCacheKey,
+  makeExtractionCacheKeyLegacy,
   serializeCanonicalInput,
   stableJson,
 } from "../../src/memory/extract-prompt"
@@ -264,7 +264,7 @@ describe("canonical extraction input", () => {
 
 describe("extraction cache identity and prompt", () => {
   it("composes the source, fingerprint, and provider/model exactly", () => {
-    expect(makeExtractionCacheKey("session-123", "abc123", {
+    expect(makeExtractionCacheKeyLegacy("session-123", "abc123", {
       providerID: "anthropic",
       modelID: "claude-3-5-haiku",
     })).toBe("session-123:abc123:anthropic/claude-3-5-haiku")

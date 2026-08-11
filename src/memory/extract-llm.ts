@@ -19,7 +19,7 @@ import {
 } from "./schema"
 import type { EvidenceKind, Evidence } from "./schema"
 import type { CanonicalExtractionInput } from "./extract-prompt"
-import { buildExtractionPrompt, makeExtractionCacheKey } from "./extract-prompt"
+import { buildExtractionPrompt, makeExtractionCacheKeyLegacy, makeSourceVersionKey, EXTRACTION_CONTRACT_VERSION } from "./extract-prompt"
 import { readMemory } from "./store"
 import {
   createAuditSession,
@@ -889,10 +889,15 @@ async function extractFactsLLMOnce(
     // never re-enter extraction.
     retainExtractionSession(extractionSessionID)
 
+    const sourceVersionKey = makeSourceVersionKey({
+      sourceSessionID,
+      sourceInputSha256: canonicalInput.promptInputSha256,
+      extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
+    })
     const audit: LLMAuditMetadata = {
       audit_session_id: extractionSessionID,
       source_session_id: sourceSessionID,
-      cache_key: makeExtractionCacheKey(
+      cache_key: makeExtractionCacheKeyLegacy(
         sourceSessionID,
         canonicalInput.sha256,
         config.model,
@@ -1117,7 +1122,7 @@ export function makeExtractionCacheEntry(args: {
       : undefined
   )
   return {
-    cache_key: makeExtractionCacheKey(
+    cache_key: makeExtractionCacheKeyLegacy(
       args.sourceSessionID,
       args.canonicalInput.sha256,
       args.model,
@@ -1157,5 +1162,5 @@ export function extractionCacheKey(
   canonicalInput: CanonicalExtractionInput,
   model: SmallModel,
 ): string {
-  return makeExtractionCacheKey(sourceSessionID, canonicalInput.sha256, model)
+  return makeExtractionCacheKeyLegacy(sourceSessionID, canonicalInput.sha256, model)
 }
