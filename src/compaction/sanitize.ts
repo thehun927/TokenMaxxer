@@ -10,7 +10,8 @@ const TRUNC_MARKER = "…[truncated]"
 
 const DURABLE_OPEN = "<<<TOKENMAXXER_DURABLE_CONTEXT_DATA>>>"
 const DURABLE_CLOSE = "<<<END_TOKENMAXXER_DURABLE_CONTEXT_DATA>>>"
-const PREV_SUMMARY_CLOSE = "<<<END_PREVIOUS_SUMMARY>>>"
+const PREV_SUMMARY_CLOSE = "<<<END_PREVIOUS_SUMMARY_ANCHOR>>>"
+const PREV_SUMMARY_LEGACY_CLOSE = "<<<END_PREVIOUS_SUMMARY>>>"
 
 /**
  * Sanitize a single durable-field value before injection into a DATA line.
@@ -84,6 +85,7 @@ export function sanitizePreviousSummary(value: string): string {
 
   // 5. Remove verbatim previous-summary closing delimiter
   result = result.split(PREV_SUMMARY_CLOSE).join("")
+  result = result.split(PREV_SUMMARY_LEGACY_CLOSE).join("")
 
   // 6. Truncate by Unicode code points
   const codePoints = [...result]

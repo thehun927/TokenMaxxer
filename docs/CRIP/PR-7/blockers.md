@@ -145,3 +145,31 @@ decisions, and validation results; do not rewrite prior entries.
   passed**.
 - Wave 4 exit: **complete**. Durable rendering and sanitization are ready for
   one coherent commit before Wave 5 previous-summary recovery.
+
+## 2026-08-11 — Wave 5 validation
+
+- Added `src/compaction/history.ts` for typed previous-summary recovery and
+  wired replacement mode to fetch history only when explicitly requested.
+- Recovery now uses the verified `{ data }` response from
+  `client.session.messages({ path: { id } })`; successful empty history is
+  `none`, while missing/throwing/malformed history is `unavailable`.
+- Extraction requires a compaction user marker, assistant role, matching
+  parent ID, `summary === true`, and non-empty text; errored/incomplete
+  summaries are ignored and transcript order selects the newest valid result.
+- Replacement mode sanitizes a found anchor, permits first compaction without
+  an anchor, and falls back to augment for that invocation when history is
+  unavailable. Fallback logs and snapshots use effective `augment` mode.
+- Added adversarial removal for both the actual
+  `<<<END_PREVIOUS_SUMMARY_ANCHOR>>>` marker and the legacy closing marker.
+- Focused command:
+  `npx vitest run test/compaction/history.test.ts test/compaction/sanitize-previous-summary.test.ts test/index.test.ts`
+  result: **3 test files passed, 40 tests passed**.
+- Prompt/sanitizer regression command:
+  `npx vitest run test/compaction/prompt.test.ts test/compaction/prompt-contract.test.ts test/compaction/anti-drift.fixture.test.ts test/compaction/sanitize.test.ts`
+  result: **4 test files passed, 90 tests passed**.
+- `npx tsc --noEmit`: **passed**.
+- `npm run typecheck:host-contract`: **passed**.
+- Full `npm test -- --reporter=dot`: **45 test files passed, 810 tests
+  passed**.
+- Wave 5 exit: **complete**. Replacement repeated-compaction recovery and
+  invocation-level safe fallback are implemented; proceed to Wave 6.

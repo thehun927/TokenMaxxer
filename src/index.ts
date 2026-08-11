@@ -13,6 +13,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { loadOptions } from "./config"
 import { buildCompactionPrompt } from "./compaction/prompt"
 import { buildDurableBlock } from "./compaction/durable"
+import { readPreviousCompactionSummary } from "./compaction/history"
 import { writeMemoryOnIdle } from "./memory/writer"
 import {
   isPersistedRetainedExtractionSession,
@@ -65,9 +66,41 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
               : "unset")
 
         // PR 7 Wave 2: Use compactionMode instead of compactionPrompt
+        let effectiveMode = options.compactionMode
+        let fallbackReason: string | undefined
+
         if (options.compactionMode === "replace") {
-          // Replace mode: set prompt, preserve unrelated context
-          output.prompt = buildCompactionPrompt(durable)
+          // Replace mode: attempt to recover previous summary
+          const historyResult = await readPreviousCompactionSummary({
+            client,
+            sessionID: input.sessionID,
+          })
+
+          if (historyResult.status === "found") {
+            // Sanitize recovered summary before interpolation
+            const { sanitizePreviousSummary } = await import("./compaction/sanitize")
+            const sanitizedSummary = sanitizePreviousSummary(historyResult.summary)
+
+            // Build replacement prompt with previous-summary anchor
+            output.prompt = buildCompactionPrompt({
+              durableContext: durable,
+              previousSummary: sanitizedSummary,
+            })
+          } else if (historyResult.status === "none") {
+            // First compaction: no prior summary, proceed without anchor
+            output.prompt = buildCompactionPrompt({
+              durableContext: durable,
+            })
+          } else {
+            // historyResult.status === "unavailable": fallback to augment
+            effectiveMode = "augment"
+            fallbackReason = historyResult.reason
+
+            // Fallback to augment: append context, leave prompt unset
+            output.context.push(durable)
+            // output.prompt remains undefined (native augmentation)
+          }
+
           // Preserve pre-existing context entries (do not erase)
           // output.context already contains any pre-existing entries
         } else {
@@ -82,8 +115,9 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
         await log(client, "info", "compaction hook fired", {
           session: input.sessionID,
           requested_mode: requestedMode,
-          effective_mode: options.compactionMode,
+          effective_mode: effectiveMode,
           durableLength: durable.length,
+          ...(fallbackReason ? { fallback_reason: fallbackReason } : {}),
         })
 
         // last_compaction.log is intentionally a last-only snapshot, not a
@@ -95,12 +129,12 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
             `timestamp=${new Date().toISOString()}`,
             `session=${input.sessionID}`,
             `requested_mode=${requestedMode}`,
-            `effective_mode=${options.compactionMode}`,
-            `kind=${options.compactionMode === "replace" ? "replacement-prompt" : "context-augmentation"}`,
+            `effective_mode=${effectiveMode}`,
+            `kind=${effectiveMode === "replace" ? "replacement-prompt" : "context-augmentation"}`,
             output.prompt ?? durable,
             "---",
             "",
-          ].join("\n")
+          ].join("\\n")
           await atomicWrite(logPath, snapshot)
         } catch {
           // Non-fatal

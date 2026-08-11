@@ -3,6 +3,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { PluginInput, ToolContext } from "@opencode-ai/plugin"
+import type { TranscriptMessage } from "../../src/types"
 
 const { writeMemoryOnIdle, buildDurableBlock } = vi.hoisted(() => {
   return {
@@ -51,6 +52,7 @@ type ClientOverride = {
   file?: Partial<{ read: FileReadStub }>
   app?: Partial<{ log: (...args: unknown[]) => unknown }>
   config?: Partial<{ get: (...args: unknown[]) => unknown }>
+  session?: Partial<{ messages: (...args: unknown[]) => Promise<{ data?: TranscriptMessage[] }> }>
 }
 
 function makeClient(overrides: ClientOverride = {}): PluginInput["client"] {
@@ -63,6 +65,9 @@ function makeClient(overrides: ClientOverride = {}): PluginInput["client"] {
     },
     config: {
       get: overrides.config?.get ?? vi.fn(),
+    },
+    session: {
+      messages: overrides.session?.messages ?? vi.fn(async () => ({ data: [] })),
     },
   } as unknown as PluginInput["client"]
 }
@@ -266,6 +271,126 @@ describe("PR 7 Wave 1 — compaction mode assertions", () => {
 
       // Replace mode should preserve unrelated context
       expect(output.context).toContain("existing-plugin-context")
+    })
+  })
+
+  describe("PR 7 Wave 5 — Previous-summary recovery", () => {
+    beforeEach(() => {
+      vi.clearAllMocks()
+      // Clear all env vars before each test
+      Object.keys(process.env).forEach((key) => {
+        if (key.startsWith("TOKENMAXXER_")) {
+          delete process.env[key]
+        }
+      })
+    })
+
+    it("replace mode with no prior summary proceeds without anchor", async () => {
+      process.env.TOKENMAXXER_COMPACTION_MODE = "replace"
+      const mockClient = {
+        session: {
+          messages: vi.fn(async () => ({ data: [] })),
+        },
+      }
+      const hooks = await TokenmaxxerPlugin({
+        ...makePluginInput(),
+        client: mockClient as unknown as PluginInput["client"],
+      })
+
+      const output = { context: [] as string[] }
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "first-compaction" },
+        output,
+      )
+
+      // Should set prompt (no anchor needed for first compaction)
+      expect(output.prompt).toBeDefined()
+      expect(output.prompt).not.toBe("")
+      // Should preserve context
+      expect(output.context).toBeDefined()
+    })
+
+    it("replace mode with prior summary includes anchor", async () => {
+      process.env.TOKENMAXXER_COMPACTION_MODE = "replace"
+      const mockMessages: TranscriptMessage[] = [
+        {
+          info: { id: "msg-1", role: "user", parentID: undefined },
+          parts: [{ type: "compaction", text: "Compaction request" }],
+        },
+        {
+          info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true },
+          parts: [{ type: "text", text: "Prior summary content" }],
+        },
+      ]
+
+      const mockClient = {
+        session: {
+          messages: vi.fn(async () => ({ data: mockMessages })),
+        },
+      }
+      const hooks = await TokenmaxxerPlugin({
+        ...makePluginInput(),
+        client: mockClient as unknown as PluginInput["client"],
+      })
+
+      const output = { context: [] as string[] }
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "second-compaction" },
+        output,
+      )
+
+      // Should set prompt with anchor
+      expect(output.prompt).toBeDefined()
+      expect(output.prompt).toContain("PREVIOUS SUMMARY ANCHOR")
+      expect(output.prompt).toContain("Prior summary content")
+      // Should preserve context
+      expect(output.context).toBeDefined()
+    })
+
+    it("replace mode with unavailable history falls back to augment", async () => {
+      process.env.TOKENMAXXER_COMPACTION_MODE = "replace"
+      const mockClient = {} as unknown
+      const hooks = await TokenmaxxerPlugin({
+        ...makePluginInput(),
+        client: mockClient,
+      })
+
+      const output = { context: [] as string[] }
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "test-session" },
+        output,
+      )
+
+      // Should fall back to augment: append context, leave prompt unset
+      expect(output.context).toBeDefined()
+      expect(output.prompt).toBeUndefined()
+    })
+
+    it("augment mode does not fetch history", async () => {
+      const mockClient = {
+        session: {
+          messages: vi.fn(async () => {
+            throw new Error("Should not be called in augment mode")
+          }),
+        },
+      }
+      const hooks = await TokenmaxxerPlugin({
+        ...makePluginInput(),
+        client: mockClient as unknown as PluginInput["client"],
+      })
+
+      const output = { context: [] as string[] }
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "test-session" },
+        output,
+      )
+
+      // Should not call session.messages in augment mode
+      expect(mockClient.session.messages).not.toHaveBeenCalled()
+      // Should append context
+      expect(output.context).toBeDefined()
+      // Should leave prompt unset
+      expect(output.prompt).toBeUndefined()
     })
   })
 
