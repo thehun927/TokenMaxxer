@@ -2444,9 +2444,10 @@ describe("PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation", () => {
       expect(result.value.memory.blockers).toEqual([])
       expect(result.value.memory.next_steps).toEqual([])
       // Fresh accepted facts win; stale cache payload is not replayed.
+      // PR6 B1: pre-PR6 contract 2 cache is quarantined before validation, so fresh cache wins.
       // Wave 5: Cache entry only contains decisions, not full ExtractedFacts
       expect(result.value.memory.llm_extraction_cache?.[0]?.facts.decisions).toHaveLength(1)
-      expect(result.value.memory.llm_extraction_cache?.[0]?.facts.decisions[0]?.topic).toBe("stale-decision")
+      expect(result.value.memory.llm_extraction_cache?.[0]?.facts.decisions[0]?.topic).toBe("fresh-decision")
       expect(result.value.memory.processed_sources).toContainEqual(expect.objectContaining({
         source_key: prepared.sourceVersionKey,
         extraction_key: selectedCacheKey,

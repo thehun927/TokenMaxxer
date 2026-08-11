@@ -277,6 +277,54 @@ function existingQuarantineCount(value: unknown): number {
 }
 
 /**
+ * B1 — quarantine pre-PR6 cache rows on current-v3 documents before final validation.
+ * Any llm_extraction_cache row whose extraction_contract_version is missing or !==3
+ * is disposable cache payload and must not make semantic STATE unreadable.
+ * Do not parse broad facts first; filter purely on contract version.
+ * Preserves semantic STATE, revision, processed_sources, and other operational metadata.
+ * A contract-3 row that is malformed remains for fail-closed validation.
+ */
+function quarantineStaleCacheByContractVersion(data: RawRecord): RawRecord {
+  if (!Array.isArray(data.llm_extraction_cache)) return data
+
+  const retained: unknown[] = []
+  let quarantined = 0
+
+  for (const entry of data.llm_extraction_cache) {
+    if (!isRecord(entry)) {
+      quarantined++
+      continue
+    }
+    const v = entry.extraction_contract_version
+    if (typeof v !== "number" || v !== 3) {
+      quarantined++
+    } else {
+      retained.push(entry)
+    }
+  }
+
+  if (quarantined === 0) return data
+
+  const result: RawRecord = { ...data }
+  if (retained.length > 0) {
+    result.llm_extraction_cache = retained
+  } else {
+    delete result.llm_extraction_cache
+  }
+
+  const count = Math.min(
+    10_000,
+    existingQuarantineCount(data.llm_extraction_cache_quarantine) + quarantined,
+  )
+  result.llm_extraction_cache_quarantine = {
+    count,
+    reason: "pre-pr6-cache-contract",
+  }
+
+  return result
+}
+
+/**
  * Drop cache rows that cannot be evidence-backed v3 hits.  Only a bounded
  * count and a non-sensitive reason survive.  This is applied while migrating
  * v2.  A malformed v3 cache row is rejected by MemoryFileSchema instead of
@@ -335,11 +383,21 @@ function migrateV2ToV3(data: RawRecord): RawRecord {
   return quarantineUnprovenCache(migrateCurrentTask(withFacts, fallbackSource))
 }
 
+function isCompleteTranscriptLLMProvenance(provenance: RawRecord): boolean {
+  const hasAudit = typeof provenance.source_audit_session_id === "string" && provenance.source_audit_session_id.length > 0
+  const evidence = provenance.evidence
+  if (!Array.isArray(evidence) || evidence.length === 0 || evidence.length > 3) return false
+  for (const ev of evidence) {
+    if (!isRecord(ev) || ev.kind !== "transcript") return false
+  }
+  return hasAudit
+}
+
 /**
- * PR 6 Wave 5 — downgrade incomplete LLM trust claims to legacy.
- * An LLM decision with incomplete provenance (missing source_audit_session_id
- * or empty evidence) is not evidence-backed and must be downgraded to legacy
- * to maintain the v3 trust invariant.
+ * PR 6 — downgrade decision LLM claims unless complete transcript-only tuple.
+ * Retains llm-corroborated only when audit + 1-3 all-transcript evidence present;
+ * otherwise downgrades to exact legacy/legacy while preserving stable ID, semantic
+ * content, authority/history, and bounded evidence pointers.
  */
 function repairIncompleteLLMClaims(decisions: unknown[]): unknown[] {
   return decisions.map((value) => {
@@ -350,13 +408,9 @@ function repairIncompleteLLMClaims(decisions: unknown[]): unknown[] {
     const isLLMClaim = provenance?.extractor === "llm" && provenance?.confidence === "llm-corroborated"
     if (!isLLMClaim) return value
 
-    // Check if provenance is complete (has audit session + evidence)
-    const hasAuditSession = typeof provenance.source_audit_session_id === "string" && provenance.source_audit_session_id.length > 0
-    const hasEvidence = Array.isArray(provenance.evidence) && provenance.evidence.length > 0
+    if (isCompleteTranscriptLLMProvenance(provenance)) return value
 
-    if (hasAuditSession && hasEvidence) return value // Complete - no repair needed
-
-    // Incomplete LLM claim - downgrade to legacy
+    // Incomplete or non-transcript LLM claim - downgrade to exact legacy
     return {
       ...value,
       provenance: {
@@ -369,23 +423,20 @@ function repairIncompleteLLMClaims(decisions: unknown[]): unknown[] {
 }
 
 /**
- * PR 6 Wave 5 — repair incomplete LLM provenance in active_files and current_task.
- * Active files and current_task with incomplete LLM provenance are downgraded
- * to legacy to maintain the v3 trust invariant.
+ * PR 6 B3 — downgrade ALL LLM provenance on non-decision state.
+ * Regardless of completeness, any current_task_provenance or active_files[]
+ * claiming extractor=llm / confidence=llm-corroborated is downgraded to exact
+ * legacy/legacy, preserving semantic value/path/reason and bounded evidence pointers.
+ * Do not invent heuristic provenance.
  */
 function repairIncompleteLLMProvenanceInState(data: RawRecord): RawRecord {
-  // Repair active_files
+  // Repair active_files — downgrade every LLM claim unconditionally
   if (Array.isArray(data.active_files)) {
     data.active_files = data.active_files.map((file) => {
       if (!isRecord(file)) return file
       const provenance = isRecord(file.provenance) ? file.provenance : undefined
       const isLLMClaim = provenance?.extractor === "llm" && provenance?.confidence === "llm-corroborated"
       if (!isLLMClaim) return file
-
-      const hasAuditSession = typeof provenance.source_audit_session_id === "string" && provenance.source_audit_session_id.length > 0
-      const hasEvidence = Array.isArray(provenance.evidence) && provenance.evidence.length > 0
-
-      if (hasAuditSession && hasEvidence) return file
 
       return {
         ...file,
@@ -398,20 +449,15 @@ function repairIncompleteLLMProvenanceInState(data: RawRecord): RawRecord {
     })
   }
 
-  // Repair current_task_provenance
+  // Repair current_task_provenance — downgrade every LLM claim unconditionally
   if (isRecord(data.current_task_provenance)) {
     const provenance = data.current_task_provenance
     const isLLMClaim = provenance.extractor === "llm" && provenance.confidence === "llm-corroborated"
     if (isLLMClaim) {
-      const hasAuditSession = typeof provenance.source_audit_session_id === "string" && provenance.source_audit_session_id.length > 0
-      const hasEvidence = Array.isArray(provenance.evidence) && provenance.evidence.length > 0
-
-      if (!hasAuditSession || !hasEvidence) {
-        data.current_task_provenance = {
-          ...provenance,
-          extractor: "legacy",
-          confidence: "legacy",
-        }
+      data.current_task_provenance = {
+        ...provenance,
+        extractor: "legacy",
+        confidence: "legacy",
       }
     }
   }
@@ -439,6 +485,10 @@ export function loadAndMigrate(raw: unknown): MemoryFile | null {
     data = migrateV2ToV3(data)
   }
   if (data.version !== CURRENT_VERSION) return null
+
+  // B1 — pre-PR6 cache contract quarantine for current-v3 documents (including PR5-era v3 broad rows).
+  // Must run before final schema validation and before any parsing of broad facts.
+  data = quarantineStaleCacheByContractVersion(data)
 
   // PR 3 §5 — repair pre-PR3 unverified human-review claims before v3
   // validation so they validate cleanly as legacy + foundational_requested.

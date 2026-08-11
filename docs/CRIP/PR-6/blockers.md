@@ -85,6 +85,25 @@ Append-only implementation log for PR 6. Do not delete or rewrite prior entries.
   audit/evidence-gate cases. They remain explicit skips pending Wave 6 and are
   not counted as green contract coverage.
 
+## 2026-08-11 — Oracle B1–B4 remediation
+
+- [remediation] B1: current-version-3 PR-5 cache rows with missing/non-v3
+  extraction contract are quarantined before cache schema parsing; semantic
+  STATE and processed-source records survive. Contract-3 malformed rows still
+  fail closed.
+- [remediation] B2: extractor/confidence pairing is exhaustive, including
+  legacy↔legacy only.
+- [remediation] B3: all non-decision LLM provenance on current task and active
+  files downgrades to legacy, and field-specific durable schemas reject future
+  LLM claims while preserving bounded semantic data.
+- [remediation] B4: durable LLM provenance and migration repair require
+  transcript-only evidence; mixed/heuristic evidence downgrades or invalidates
+  the claim/cache.
+- [verification] Focused B1–B4 regressions passed: 20 new tests; focused
+  schema/migration/merge/extraction total 154 passed.
+- [verification] `npx tsc --noEmit` passed; `npm test` passed: 39 files, 651
+  tests.
+
 ## 2026-08-11 — Wave 6 durable provenance invariants
 
 - [implementation] Provenance schema now enforces extractor/confidence pairing

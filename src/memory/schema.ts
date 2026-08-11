@@ -65,11 +65,8 @@ export const ProvenanceSchema = z
   })
   .strict()
   .superRefine((provenance, ctx) => {
-    // PR-6 Wave 6: Enforce extractor/confidence pairing contract
-    // extractor=llm must pair with confidence=llm-corroborated
-    // extractor=heuristic must pair with confidence=heuristic
-    // extractor=human must pair with confidence=human-reviewed
-    // extractor=legacy has no pairing requirement
+    // PR-6: Enforce exhaustive extractor/confidence pairing contract
+    // heuristic <-> heuristic, llm <-> llm-corroborated, human <-> human-reviewed, legacy <-> legacy
     const { extractor, confidence } = provenance
 
     if (extractor === "llm" && confidence !== "llm-corroborated") {
@@ -96,7 +93,15 @@ export const ProvenanceSchema = z
       })
     }
 
-    // PR-6 Wave 6: LLM provenance requires source_audit_session_id and 1-3 evidence entries
+    if (extractor === "legacy" && confidence !== "legacy") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["confidence"],
+        message: "extractor=legacy must pair with confidence=legacy",
+      })
+    }
+
+    // PR-6: LLM provenance requires source_audit_session_id and 1-3 transcript-only evidence entries
     if (extractor === "llm" && confidence === "llm-corroborated") {
       if (!provenance.source_audit_session_id || provenance.source_audit_session_id.length === 0) {
         ctx.addIssue({
@@ -119,9 +124,35 @@ export const ProvenanceSchema = z
           message: "LLM provenance evidence must have at most 3 entries",
         })
       }
+      if (provenance.evidence.some((e) => e.kind !== "transcript")) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["evidence"],
+          message: "LLM provenance evidence must be transcript-only",
+        })
+      }
     }
   })
 export type Provenance = z.infer<typeof ProvenanceSchema>
+
+/** Non-decision provenance is durable only as heuristic or legacy. LLM/human trust is never durable on current_task/active_files. */
+export const NonDecisionProvenanceSchema = ProvenanceSchema.superRefine((provenance, ctx) => {
+  if (provenance.extractor !== "heuristic" && provenance.extractor !== "legacy") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["extractor"],
+      message: "non-decision provenance must be heuristic or legacy",
+    })
+  }
+  if (provenance.confidence !== "heuristic" && provenance.confidence !== "legacy") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["confidence"],
+      message: "non-decision provenance confidence must be heuristic or legacy",
+    })
+  }
+})
+export type NonDecisionProvenance = z.infer<typeof NonDecisionProvenanceSchema>
 
 export const DecisionSchema = z.object({
   // PR 3 wave-9 (Blocker 2): the stable decision ID is the trust address for
@@ -168,7 +199,7 @@ export const ActiveFileSchema = z.object({
   path: z.string(),
   reason: z.string(),
   last_touched: z.string().datetime({ offset: true }).or(z.string()), // ISO 8601
-  provenance: ProvenanceSchema,
+  provenance: NonDecisionProvenanceSchema,
 })
 
 export type ActiveFile = Omit<z.input<typeof ActiveFileSchema>, "provenance"> & {
@@ -288,7 +319,7 @@ const MemoryFileBaseSchema = z.object({
   last_git_sha: z.string().optional(),
   last_session_id: z.string().optional(),
   current_task: z.string().optional(),
-  current_task_provenance: ProvenanceSchema.optional(),
+  current_task_provenance: NonDecisionProvenanceSchema.optional(),
   active_files: z.array(ActiveFileSchema).default([]),
   decisions: z.array(DecisionSchema).default([]),
   blockers: z.array(z.string()).default([]),

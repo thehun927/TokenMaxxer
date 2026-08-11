@@ -1137,7 +1137,9 @@ function hasEvidenceBackedProvenance(
     provenance.extractor !== "llm" ||
     provenance.confidence !== "llm-corroborated" ||
     !provenance.source_audit_session_id ||
-    provenance.evidence.length === 0
+    provenance.evidence.length === 0 ||
+    provenance.evidence.length > 3 ||
+    provenance.evidence.some((e) => e.kind !== "transcript")
   ) return false
 
   const evidenceByRef = new Map(provenance.evidence.map((evidence) => [evidence.ref, evidence]))
