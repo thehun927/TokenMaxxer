@@ -21,3 +21,8 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [test-gap] test/memory/extract.test.ts extended with 10 failing-on-main fixtures (§18.A items 1-10); expected to go green in Wave 2.
 - [design-decision] Tests use `import * as prompt from "../../src/memory/extract-prompt"` cast through `as any as { ... }`; today's import resolves to the existing module; `buildExtractionSourceInput`, `makeSourceVersionKey`, `makeExtractionCacheKey` do NOT yet exist, so the tests reference them through a typed stub. Today the tests fail because the new exports are absent.
 - [scope-deviation] The fixtures are pure unit tests of the new helpers; integration with writeMemoryOnIdle is covered by Lane B.
+
+## 2026-08-11 — wave-1B idempotency basics fixtures
+- [test-gap] test/memory/writer-llm.test.ts extended with 7 failing-on-main fixtures (§18.B items 11-17); expected to go green in Wave 4.
+- [design-decision] Tests use the real writeMemoryOnIdle boundary and existing writeMemoryOnIdle test patterns.
+- [scope-deviation] Items 18-25 (advanced idempotency) and 39-41 (truthful outcomes) will be added in subsequent sub-waves.
