@@ -7,7 +7,7 @@ import {
 describe("Shared continuation-preservation contract (§5)", () => {
   describe("User constraints (§5.1)", () => {
     it("explicitly preserves still-applicable user constraints", () => {
-      const prompt = buildCompactionPrompt("")
+      const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
       expect(prompt).toContain("User constraints")
       expect(prompt).toContain("retain them while still applicable")
       expect(prompt).toContain("do not infer resolution from silence")
@@ -16,7 +16,7 @@ describe("Shared continuation-preservation contract (§5)", () => {
     })
 
     it("lists example constraint types that must be preserved", () => {
-      const prompt = buildCompactionPrompt("")
+      const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
       expect(prompt).toContain("do not commit")
       expect(prompt).toContain("keep API backwards-compatible")
       expect(prompt).toContain("use pnpm rather than npm")
@@ -28,7 +28,7 @@ describe("Shared continuation-preservation contract (§5)", () => {
 
   describe("Verification state (§5.2)", () => {
     it("distinguishes verified passing, verified failing, not rerun, and pending", () => {
-      const prompt = buildCompactionPrompt("")
+      const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
       expect(prompt).toContain("verified passing")
       expect(prompt).toContain("verified failing")
       expect(prompt).toContain("not rerun after last change")
@@ -36,7 +36,7 @@ describe("Shared continuation-preservation contract (§5)", () => {
     })
 
     it("preserves exact unresolved command/error/identifier when necessary", () => {
-      const prompt = buildCompactionPrompt("")
+      const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
       expect(prompt).toContain("npm test: passed")
       expect(prompt).toContain("npx tsc --noEmit: failing")
       expect(prompt).toContain("build: not rerun after last edit")
@@ -48,7 +48,7 @@ describe("Shared continuation-preservation contract (§5)", () => {
 
   describe("Work completed vs current work (§5.3)", () => {
     it("distinguishes completed/verified, implemented-but-unverified, currently editing, planned only", () => {
-      const prompt = buildCompactionPrompt("")
+      const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
       expect(prompt).toContain("completed and verified")
       expect(prompt).toContain("implemented but unverified")
       expect(prompt).toContain("currently editing/investigating")
@@ -59,7 +59,7 @@ describe("Shared continuation-preservation contract (§5)", () => {
 
   describe("Relevant file vs changed file (§5.4)", () => {
     it("does not transform durable active_files observation into file changed claim", () => {
-      const prompt = buildCompactionPrompt("")
+      const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
       expect(prompt).toContain("changed: exact edit/write/patch evidence exists")
       expect(prompt).toContain("relevant/explored: read/search/reference only")
       expect(prompt).toContain("Durable file observations are hints about relevance, not modification proof")
@@ -68,7 +68,7 @@ describe("Shared continuation-preservation contract (§5)", () => {
 
   describe("Exact-detail rule (§5.5)", () => {
     it("allows short exact excerpts when paraphrase would impair continuation", () => {
-      const prompt = buildCompactionPrompt("")
+      const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
       expect(prompt).toContain("Do not reproduce large source files, patches, logs, or tool output")
       expect(prompt).toContain("Preserve a short exact excerpt, signature, command, config value, error string, version, regex, identifier, or other syntax")
       expect(prompt).toContain("only when paraphrasing it would materially impair continuation")
@@ -77,7 +77,7 @@ describe("Shared continuation-preservation contract (§5)", () => {
 
   describe("Conflict rule (§5.6)", () => {
     it("preserves disagreement between durable memory and current-session evidence", () => {
-      const prompt = buildCompactionPrompt("")
+      const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
       expect(prompt).toContain("do not silently choose one")
       expect(prompt).toContain("preserve the disagreement")
       expect(prompt).toContain("identify the durable side as prior recorded state")
@@ -86,13 +86,13 @@ describe("Shared continuation-preservation contract (§5)", () => {
     })
 
     it("includes example conflict output", () => {
-      const prompt = buildCompactionPrompt("")
+      const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
       expect(prompt).toContain("Conflict: durable decision says SQLite; current session is migrating toward PostgreSQL")
       expect(prompt).toContain("migration status is current evidence and the conflict remains unresolved pending confirmation")
     })
 
     it("protects human-reviewed foundational authority under PR 3", () => {
-      const prompt = buildCompactionPrompt("")
+      const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
       expect(prompt).toContain("Human-reviewed foundational authority remains authority under PR 3")
       expect(prompt).toContain("a git mismatch or casual automation text does not silently supersede it")
     })
@@ -174,7 +174,7 @@ describe("Replacement-mode prompt contract (§7)", () => {
 
 describe("Repeated-compaction anti-drift contract (§9)", () => {
   it("includes explicit shared anti-drift wording", () => {
-    const prompt = buildCompactionPrompt("")
+    const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
     expect(prompt).toContain("Any still-applicable user constraint, settled decision, unresolved blocker, rejected approach, verification state, exact critical detail, or pending action present in the prior continuation summary must survive the next summary")
     expect(prompt).toContain("unless later conversation explicitly superseded, resolved, disproved, or completed it")
     expect(prompt).toContain("Omission from recent turns is not resolution")
@@ -182,7 +182,7 @@ describe("Repeated-compaction anti-drift contract (§9)", () => {
 
   describe("Precedence rules", () => {
     it("defines correct semantic precedence order", () => {
-      const prompt = buildCompactionPrompt("")
+      const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
       expect(prompt).toContain("explicit later user instruction / explicit verified resolution")
       expect(prompt).toContain("current-session direct evidence")
       expect(prompt).toContain("prior continuation summary")
@@ -190,7 +190,7 @@ describe("Repeated-compaction anti-drift contract (§9)", () => {
     })
 
     it("protects trusted human-reviewed foundational decision as exception", () => {
-      const prompt = buildCompactionPrompt("")
+      const prompt = buildCompactionPrompt({ durableContext: "", previousSummary: "" })
       expect(prompt).toContain("trusted human-reviewed foundational decision")
       expect(prompt).toContain("remains protected by PR 3")
       expect(prompt).toContain("If current-session automation appears to conflict with it, preserve the conflict instead of silently demoting the human authority")

@@ -94,3 +94,28 @@ decisions, and validation results; do not rewrite prior entries.
   green.
 - Wave 2 exit: **complete**. Production changes are ready for one coherent
   commit before Wave 3.
+
+## 2026-08-11 — Wave 3 validation
+
+- Integrated the shared preservation contract and typed augment/replacement
+  prompt builders in `src/compaction/prompt.ts`.
+- Preserved the legacy string prompt API for existing PR-1–6 tests while the
+  new contract fixtures use the typed object API. This is a compatibility
+  overload, not a second production behavior path; Wave 7 may remove it only
+  after the full regression chain proves it is safe.
+- Corrected exact contract wording for terse continuation, previous-summary
+  data/anchor labeling, and current-evidence update instructions. Assertions
+  were not weakened.
+- Focused command:
+  `npm test -- test/compaction/prompt.test.ts test/compaction/prompt-contract.test.ts test/compaction/anti-drift.fixture.test.ts`
+  result: **3 test files passed, 56 tests passed**.
+- `npx tsc --noEmit`: **passed**.
+- `npm run typecheck:host-contract`: **passed**.
+- Full `npm test -- --reporter=dot`: **2 test files failed, 41 passed; 23
+  tests failed, 722 passed**. The only remaining failures are the intended
+  Wave-4 durable-rendering tests and the Wave-4 sanitizer module load.
+- During full-suite regression, Wave-2 snapshot behavior was corrected so
+  augment snapshots contain the durable payload and mocked/empty durable
+  builders fail safely. That correction is isolated in follow-up commit
+  `faa1118`.
+- Wave 3 exit: **complete**. Proceed to Wave 4 durable rendering hardening.
