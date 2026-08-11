@@ -727,3 +727,264 @@ describe("PR 5 Wave 3 — pre-PR5 v3 STATE loads unchanged", () => {
     expect(result!.processed_sources[0]?.source_key).toBe("v2s:" + "a".repeat(64))
   })
 })
+
+// ─── PR 6 Wave 1 — pre-v3 broad cache quarantine preserves STATE ─────────────
+// When a pre-v3 STATE carries a broad cache payload (full ExtractedFacts with
+// current_task, active_files, blockers, next_steps), it must be quarantined
+// or dropped while the semantic STATE fields remain readable.
+describe("PR 6 Wave 1 — pre-v3 cache quarantine preserves STATE", () => {
+  it("drops a broad pre-v3 cache payload while preserving all semantic STATE fields", () => {
+    const broadCacheEntry = {
+      cache_key: "source:input:provider/model",
+      source_session_id: "source-session",
+      canonical_input_sha256: "a".repeat(64),
+      provider_id: "provider",
+      model_id: "model",
+      completed_at: "2026-08-08T12:00:00.000Z",
+      // No provenance → not evidence-backed → must be quarantined
+      facts: {
+        current_task: "Broad task from cache — must not leak to STATE",
+        active_files: [{ path: "src/broad.ts", reason: "edited" }],
+        decisions: [
+          { topic: "cache-dec", decision: "Use cache-only DB" },
+        ],
+        blockers: ["cache-blocker"],
+        next_steps: ["cache-step"],
+      },
+    }
+    const v2State = {
+      version: 2,
+      project_path: "/test/project",
+      last_updated: "2026-08-08T12:00:00.000Z",
+      active_files: [{ path: "src/real.ts", reason: "edited", last_touched: "2026-08-08T12:00:00.000Z" }],
+      decisions: [{
+        id: "d-real",
+        topic: "storage",
+        decision: "Use Postgres",
+        timestamp: "2026-08-08T12:00:00.000Z",
+        session_id: "real-session",
+      }],
+      blockers: ["real-blocker"],
+      next_steps: ["real-step"],
+      recent_sessions: ["real-session"],
+      llm_extraction_cache: [broadCacheEntry],
+    }
+
+    const result = loadAndMigrate(v2State)
+    expect(result).not.toBeNull()
+    // Cache is quarantined/dropped
+    expect(result!.llm_extraction_cache).toBeUndefined()
+    expect(result!.llm_extraction_cache_quarantine).toEqual({
+      count: 1,
+      reason: "missing-evidence-backed-provenance",
+    })
+    // Semantic STATE fields remain intact — quarantine must not corrupt them
+    expect(result!.decisions).toHaveLength(1)
+    expect(result!.decisions[0]!.topic).toBe("storage")
+    expect(result!.decisions[0]!.decision).toBe("Use Postgres")
+    expect(result!.active_files).toHaveLength(1)
+    expect(result!.active_files[0]!.path).toBe("src/real.ts")
+    expect(result!.blockers).toEqual(["real-blocker"])
+    expect(result!.next_steps).toEqual(["real-step"])
+  })
+
+  it("mix of evidence-backed and unproven v2 cache entries: unproven dropped, valid retained, STATE untouched", () => {
+    const validEntry = {
+      cache_key: "source:valid:provider/model",
+      source_session_id: "valid-session",
+      canonical_input_sha256: "b".repeat(64),
+      provider_id: "provider",
+      model_id: "model",
+      completed_at: "2026-08-08T12:00:00.000Z",
+      provenance: {
+        extractor: "llm" as const,
+        source_session_id: "valid-session",
+        source_audit_session_id: "audit-session",
+        confidence: "llm-corroborated" as const,
+        evidence: [{ kind: "transcript" as const, ref: "tr-valid", digest: "a".repeat(64) }],
+      },
+      facts: {
+        current_task: null,
+        active_files: [],
+        decisions: [{ topic: "storage", decision: "Use Postgres", evidence_refs: ["tr-valid"] }],
+        blockers: [],
+        next_steps: [],
+      },
+    }
+    const unprovenEntry = {
+      cache_key: "source:unproven:provider/model",
+      source_session_id: "bad-session",
+      canonical_input_sha256: "c".repeat(64),
+      provider_id: "provider",
+      model_id: "model",
+      completed_at: "2026-08-08T12:00:00.000Z",
+      // No provenance → not evidence-backed → must be quarantined
+      facts: {
+        current_task: "Should be dropped",
+        active_files: [],
+        decisions: [],
+        blockers: [],
+        next_steps: [],
+      },
+    }
+    const v2State = {
+      version: 2,
+      project_path: "/test/project",
+      last_updated: "2026-08-08T12:00:00.000Z",
+      active_files: [],
+      decisions: [],
+      blockers: ["semantic-blocker"],
+      next_steps: ["semantic-step"],
+      recent_sessions: [],
+      llm_extraction_cache: [validEntry, unprovenEntry],
+    }
+
+    const result = loadAndMigrate(v2State)
+    expect(result).not.toBeNull()
+    // Unproven dropped, evidence-backed retained
+    expect(result!.llm_extraction_cache).toHaveLength(1)
+    expect(result!.llm_extraction_cache![0]!.provenance?.source_audit_session_id).toBe("audit-session")
+    expect(result!.llm_extraction_cache_quarantine).toEqual({
+      count: 1,
+      reason: "missing-evidence-backed-provenance",
+    })
+    // STATE untouched
+    expect(result!.blockers).toEqual(["semantic-blocker"])
+    expect(result!.next_steps).toEqual(["semantic-step"])
+  })
+})
+
+// ─── PR 6 Wave 1 — incomplete LLM trust claim downgrade ──────────────────────
+// When a v3 STATE carries a decision with LLM provenance that is missing
+// source_audit_session_id or evidence, it is an incomplete trust claim.
+// PR-6 says loadAndMigrate must downgrade such claims to legacy without
+// changing the semantic decision identity or authority.
+// These tests currently FAIL because no LLM-claim repair exists yet.
+describe("PR 6 Wave 1 — incomplete LLM trust claim downgrade", () => {
+  function incompleteLLMClaim(id: string, session: string, topic: string, decision: string) {
+    return {
+      id,
+      topic,
+      decision,
+      rationale: "LLM-generated claim",
+      timestamp: "2026-08-01T00:00:00.000Z",
+      session_id: session,
+      still_valid: true,
+      foundational: false,
+      foundational_requested: false,
+      provenance: {
+        extractor: "llm",
+        source_session_id: session,
+        // Deliberately missing source_audit_session_id — incomplete LLM claim
+        confidence: "llm-corroborated",
+        evidence: [], // Deliberately empty — incomplete LLM claim
+      },
+    }
+  }
+
+  function v3StateWith(decisions: unknown[]): Record<string, unknown> {
+    return {
+      version: 3,
+      project_path: "/test/project",
+      last_updated: "2026-08-08T12:00:00.000Z",
+      last_git_sha: "abc123",
+      last_session_id: "session-v3",
+      active_files: [],
+      decisions,
+      blockers: [],
+      next_steps: [],
+      recent_sessions: [],
+    }
+  }
+
+  it("incomplete LLM provenance (no source_audit_session_id, no evidence) is downgraded to legacy", () => {
+    const result = loadAndMigrate(v3StateWith([
+      incompleteLLMClaim("d-llm", "sess-llm", "database", "Use Postgres"),
+    ]))
+
+    expect(result).not.toBeNull()
+    const d = result!.decisions[0]!
+    // PR-6 contract: incomplete LLM trust claims are downgraded to legacy
+    // without changing semantic decision identity/authority.
+    // Currently NOT enforced by loadAndMigrate — this test FAILS to
+    // document the gap.
+    expect(d.provenance?.extractor).toBe("legacy")
+    expect(d.provenance?.confidence).toBe("legacy")
+    // Semantic identity preserved
+    expect(d.id).toBe("d-llm")
+    expect(d.topic).toBe("database")
+    expect(d.decision).toBe("Use Postgres")
+    expect(d.session_id).toBe("sess-llm")
+  })
+
+  it("LLM provenance with evidence but no source_audit_session_id is downgraded to legacy", () => {
+    const claim = {
+      ...incompleteLLMClaim("d-llm2", "sess-llm2", "auth", "Use JWT"),
+      provenance: {
+        extractor: "llm" as const,
+        source_session_id: "sess-llm2",
+        // Missing source_audit_session_id
+        confidence: "llm-corroborated" as const,
+        evidence: [{ kind: "transcript" as const, ref: "tr-1", digest: "a".repeat(64) }],
+      },
+    }
+
+    const result = loadAndMigrate(v3StateWith([claim]))
+    expect(result).not.toBeNull()
+    const d = result!.decisions[0]!
+    // Still incomplete — missing audit session
+    expect(d.provenance?.extractor).toBe("legacy")
+    expect(d.provenance?.confidence).toBe("legacy")
+    expect(d.id).toBe("d-llm2")
+    expect(d.decision).toBe("Use JWT")
+    // Evidence array should be preserved (it's valid transcript evidence,
+    // just not backed by an audit session)
+    expect(d.provenance?.evidence).toHaveLength(1)
+    expect(d.provenance?.evidence[0]?.ref).toBe("tr-1")
+  })
+
+  it("LLM provenance with source_audit_session_id but no evidence is downgraded to legacy", () => {
+    const claim = {
+      ...incompleteLLMClaim("d-llm3", "sess-llm3", "testing", "Use Vitest"),
+      provenance: {
+        extractor: "llm" as const,
+        source_session_id: "sess-llm3",
+        source_audit_session_id: "audit-1",
+        confidence: "llm-corroborated" as const,
+        evidence: [], // Empty — incomplete
+      },
+    }
+
+    const result = loadAndMigrate(v3StateWith([claim]))
+    expect(result).not.toBeNull()
+    const d = result!.decisions[0]!
+    expect(d.provenance?.extractor).toBe("legacy")
+    expect(d.provenance?.confidence).toBe("legacy")
+    expect(d.id).toBe("d-llm3")
+    expect(d.decision).toBe("Use Vitest")
+  })
+
+  it("complete LLM provenance (audit session + evidence) is NOT downgraded — passes through intact", () => {
+    const claim = {
+      ...incompleteLLMClaim("d-llm-ok", "sess-llm-ok", "framework", "Use Express"),
+      provenance: {
+        extractor: "llm" as const,
+        source_session_id: "sess-llm-ok",
+        source_audit_session_id: "audit-ok",
+        confidence: "llm-corroborated" as const,
+        evidence: [{ kind: "transcript" as const, ref: "tr-ok", digest: "a".repeat(64) }],
+      },
+    }
+
+    const result = loadAndMigrate(v3StateWith([claim]))
+    expect(result).not.toBeNull()
+    const d = result!.decisions[0]!
+    // Complete LLM provenance is valid and passes through untouched
+    expect(d.provenance?.extractor).toBe("llm")
+    expect(d.provenance?.confidence).toBe("llm-corroborated")
+    expect(d.provenance?.source_audit_session_id).toBe("audit-ok")
+    expect(d.provenance?.evidence).toHaveLength(1)
+    expect(d.id).toBe("d-llm-ok")
+    expect(d.decision).toBe("Use Express")
+  })
+})

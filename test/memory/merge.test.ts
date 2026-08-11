@@ -39,6 +39,41 @@ function makeExtracted(overrides: Partial<ExtractedFacts> = {}): ExtractedFacts 
 }
 
 describe("mergeMemory", () => {
+  it("LLM decisions-only merge does not alter other top-level fields", () => {
+    const existing = {
+      ...emptyMemory("/test"),
+      current_task: "Existing task",
+      active_files: [{ path: "src/main.ts", reason: "edit", last_touched: "2026-08-01T00:00:00Z" }],
+      blockers: ["blocker1"],
+      next_steps: ["step1"],
+      decisions: [],
+    };
+    const extracted = {
+      ...makeExtracted({ decisions: [{ topic: "db", decision: "Use MySQL" }] }),
+    };
+    const meta = {
+      sessionId: "session-1",
+      gitSha: "abc123",
+      timestamp: new Date().toISOString(),
+      origin: "llm" as const,
+      auditSessionID: "audit-1",
+      evidenceCandidates: {
+        "tr-1": {
+          kind: "transcript",
+          ref: "tr-1",
+          digest: "a".repeat(64),
+          text: "dummy transcript",
+          role: "assistant",
+        },
+      },
+    };
+    const result = mergeMemory(existing, extracted, meta);
+    expect(result.current_task).toBe(existing.current_task);
+    expect(result.active_files).toEqual(existing.active_files);
+    expect(result.blockers).toEqual(existing.blockers);
+    expect(result.next_steps).toEqual(existing.next_steps);
+    expect(result.decisions).toHaveLength(1);
+  });
   it("exact topic match (not substring): 'auth' does NOT supersede 'authentication'", () => {
     const existing = {
       ...emptyMemory("/test"),
@@ -705,5 +740,141 @@ describe("PR 3 wave-9 — durable human conflict quarantine", () => {
     expect(merged[0]!.provenance?.extractor).toBe("llm")
     expect(merged[0]!.provenance?.confidence).toBe("llm-corroborated")
     expect(merged[0]!.provenance?.source_audit_session_id).toBe("audit-1")
+  })
+})
+
+// ─── PR 6 Wave 1 — LLM decisions-only trust boundary ─────────────────────────
+// The PR-6 trust boundary says the LLM path in mergeMemory is decisions-only:
+// it must not mutate current_task, active_files, blockers, or next_steps.
+// These tests document the boundary. Tests that fail against current production
+// code reveal where the boundary is not yet enforced.
+describe("PR 6 Wave 1 — LLM decisions-only trust boundary", () => {
+  const llmMeta = {
+    ...meta,
+    origin: "llm" as const,
+    auditSessionID: "audit-1",
+    evidenceCandidates: {
+      "tr-1": {
+        kind: "transcript" as const,
+        ref: "tr-1",
+        digest: "a".repeat(64),
+        text: "dummy transcript",
+        role: "assistant",
+      },
+    },
+  }
+
+  it("LLM merge cannot mutate current_task when extracted task is non-null and existing has heuristic provenance", () => {
+    const existing = {
+      ...emptyMemory("/test"),
+      current_task: "Existing heuristic task",
+      current_task_provenance: {
+        extractor: "heuristic" as const,
+        source_session_id: "session-heuristic",
+        confidence: "heuristic" as const,
+        evidence: [],
+      },
+    }
+    const extracted = makeExtracted({
+      current_task: "LLM-injected task override",
+      decisions: [{ topic: "db", decision: "Use Postgres" }],
+    })
+    const result = mergeMemory(existing, extracted, llmMeta)
+    // PR-6: LLM decisions-only merge must not overwrite an existing heuristic task
+    expect(result.current_task).toBe("Existing heuristic task")
+    expect(result.current_task_provenance?.extractor).toBe("heuristic")
+  })
+
+  it("LLM merge appends active_files but never replaces or erases existing files", () => {
+    const existing = {
+      ...emptyMemory("/test"),
+      active_files: [
+        { path: "src/main.ts", reason: "entry point", last_touched: "2026-08-01T00:00:00Z" },
+      ],
+    }
+    const extracted = makeExtracted({
+      active_files: [{ path: "src/llm-file.ts", reason: "LLM claim" }],
+      decisions: [{ topic: "db", decision: "Use Postgres" }],
+    })
+    const result = mergeMemory(existing, extracted, llmMeta)
+    // PR-6: LLM can only add new files, never replace or erase existing
+    expect(result.active_files).toHaveLength(2)
+    expect(result.active_files.some(f => f.path === "src/main.ts")).toBe(true)
+  })
+
+  it("LLM merge cannot mutate blockers — existing blockers must survive an LLM pass", () => {
+    const existing = {
+      ...emptyMemory("/test"),
+      blockers: ["Existing blocker: awaiting review"],
+    }
+    const extracted = makeExtracted({
+      blockers: ["LLM-injected blocker"],
+      decisions: [{ topic: "db", decision: "Use Postgres" }],
+    })
+    const result = mergeMemory(existing, extracted, llmMeta)
+    // PR-6 boundary: LLM decisions-only merge must never overwrite blockers.
+    // This currently FAILS because mergeMemory unconditionally sets
+    // `blockers: extracted.blockers` regardless of origin.
+    expect(result.blockers).toEqual(["Existing blocker: awaiting review"])
+  })
+
+  it("LLM merge cannot mutate next_steps — existing next_steps must survive an LLM pass", () => {
+    const existing = {
+      ...emptyMemory("/test"),
+      next_steps: ["Existing step: run integration tests"],
+    }
+    const extracted = makeExtracted({
+      next_steps: ["LLM-injected next step"],
+      decisions: [{ topic: "db", decision: "Use Postgres" }],
+    })
+    const result = mergeMemory(existing, extracted, llmMeta)
+    // PR-6 boundary: LLM decisions-only merge must never overwrite next_steps.
+    // This currently FAILS because mergeMemory unconditionally sets
+    // `next_steps: extracted.next_steps` regardless of origin.
+    expect(result.next_steps).toEqual(["Existing step: run integration tests"])
+  })
+})
+
+// ─── PR 6 Wave 1 — extractor/confidence pairing ──────────────────────────────
+describe("PR 6 Wave 1 — extractor/confidence pairing", () => {
+  const llmMeta = {
+    ...meta,
+    origin: "llm" as const,
+    auditSessionID: "audit-1",
+    evidenceCandidates: {
+      "tr-1": {
+        kind: "transcript" as const,
+        ref: "tr-1",
+        digest: "a".repeat(64),
+        text: "dummy transcript",
+        role: "assistant",
+      },
+    },
+  }
+
+  it("heuristic origin produces extractor=heuristic + confidence=heuristic, no audit session", () => {
+    const existing = emptyMemory("/test")
+    const extracted = makeExtracted({
+      decisions: [{ topic: "db", decision: "Use Postgres" }],
+    })
+    const result = mergeMemory(existing, extracted, meta)
+    const provenance = result.decisions[0]?.provenance
+    expect(provenance?.extractor).toBe("heuristic")
+    expect(provenance?.confidence).toBe("heuristic")
+    expect(provenance?.source_audit_session_id).toBeUndefined()
+  })
+
+  it("LLM origin produces extractor=llm + confidence=llm-corroborated with audit session ID and 1-3 transcript evidence", () => {
+    const existing = emptyMemory("/test")
+    const extracted = makeExtracted({
+      decisions: [{ topic: "db", decision: "Use Postgres", evidence_refs: ["tr-1"] } as never],
+    })
+    const result = mergeMemory(existing, extracted, llmMeta)
+    const provenance = result.decisions[0]?.provenance
+    expect(provenance?.extractor).toBe("llm")
+    expect(provenance?.confidence).toBe("llm-corroborated")
+    expect(provenance?.source_audit_session_id).toBe("audit-1")
+    expect(provenance?.evidence.length).toBeGreaterThanOrEqual(1)
+    expect(provenance?.evidence.length).toBeLessThanOrEqual(3)
   })
 })

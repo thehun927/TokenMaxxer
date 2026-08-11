@@ -6,6 +6,7 @@ import {
   ExtractedFactsSchema,
   validateStructuredResult,
 } from "../../src/memory/extract-schema"
+import * as extractSchema from "../../src/memory/extract-schema"
 import {
   buildCanonicalInput,
   buildTranscriptEvidenceCandidateMap,
@@ -305,6 +306,100 @@ describe("extraction cache identity and prompt", () => {
     for (const field of ExtractedFactsJsonSchema.required) {
       expect(prompt).toContain(`- ${field}:`)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PR 6 §Wave 1 — contract-freeze tests (§18.B items 1-7)
+// ---------------------------------------------------------------------------
+describe("PR 6 §Wave 1 — extraction contract v3", () => {
+  type V3SchemaModule = typeof extractSchema & {
+    LLMDecisionFactsJsonSchema: {
+      required: string[]
+      properties: { decisions: { maxItems: number; items: { required: string[] } } }
+    }
+    validateLLMDecisionResult: (value: unknown) => unknown
+  }
+
+  const v3 = extractSchema as V3SchemaModule
+  const validateV3 = (value: unknown) => {
+    expect(v3.validateLLMDecisionResult).toBeTypeOf("function")
+    return v3.validateLLMDecisionResult(value)
+  }
+
+  const validDecision = {
+    topic: "database",
+    decision: "Use Postgres",
+    rationale: "The transcript explicitly selected it.",
+    evidence_refs: ["tr-evidence"],
+  }
+
+  it("bumps EXTRACTION_CONTRACT_VERSION to 3", () => {
+    expect(prompt.EXTRACTION_CONTRACT_VERSION).toBe(3)
+  })
+
+  it("accepts decisions-only empty output and one valid evidence-backed decision", () => {
+    expect(validateV3({ decisions: [] })).toEqual({ decisions: [] })
+    expect(validateV3({ decisions: [validDecision] })).toEqual({ decisions: [validDecision] })
+
+    expect(v3.LLMDecisionFactsJsonSchema.required).toEqual(["decisions"])
+    expect(v3.LLMDecisionFactsJsonSchema.properties.decisions.maxItems).toBe(10)
+    expect(v3.LLMDecisionFactsJsonSchema.properties.decisions.items.required).toEqual([
+      "topic",
+      "decision",
+      "evidence_refs",
+    ])
+  })
+
+  it.each([
+    ["missing evidence_refs", { topic: "database", decision: "Use Postgres" }],
+    ["empty evidence_refs", { ...validDecision, evidence_refs: [] }],
+    ["duplicate evidence_refs", { ...validDecision, evidence_refs: ["tr-a", "tr-a"] }],
+    ["more than three evidence_refs", { ...validDecision, evidence_refs: ["tr-a", "tr-b", "tr-c", "tr-d"] }],
+  ])("rejects %s", (_name, decision) => {
+    expect(validateV3({ decisions: [decision] })).toBeNull()
+  })
+
+  it.each([
+    ["empty topic", { ...validDecision, topic: "" }],
+    ["oversized topic", { ...validDecision, topic: "a".repeat(257) }],
+    ["empty decision", { ...validDecision, decision: " " }],
+    ["oversized decision", { ...validDecision, decision: "a".repeat(501) }],
+    ["empty rationale", { ...validDecision, rationale: "" }],
+    ["oversized rationale", { ...validDecision, rationale: "a".repeat(501) }],
+  ])("rejects bounded-field violation: %s", (_name, decision) => {
+    expect(validateV3({ decisions: [decision] })).toBeNull()
+  })
+
+  it("rejects more than ten decisions", () => {
+    const decisions = Array.from({ length: 11 }, (_, index) => ({
+      ...validDecision,
+      topic: `topic-${index}`,
+      evidence_refs: [`tr-${index}`],
+    }))
+    expect(validateV3({ decisions })).toBeNull()
+  })
+
+  it.each([
+    "foundational",
+    "foundational_requested",
+    "current_task",
+    "active_files",
+    "blockers",
+    "next_steps",
+    "unknown_field",
+  ])(
+    "rejects forbidden top-level field: %s",
+    (field) => {
+      const value = field === "foundational" ? true : field === "unknown_field" ? "unexpected" : []
+      expect(validateV3({ decisions: [], [field]: value })).toBeNull()
+    },
+  )
+
+  it("rejects foundational on a structured decision", () => {
+    expect(validateV3({
+      decisions: [{ ...validDecision, foundational: true }],
+    })).toBeNull()
   })
 })
 

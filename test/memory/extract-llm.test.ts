@@ -14,9 +14,11 @@ import {
   parseSmallModel,
   readExtractionCache,
   resetRetainedExtractionSessionIDs,
+  resolveEvidenceReferences,
   upsertExtractionCache,
 } from "../../src/memory/extract-llm"
 import { buildCanonicalInput } from "../../src/memory/extract-prompt"
+import * as prompt from "../../src/memory/extract-prompt"
 import { emptyMemory } from "../../src/memory/schema"
 import { writeMemory } from "../../src/memory/store"
 import type { MemoryFile } from "../../src/memory/schema"
@@ -617,5 +619,76 @@ describe("v1 structured extraction", () => {
       enabled: false,
       reason: "model inventory request failed",
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PR 6 §Wave 1 — contract-freeze tests at the LLM/evidence seam
+// ---------------------------------------------------------------------------
+describe("PR 6 §Wave 1 — decisions-only LLM extraction", () => {
+  const decisionsOnly = {
+    decisions: [{
+      topic: "transport",
+      decision: "Use SDK v2",
+      rationale: "The source transcript selected the SDK transport.",
+      evidence_refs: ["tr-source-evidence"],
+    }],
+  }
+
+  it("uses extraction contract version 3", () => {
+    expect(prompt.EXTRACTION_CONTRACT_VERSION).toBe(3)
+  })
+
+  it("accepts one decisions-only result when its evidence is a transcript candidate", () => {
+    expect(corroborateLLMFacts(
+      decisionsOnly as unknown as Parameters<typeof corroborateLLMFacts>[0],
+      evidenceOptions,
+    )).toEqual(decisionsOnly)
+    expect(resolveEvidenceReferences(["tr-source-evidence"], evidenceOptions)).toEqual({
+      evidence: [{
+        kind: "transcript",
+        ref: "tr-source-evidence",
+        digest: "a".repeat(64),
+      }],
+    })
+  })
+
+  it("rejects a heuristic-candidate as LLM evidence", () => {
+    const heuristic = {
+      "heuristic-candidate": {
+        kind: "heuristic-candidate" as const,
+        ref: "heuristic-candidate",
+        digest: "b".repeat(64),
+      },
+    }
+    expect(resolveEvidenceReferences(["heuristic-candidate"], {
+      evidenceCandidateMap: heuristic,
+      evidenceDigestMap: { "heuristic-candidate": "b".repeat(64) },
+    })).toEqual({ evidence: [], reason: "invalid-candidate" })
+    expect(corroborateLLMFacts({
+      decisions: [{ ...decisionsOnly.decisions[0], evidence_refs: ["heuristic-candidate"] }],
+    } as unknown as Parameters<typeof corroborateLLMFacts>[0], {
+      evidenceCandidateMap: heuristic,
+      evidenceDigestMap: { "heuristic-candidate": "b".repeat(64) },
+    })).toBeNull()
+  })
+
+  it("passes decisions-only structured output through the extraction request", async () => {
+    const promptRequest = vi.fn(async () => ({ data: { info: { structured: decisionsOnly } } }))
+    const client = {
+      session: {
+        create: vi.fn(async () => ({ data: { id: "audit-v3" } })),
+        prompt: promptRequest,
+      },
+    }
+
+    await expect(extractFactsLLM(
+      canonical(),
+      "source-v3",
+      "project",
+      client,
+      { enabled: true, model: { providerID: "provider", modelID: "model" } },
+      { directory: "/worktree", ...evidenceOptions },
+    )).resolves.toEqual({ status: "success", facts: decisionsOnly })
   })
 })

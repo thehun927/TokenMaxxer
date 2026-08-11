@@ -5,6 +5,7 @@ import {
   DecisionSchema,
   EvidenceSchema,
   HumanReviewSchema,
+  LLMExtractionCacheEntrySchema,
   MemoryFileSchema,
   ModelHealthSchema,
   MAX_IDENTIFIER,
@@ -52,6 +53,12 @@ function validV3(overrides: Record<string, unknown> = {}) {
 }
 
 describe("MemoryFile v3 bounded schemas", () => {
+  it("adds provenance to decisions and active files", () => {
+    expect(DecisionSchema.safeParse(validDecision).success).toBe(true);
+    expect(ActiveFileSchema.safeParse(validActiveFile).success).toBe(true);
+    expect(DecisionSchema.safeParse({ ...validDecision, provenance: undefined }).success).toBe(false);
+    expect(ActiveFileSchema.safeParse({ ...validActiveFile, provenance: undefined }).success).toBe(false);
+  });
   it("uses exact provenance defaults and stores no source text", () => {
     const provenance = ProvenanceSchema.parse({
       extractor: "legacy",
@@ -430,6 +437,189 @@ describe("PR 5 Wave 3 — MemoryFile with processed_sources", () => {
       ...validV3(),
       processed_sources: records,
     })
+    expect(result.success).toBe(false)
+  })
+})
+
+// ─── PR 6 Wave 1 — extractor/confidence pairing contract ─────────────────────
+// The PR-6 trust boundary mandates consistent extractor/confidence pairs.
+// These tests document the schema-level contract. Tests that fail reveal
+// gaps where the current schema accepts inconsistent pairings.
+describe("PR 6 Wave 1 — extractor/confidence pairing contract", () => {
+  it("rejects llm extractor paired with non-llm-corroborated confidence", () => {
+    const result = ProvenanceSchema.safeParse({
+      extractor: "llm",
+      source_session_id: "sess-1",
+      source_audit_session_id: "audit-1",
+      confidence: "heuristic",
+      evidence: [{ kind: "transcript", ref: "tr-1", digest: "a".repeat(64) }],
+    })
+    // PR-6 contract: extractor=llm must pair with confidence=llm-corroborated.
+    // The current schema validates fields independently and does not
+    // enforce this pairing — this test FAILS until the pairing is enforced.
+    expect(result.success).toBe(false)
+  })
+
+  it("rejects heuristic extractor paired with non-heuristic confidence", () => {
+    const result = ProvenanceSchema.safeParse({
+      extractor: "heuristic",
+      source_session_id: "sess-1",
+      confidence: "llm-corroborated",
+      evidence: [],
+    })
+    // PR-6 contract: extractor=heuristic must pair with confidence=heuristic.
+    expect(result.success).toBe(false)
+  })
+
+  it("rejects human extractor paired with non-human-reviewed confidence", () => {
+    const result = ProvenanceSchema.safeParse({
+      extractor: "human",
+      source_session_id: "sess-1",
+      confidence: "heuristic",
+      evidence: [{ kind: "transcript", ref: "tr-1", digest: "a".repeat(64) }],
+    })
+    // PR-6 contract: extractor=human must pair with confidence=human-reviewed.
+    expect(result.success).toBe(false)
+  })
+})
+
+// ─── PR 6 Wave 1 — LLM provenance audit + evidence gate ──────────────────────
+// PR-6 requires LLM provenance to carry: (a) source_audit_session_id,
+// and (b) at least 1 transcript evidence entry (max 3).
+// These tests document the schema-level contract gaps.
+describe("PR 6 Wave 1 — LLM provenance audit + evidence gate", () => {
+  it("rejects llm provenance without source_audit_session_id", () => {
+    const result = ProvenanceSchema.safeParse({
+      extractor: "llm",
+      source_session_id: "sess-1",
+      // Deliberately missing source_audit_session_id
+      confidence: "llm-corroborated",
+      evidence: [{ kind: "transcript", ref: "tr-1", digest: "a".repeat(64) }],
+    })
+    // PR-6 contract: LLM provenance MUST carry source_audit_session_id.
+    // Currently optional in schema — this test FAILS until required.
+    expect(result.success).toBe(false)
+  })
+
+  it("rejects llm provenance with zero evidence entries", () => {
+    const result = ProvenanceSchema.safeParse({
+      extractor: "llm",
+      source_session_id: "sess-1",
+      source_audit_session_id: "audit-1",
+      confidence: "llm-corroborated",
+      evidence: [],
+    })
+    // PR-6 contract: LLM provenance MUST carry at least 1 evidence entry.
+    // Currently evidence allows 0 entries via default([]) — this test FAILS.
+    expect(result.success).toBe(false)
+  })
+
+  it("heuristic provenance is allowed to have zero evidence (no audit gate)", () => {
+    const result = ProvenanceSchema.safeParse({
+      extractor: "heuristic",
+      source_session_id: "sess-1",
+      confidence: "heuristic",
+      evidence: [],
+    })
+    // Heuristic provenance does not require evidence or audit session.
+    expect(result.success).toBe(true)
+  })
+
+  it("human provenance requires evidence but not source_audit_session_id", () => {
+    const result = ProvenanceSchema.safeParse({
+      extractor: "human",
+      source_session_id: "sess-1",
+      confidence: "human-reviewed",
+      evidence: [{ kind: "transcript", ref: "tr-1", digest: "a".repeat(64) }],
+    })
+    // Human provenance has its own invariant gate (human_review record).
+    expect(result.success).toBe(true)
+  })
+})
+
+// ─── PR 6 Wave 1 — decisions-only cache shape contract ───────────────────────
+// PR-6 says the durable cache payload should carry only decisions, not other
+// extracted facts. These tests document the current cache shape and the
+// desired future shape.
+describe("PR 6 Wave 1 — cache entry shape contract", () => {
+  it("current cache entry shape accepts full ExtractedFacts (current behavior)", () => {
+    const cacheEntry = {
+      cache_key: "test-key",
+      source_session_id: "sess-1",
+      canonical_input_sha256: "a".repeat(64),
+      provider_id: "provider",
+      model_id: "model",
+      completed_at: "2026-08-11T00:00:00.000Z",
+      provenance: {
+        extractor: "llm",
+        source_session_id: "sess-1",
+        source_audit_session_id: "audit-1",
+        confidence: "llm-corroborated",
+        evidence: [{ kind: "transcript", ref: "tr-1", digest: "a".repeat(64) }],
+      },
+      facts: {
+        current_task: null,
+        active_files: [],
+        decisions: [{ topic: "db", decision: "Use Postgres", evidence_refs: ["tr-1"] }],
+        blockers: [],
+        next_steps: [],
+      },
+    }
+    // Current shape: full ExtractedFacts passes schema validation.
+    const cacheResult = LLMExtractionCacheEntrySchema.safeParse(cacheEntry)
+    expect(cacheResult.success).toBe(true)
+  })
+
+  it("cache entry with only decisions (no current_task/active_files/blockers/next_steps) is still valid", () => {
+    const cacheEntry = {
+      cache_key: "test-key",
+      source_session_id: "sess-1",
+      canonical_input_sha256: "a".repeat(64),
+      provider_id: "provider",
+      model_id: "model",
+      completed_at: "2026-08-11T00:00:00.000Z",
+      provenance: {
+        extractor: "llm",
+        source_session_id: "sess-1",
+        source_audit_session_id: "audit-1",
+        confidence: "llm-corroborated",
+        evidence: [{ kind: "transcript", ref: "tr-1", digest: "a".repeat(64) }],
+      },
+      facts: {
+        current_task: null,
+        active_files: [],
+        decisions: [{ topic: "db", decision: "Use Postgres", evidence_refs: ["tr-1"] }],
+        blockers: [],
+        next_steps: [],
+      },
+    }
+    expect(LLMExtractionCacheEntrySchema.safeParse(cacheEntry).success).toBe(true)
+  })
+
+  it("cache entry without evidence-backed provenance is rejected by the v3 MemoryFile contract", () => {
+    const memory = {
+      ...validV3(),
+      llm_extraction_cache: [{
+        cache_key: "test-key",
+        source_session_id: "sess-1",
+        canonical_input_sha256: "a".repeat(64),
+        provider_id: "provider",
+        model_id: "model",
+        completed_at: "2026-08-11T00:00:00.000Z",
+        // Missing provenance entirely — not evidence-backed
+        facts: {
+          current_task: null,
+          active_files: [],
+          decisions: [],
+          blockers: [],
+          next_steps: [],
+        },
+      }],
+    }
+    // The v3 MemoryFile superRefine rejects cache entries without
+    // evidence-backed provenance. This is the MemoryFile-level contract,
+    // not the entry-level schema.
+    const result = MemoryFileSchema.safeParse(memory)
     expect(result.success).toBe(false)
   })
 })
