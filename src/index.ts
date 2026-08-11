@@ -11,7 +11,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 
 import { loadOptions } from "./config"
-import { buildCompactionPrompt } from "./compaction/prompt"
+import { buildCompactionAugmentation, buildCompactionPrompt } from "./compaction/prompt"
 import { buildDurableBlock } from "./compaction/durable"
 import { readPreviousCompactionSummary } from "./compaction/history"
 import { writeMemoryOnIdle } from "./memory/writer"
@@ -97,7 +97,7 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
             fallbackReason = historyResult.reason
 
             // Fallback to augment: append context, leave prompt unset
-            output.context.push(durable)
+            output.context.push(buildCompactionAugmentation(durable))
             // output.prompt remains undefined (native augmentation)
           }
 
@@ -106,7 +106,7 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
         } else {
           // Augment mode (default): append context, leave prompt unset
           // Preserve pre-existing context entries
-          output.context.push(durable)
+          output.context.push(buildCompactionAugmentation(durable))
           // output.prompt remains undefined (native augmentation)
         }
 

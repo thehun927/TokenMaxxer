@@ -173,3 +173,25 @@ decisions, and validation results; do not rewrite prior entries.
   passed**.
 - Wave 5 exit: **complete**. Replacement repeated-compaction recovery and
   invocation-level safe fallback are implemented; proceed to Wave 6.
+
+## 2026-08-11 — Wave 6 validation
+
+- Added `test/compaction/integration.test.ts` with two-generation fixtures for
+  augment and replace paths, omission-not-resolution, explicit supersession,
+  durable/current-session conflicts, human foundational authority, and the
+  actual `{ data }` history API.
+- Integration review found a production seam gap: augment mode had a typed
+  `buildCompactionAugmentation()` builder but appended only raw durable data.
+  Both ordinary augment and replacement-history-unavailable fallback now append
+  the augmentation contract while leaving `output.prompt` unset.
+- Corrected the initial Wave-6 fixture’s malformed duplicate transcript block
+  and strengthened it to assert the actual anti-drift instruction content.
+- Focused command:
+  `npx vitest run test/compaction/integration.test.ts test/compaction/history.test.ts test/compaction/prompt-contract.test.ts test/index.test.ts`
+  result: **4 test files passed, 80 tests passed**.
+- `npx tsc --noEmit`: **passed**.
+- `npm run typecheck:host-contract`: **passed**.
+- Full `npm test -- --reporter=dot`: **46 test files passed, 833 tests
+  passed**.
+- Wave 6 exit: **complete**. The repeated-compaction information path is
+  demonstrably intact in both modes; proceed to Wave 7 diagnostic seam cleanup.
