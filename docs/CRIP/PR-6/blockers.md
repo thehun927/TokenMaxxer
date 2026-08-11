@@ -70,3 +70,17 @@ Append-only implementation log for PR 6. Do not delete or rewrite prior entries.
 - [expected-downstream] `writer-llm.test.ts` had 44 passed and 3 failed; all
   remaining failures are Wave 5 cache/provenance behavior (cache persistence,
   v2 legacy cache identity expectation, and model-gating/cache integration).
+
+## 2026-08-11 — Wave 5 decisions-only cache and compatibility
+
+- [implementation] Cache entries now carry decisions-only LLM facts, current v3
+  identity/provenance gates, and no trusted heuristic non-decision fields.
+- [implementation] Pre-v3 broad cache payloads are quarantined while semantic
+  STATE remains readable; incomplete LLM decision claims downgrade trust to
+  legacy without deleting their semantic decision/evidence content.
+- [verification] `npx tsc --noEmit` passed; cache/migration/schema/writer focused
+  validation passed: 189 tests, 5 skipped.
+- [verification] `npm test` passed: 38 files, 627 tests, 5 skipped.
+- [gated] The five skipped schema tests are the Wave 6 provenance pairing and
+  audit/evidence-gate cases. They remain explicit skips pending Wave 6 and are
+  not counted as green contract coverage.

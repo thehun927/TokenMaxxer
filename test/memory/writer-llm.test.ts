@@ -380,12 +380,13 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
     const messages = sourceMessages()
     const prior = emptyMemory(worktree)
     const model = { providerID: "provider", modelID: "model" }
+    // Wave 5: Cache stores only decisions, not full ExtractedFacts
     const cachedFacts = {
-      current_task: "Cached task",
-      active_files: [],
-      decisions: [],
-      blockers: [],
-      next_steps: ["Cached next step"],
+      decisions: [{
+        topic: "cached-decision",
+        decision: "Use cached DB",
+        evidence_refs: [makeTranscriptEvidenceRef("m1")],
+      }],
     }
     const cachedEvidenceRef = makeTranscriptEvidenceRef("m1")
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[cachedEvidenceRef]!
@@ -395,12 +396,12 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
     const sourceVersionKey = makeSourceVersionKey({
       sourceSessionID: "source-cache",
       sourceInputSha256: sourceInput.sourceInputSha256,
-      extractionContractVersion: 2,
+      extractionContractVersion: 3,
     })
     const canonicalInput = buildCanonicalInput(messages, prior)
     const extractionKey = makeExtractionCacheKey({
       sourceVersionKey,
-      extractionContractVersion: 2,
+      extractionContractVersion: 3,
       model,
     })
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
@@ -417,7 +418,7 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
       sourceVersionKey,
       sourceInputSha256: sourceInput.sourceInputSha256,
       promptInputSha256: canonicalInput.promptInputSha256,
-      extractionContractVersion: 2,
+      extractionContractVersion: 3,
       modelVariant: undefined,
     })]
     await writeMemory({ worktree, directory: worktree }, prior)
@@ -447,7 +448,6 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
     expect(create).toHaveBeenCalledTimes(1)
     expect(prompt).not.toHaveBeenCalled()
     expect(memory?.current_task).toContain("Implement the extraction")
-    expect(memory?.current_task).not.toBe("Cached task")
     expect(memory?.revision).toBe(1)
     expect(memory?.current_task_provenance?.confidence).toBe("heuristic")
     expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
@@ -614,11 +614,7 @@ function llmFacts(overrides: Partial<Record<string, unknown>> = {}) {
 
 function legacyLLMFacts(overrides: Partial<Record<string, unknown>> = {}) {
   return {
-    current_task: "Cached task",
-    active_files: [],
     decisions: [],
-    blockers: [],
-    next_steps: [],
     ...overrides,
   }
 }
@@ -726,14 +722,21 @@ describe("Wave 4 deferred — cache-hit transaction is inside the lock", () => {
     const prior = emptyMemory(project)
     const messages = sourceMessages()
     const model = { providerID: "provider", modelID: "model" }
-    const cachedFacts = legacyLLMFacts({ current_task: "Cached task" })
+    // Wave 5: Cache stores only decisions
+    const cachedFacts = {
+      decisions: [{
+        topic: "cached-decision",
+        decision: "Use cached DB",
+        evidence_refs: [makeTranscriptEvidenceRef("m1")],
+      }],
+    }
     const cachedEvidenceRef = makeTranscriptEvidenceRef("m1")
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[cachedEvidenceRef]!
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
       sourceSessionID: "source-cache",
       canonicalInput: buildCanonicalInput(messages, prior),
       model,
-      facts: cachedFacts as never,
+      facts: cachedFacts,
       auditSessionID: "audit-cache",
       evidence: [{ kind: "transcript", ref: cachedEvidenceRef, digest: cachedEvidence.digest }],
     })]
@@ -745,7 +748,7 @@ describe("Wave 4 deferred — cache-hit transaction is inside the lock", () => {
 
     const result = await mergeAsyncFacts(
       { client: {}, worktree, directory: worktree, sessionId: "source-cache" },
-      cachedFacts as never,
+      cachedFacts,
       null,
       "source-cache",
       { origin: "llm", auditSessionID: "audit-cache", evidenceCandidates: {} },
@@ -772,14 +775,21 @@ describe("Wave 4 deferred — final-LLM transaction reads cache identity under t
     prior.revision = 1
     const cacheKey = "cache-key-identity"
     // Seed cache entry X at revision 1.
-    const cachedFactsX = legacyLLMFacts({ current_task: "task-X" })
+    // Wave 5: Cache stores only decisions
+    const cachedFactsX = {
+      decisions: [{
+        topic: "task-x",
+        decision: "Use X DB",
+        evidence_refs: [makeTranscriptEvidenceRef("m1")],
+      }],
+    }
     const cachedEvidenceRef = makeTranscriptEvidenceRef("m1")
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[cachedEvidenceRef]!
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
       sourceSessionID: "source-X",
       canonicalInput: buildCanonicalInput(messages, prior),
       model,
-      facts: cachedFactsX as never,
+      facts: cachedFactsX,
       auditSessionID: "audit-X",
       evidence: [{ kind: "transcript", ref: cachedEvidenceRef, digest: cachedEvidence.digest }],
       sourceVersionKey: "v2s:" + "x".repeat(64),
@@ -803,14 +813,20 @@ describe("Wave 4 deferred — final-LLM transaction reads cache identity under t
     })
 
     // Now create cache entry Y with different facts
-    const cachedFactsY = legacyLLMFacts({ current_task: "task-Y" })
+    const cachedFactsY = {
+      decisions: [{
+        topic: "task-y",
+        decision: "Use Y DB",
+        evidence_refs: [makeTranscriptEvidenceRef("m1")],
+      }],
+    }
     const priorY = emptyMemory(project)
     priorY.revision = 5
     priorY.llm_extraction_cache = [makeExtractionCacheEntry({
       sourceSessionID: "source-Y",
       canonicalInput: buildCanonicalInput(messages, priorY),
       model,
-      facts: cachedFactsY as never,
+      facts: cachedFactsY,
       auditSessionID: "audit-Y",
       evidence: [{ kind: "transcript", ref: cachedEvidenceRef, digest: cachedEvidence.digest }],
       sourceVersionKey: "v2s:" + "x".repeat(64),
@@ -840,7 +856,13 @@ describe("Wave 4 deferred — final-LLM transaction reads cache identity under t
         canonicalInput: buildCanonicalInput(messages, priorY),
         selectedModel: model,
         selectedCacheKey: cacheKey,
-        llmFacts: legacyLLMFacts({ current_task: "task-final" }) as never,
+        llmFacts: {
+          decisions: [{
+            topic: "task-final",
+            decision: "Use Final DB",
+            evidence_refs: [makeTranscriptEvidenceRef("m1")],
+          }],
+        },
         extractionAuditSessionID: "audit-final",
         candidates: transcriptCandidates,
         digests,
@@ -1257,16 +1279,13 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
     const model = { providerID: "provider", modelID: "model" }
 
     // Seed a cache entry for the same source
+    // Wave 5: Cache stores only decisions
     const cachedFacts = {
-      current_task: "Cached task",
-      active_files: [],
       decisions: [{
         topic: "transport",
         decision: "Use SDK v2",
         evidence_refs: [evidenceRef],
       }],
-      blockers: [],
-      next_steps: [],
     }
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[evidenceRef]!
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
@@ -1325,16 +1344,13 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
     const model = { providerID: "provider", modelID: "model" }
 
     // Seed a cache entry for the same source
+    // Wave 5: Cache stores only decisions
     const cachedFacts = {
-      current_task: "Cached task",
-      active_files: [],
       decisions: [{
         topic: "transport",
         decision: "Use SDK v2",
         evidence_refs: [evidenceRef],
       }],
-      blockers: [],
-      next_steps: [],
     }
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[evidenceRef]!
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
@@ -1394,16 +1410,13 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
     const model = { providerID: "provider", modelID: "model" }
 
     // Seed a cache entry for the same source
+    // Wave 5: Cache stores only decisions
     const cachedFacts = {
-      current_task: "Cached task",
-      active_files: [],
       decisions: [{
         topic: "transport",
         decision: "Use SDK v2",
         evidence_refs: [evidenceRef],
       }],
-      blockers: [],
-      next_steps: [],
     }
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[evidenceRef]!
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
@@ -1463,16 +1476,13 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
     const model = { providerID: "provider", modelID: "model" }
 
     // Seed a cache entry for the same source
+    // Wave 5: Cache stores only decisions
     const cachedFacts = {
-      current_task: "Cached task",
-      active_files: [],
       decisions: [{
         topic: "transport",
         decision: "Use SDK v2",
         evidence_refs: [evidenceRef],
       }],
-      blockers: [],
-      next_steps: [],
     }
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[evidenceRef]!
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
@@ -1535,16 +1545,13 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
     const model = { providerID: "provider", modelID: "model" }
 
     // Seed a cache entry for the same source
+    // Wave 5: Cache stores only decisions
     const cachedFacts = {
-      current_task: "Cached task",
-      active_files: [],
       decisions: [{
         topic: "transport",
         decision: "Use SDK v2",
         evidence_refs: [evidenceRef],
       }],
-      blockers: [],
-      next_steps: [],
     }
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[evidenceRef]!
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
@@ -1632,16 +1639,17 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
     }]
     const cachedEvidenceRef = makeTranscriptEvidenceRef("m1")
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[cachedEvidenceRef]!
+    // Wave 5: Cache stores only decisions
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
       sourceSessionID: sessionId,
       canonicalInput: buildCanonicalInput(messages, prior),
       model: { providerID: "provider", modelID: "model" },
       facts: {
-        current_task: "REPLAYED CACHE FACT",
-        active_files: [],
-        decisions: [],
-        blockers: [],
-        next_steps: [],
+        decisions: [{
+          topic: "cached-decision",
+          decision: "Use cached DB",
+          evidence_refs: [cachedEvidenceRef],
+        }],
       },
       auditSessionID: "audit-replay",
       evidence: [{ kind: "transcript", ref: cachedEvidenceRef, digest: cachedEvidence.digest }],
@@ -2436,16 +2444,17 @@ describe("PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation", () => {
       // This is a complete, current-contract cache row. It is intentionally
       // not accompanied by processed_sources, which is the only completion
       // proof accepted by finalLLMMerge.
+      // Wave 5: Cache stores only decisions, not full ExtractedFacts
       prior.llm_extraction_cache = [makeExtractionCacheEntry({
         sourceSessionID: sessionId,
         canonicalInput: prepared.canonicalInput,
         model,
         facts: {
-          current_task: "STALE CACHE TASK",
-          active_files: [],
-          decisions: [],
-          blockers: [],
-          next_steps: ["stale cache step"],
+          decisions: [{
+            topic: "stale-decision",
+            decision: "Use stale DB",
+            evidence_refs: [evidenceRef],
+          }],
         },
         auditSessionID: "audit-stale",
         evidence: [{ kind: "transcript", ref: evidenceRef, digest: evidence.digest }],
@@ -2458,11 +2467,11 @@ describe("PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation", () => {
       await writeMemory({ worktree, directory: worktree }, prior)
 
       const freshFacts = {
-        current_task: "FRESH ACCEPTED TASK",
-        active_files: [],
-        decisions: [],
-        blockers: ["fresh blocker"],
-        next_steps: ["fresh accepted step"],
+        decisions: [{
+          topic: "fresh-decision",
+          decision: "Use Postgres",
+          evidence_refs: [evidenceRef],
+        }],
       }
       const result = await finalLLMMerge(
         { client: {}, worktree, directory: worktree },
@@ -2487,14 +2496,12 @@ describe("PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation", () => {
       // Wave 4 decisions-only merge: non-decision fields remain the base state.
       // The base state (prior) has current_task undefined from emptyMemory.
       expect(result.value.memory.current_task).toBeUndefined()
-      expect(result.value.memory.current_task).not.toBe("STALE CACHE TASK")
       expect(result.value.memory.blockers).toEqual([])
       expect(result.value.memory.next_steps).toEqual([])
       // Fresh accepted facts win; stale cache payload is not replayed.
-      // No new cache entry is created (freshFacts has no decisions), so the stale
-      // cache entry remains unchanged.
-      expect(result.value.memory.llm_extraction_cache?.[0]?.facts.current_task)
-        .toBe("STALE CACHE TASK")
+      // Wave 5: Cache entry only contains decisions, not full ExtractedFacts
+      expect(result.value.memory.llm_extraction_cache?.[0]?.facts.decisions).toHaveLength(1)
+      expect(result.value.memory.llm_extraction_cache?.[0]?.facts.decisions[0]?.topic).toBe("stale-decision")
       expect(result.value.memory.processed_sources).toContainEqual(expect.objectContaining({
         source_key: prepared.sourceVersionKey,
         extraction_key: selectedCacheKey,
@@ -2583,15 +2590,11 @@ describe("PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation", () => {
         data: {
           info: {
             structured: {
-              current_task: "B3 healthy model task",
-              active_files: [],
               decisions: [{
                 topic: "provider selection",
                 decision: "Use healthy model B",
                 evidence_refs: [makeTranscriptEvidenceRef("m2")],
               }],
-              blockers: [],
-              next_steps: [],
             },
           },
         },
@@ -2669,7 +2672,7 @@ describe("PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation", () => {
       const modelB = { providerID: "provider-b", modelID: "model-b", variant: "none" }
       const expectedCacheKey = makeExtractionCacheKey({
         sourceVersionKey: prepared.sourceVersionKey,
-        extractionContractVersion: 2,
+        extractionContractVersion: 3,
         model: modelB,
       })
       const cache = memory?.llm_extraction_cache?.find((entry) => entry.cache_key === expectedCacheKey)
@@ -2678,7 +2681,7 @@ describe("PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation", () => {
         source_key: prepared.sourceVersionKey,
         source_input_sha256: prepared.sourceInputSha256,
         prompt_input_sha256: prepared.promptInputSha256,
-        extraction_contract_version: 2,
+        extraction_contract_version: 3,
         provider_id: "provider-b",
         model_id: "model-b",
         model_variant: "none",
@@ -2696,7 +2699,7 @@ describe("PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation", () => {
       expect(memory?.processed_sources).toContainEqual(expect.objectContaining({
         source_key: prepared.sourceVersionKey,
         extraction_key: expectedCacheKey,
-        extraction_contract_version: 2,
+        extraction_contract_version: 3,
       }))
     })
   })

@@ -336,6 +336,39 @@ function migrateV2ToV3(data: RawRecord): RawRecord {
 }
 
 /**
+ * PR 6 Wave 5 — downgrade incomplete LLM trust claims to legacy.
+ * An LLM decision with incomplete provenance (missing source_audit_session_id
+ * or empty evidence) is not evidence-backed and must be downgraded to legacy
+ * to maintain the v3 trust invariant.
+ */
+function repairIncompleteLLMClaims(decisions: unknown[]): unknown[] {
+  return decisions.map((value) => {
+    if (!isRecord(value)) return value
+    const provenance = isRecord(value.provenance) ? value.provenance : undefined
+
+    // Check if this is an LLM claim that needs repair
+    const isLLMClaim = provenance?.extractor === "llm" && provenance?.confidence === "llm-corroborated"
+    if (!isLLMClaim) return value
+
+    // Check if provenance is complete (has audit session + evidence)
+    const hasAuditSession = typeof provenance.source_audit_session_id === "string" && provenance.source_audit_session_id.length > 0
+    const hasEvidence = Array.isArray(provenance.evidence) && provenance.evidence.length > 0
+
+    if (hasAuditSession && hasEvidence) return value // Complete - no repair needed
+
+    // Incomplete LLM claim - downgrade to legacy
+    return {
+      ...value,
+      provenance: {
+        ...provenance,
+        extractor: "legacy",
+        confidence: "legacy",
+      },
+    }
+  })
+}
+
+/**
  * Load a raw parsed JSON value and migrate it to the current MemoryFile schema.
  * Returns null for invalid/corrupt data, unknown versions, or missing version.
  * No filesystem operation is performed on either success or failure.
@@ -375,6 +408,15 @@ export function loadAndMigrate(raw: unknown): MemoryFile | null {
     data = {
       ...data,
       decisions: repairDuplicateDecisionIds(data.decisions),
+    }
+  }
+
+  // PR 6 Wave 5 — repair incomplete LLM trust claims before v3 validation
+  // so they validate cleanly as legacy provenance.
+  if (Array.isArray(data.decisions)) {
+    data = {
+      ...data,
+      decisions: repairIncompleteLLMClaims(data.decisions),
     }
   }
 

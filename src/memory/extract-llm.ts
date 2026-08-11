@@ -9,7 +9,6 @@ import {
   validateLLMDecisionResult,
   type LLMDecisionFacts,
 } from "./extract-schema"
-import type { ExtractedFacts } from "../types"
 import {
   LLMExtractionCacheEntrySchema,
   type AuditTerminalOutcome,
@@ -1239,21 +1238,21 @@ export function readExtractionCacheEntry(
   return null
 }
 
-/** Return validated facts for a cache key, or null for a stale/malformed entry. */
+/** Return validated decisions-only facts for a cache key, or null for a stale/malformed entry. */
 export function readExtractionCache(
   memory: Pick<MemoryFile, "llm_extraction_cache"> | null | undefined,
   cacheKey: string,
   options?: CacheEvidenceOptions,
-): ExtractedFacts | null {
+): LLMDecisionFacts | null {
   return readExtractionCacheEntry(memory, cacheKey, options)?.facts ?? null
 }
 
-/** Build a validated cache entry for a successful extraction. */
+/** Build a validated cache entry for a successful extraction. Wave 5: facts are decisions-only. */
 export function makeExtractionCacheEntry(args: {
   sourceSessionID: string
   canonicalInput: CanonicalExtractionInput
   model: SmallModel
-  facts: ExtractedFacts
+  facts: LLMDecisionFacts
   auditSessionID?: string
   evidence?: Evidence[]
   provenance?: LLMExtractionCacheEntry["provenance"]

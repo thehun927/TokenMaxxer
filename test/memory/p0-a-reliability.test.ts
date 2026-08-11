@@ -15,7 +15,7 @@ import {
   LLM_REQUEST_TIMEOUT_MS,
 } from "../../src/memory/extract-llm"
 import { resetHostStructuredContractGate } from "../../src/memory/llm-adapter"
-import { buildCanonicalInput } from "../../src/memory/extract-prompt"
+import { buildCanonicalInput, makeTranscriptEvidenceRef } from "../../src/memory/extract-prompt"
 import { resetProjectQueues } from "../../src/memory/lock"
 import { MEMORY_MAX_BYTES, memorySizeBytes } from "../../src/memory/memory-size"
 import type { TranscriptMessage } from "../../src/types"
@@ -53,19 +53,25 @@ function clientFor(
     session: {
       messages: vi.fn(async ({ path }: { path: { id: string } }) => ({ data: sessionMap[path.id] })),
       create,
-      prompt: vi.fn(async () => ({
-        data: {
-          info: {
-            structured: {
-              current_task: null,
-              active_files: [],
-              decisions: [],
-              blockers: [],
-              next_steps: [],
+      prompt: vi.fn(async (args: unknown) => {
+        const serialized = JSON.stringify(args)
+        const sessionID = Object.keys(sessionMap).find((id) => (
+          serialized.includes(`Implement ${id} extraction.`)
+        )) ?? Object.keys(sessionMap)[0]!
+        return {
+          data: {
+            info: {
+              structured: {
+                decisions: [{
+                  topic: "queue",
+                  decision: "Use a bounded queue",
+                  evidence_refs: [makeTranscriptEvidenceRef(`${sessionID}-assistant`)],
+                }],
+              },
             },
           },
-        },
-      })),
+        }
+      }),
     },
   }
 }

@@ -789,6 +789,7 @@ export async function finalLLMMerge(
       })
 
       // Wave 5 §10.4: Optionally store result-cache payload when safe
+      // Wave 5: Cache stores only decisions, not full ExtractedFacts
       const decisionEvidence = [
         ...effectiveFacts.decisions.flatMap((decision) => candidateEvidence(
           (decision as { evidence_refs?: unknown }).evidence_refs,
@@ -806,9 +807,8 @@ export async function finalLLMMerge(
               sourceSessionID: args.sessionId,
               canonicalInput: args.canonicalInput,
               model: args.selectedModel,
-              // Wave 5 owns the legacy cache payload repair; this cast does not
-              // re-enter the semantic merge boundary.
-              facts: effectiveFacts as unknown as ExtractedFacts,
+              // Wave 5: Store decisions-only facts in cache payload
+              facts: { decisions: effectiveFacts.decisions },
               auditSessionID: effectiveAuditSessionID,
               evidence: cacheEvidence,
               completedAt: timestamp,
@@ -2166,11 +2166,7 @@ export function pruneOld(
     llm_extraction_cache: mem.llm_extraction_cache?.map((entry) => ({
       ...entry,
       facts: {
-        ...entry.facts,
-        active_files: entry.facts.active_files.map((file) => ({ ...file })),
         decisions: entry.facts.decisions.map((decision) => ({ ...decision })),
-        blockers: [...entry.facts.blockers],
-        next_steps: [...entry.facts.next_steps],
       },
     })),
     llm_extraction_audits: mem.llm_extraction_audits

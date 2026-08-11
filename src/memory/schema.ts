@@ -6,8 +6,8 @@
  * schema.
  */
 import { z } from "zod"
-import { ExtractedFactsSchema } from "./extract-schema"
-import type { ExtractedFacts as LegacyExtractedFacts } from "../types"
+import { LLMDecisionFactsSchema } from "./extract-schema"
+export { LLMDecisionFactsSchema } from "./extract-schema"
 
 export const MAX_IDENTIFIER = 256
 const MAX_REFERENCE = 128
@@ -162,6 +162,12 @@ export const ProcessedSourceSchema = z.object({
 }).strict()
 export type ProcessedSource = z.infer<typeof ProcessedSourceSchema>
 
+/**
+ * Decisions-only LLM facts for cache payload (Wave 5).
+ * The cache stores only decisions, not full heuristic ExtractedFacts.
+ * Non-decision fields (current_task, active_files, blockers, next_steps) are
+ * derived from base state on cache hit, not replayed from cache.
+ */
 /** A successful structured extraction that can be reused for the same input. */
 export const LLMExtractionCacheEntrySchema = z.object({
   cache_key: z.string(),
@@ -172,7 +178,8 @@ export const LLMExtractionCacheEntrySchema = z.object({
   completed_at: z.string().datetime({ offset: true }).or(z.string()),
   /** Required for an evidence-backed v3 cache hit; optional for construction by the pre-v3 writer. */
   provenance: ProvenanceSchema.optional(),
-  facts: ExtractedFactsSchema,
+  /** Wave 5: decisions-only facts payload; never full heuristic ExtractedFacts. */
+  facts: LLMDecisionFactsSchema,
   /** PR 5 Wave 3: optional source identity fields for backward compatibility. */
   source_key: z.string().optional(),
   source_input_sha256: z.string().optional(),
@@ -181,13 +188,10 @@ export const LLMExtractionCacheEntrySchema = z.object({
   model_variant: z.string().optional(),
 })
 /**
- * Keep the exported construction type compatible with the pre-v3 extractor
- * while the disk schema validates the newer structured-facts shape.
+ * Wave 5: Cache entry facts type is decisions-only LLM facts.
+ * The type alias maintains compatibility with the extraction contract.
  */
-export type LLMExtractionCacheEntry = Omit<
-  z.infer<typeof LLMExtractionCacheEntrySchema>,
-  "facts"
-> & { facts: LegacyExtractedFacts }
+export type LLMExtractionCacheEntry = z.infer<typeof LLMExtractionCacheEntrySchema>
 
 /**
  * Bounded durable guard information for a retained extraction session.

@@ -124,7 +124,7 @@ describe("loadAndMigrate", () => {
     expect(readExtractionCache(result, "one")).toBeNull()
   })
 
-  it("retains a v2 cache row only when its provenance is evidence-backed", () => {
+  it("quarantines a broad v2 cache row even when its provenance is evidence-backed", () => {
     const retained = {
       cache_key: "source:input:provider/model",
       source_session_id: "source-session",
@@ -168,9 +168,11 @@ describe("loadAndMigrate", () => {
     })
 
     expect(result).not.toBeNull()
-    expect(result!.llm_extraction_cache).toHaveLength(1)
-    expect(result!.llm_extraction_cache![0]!.provenance).toEqual(retained.provenance)
-    expect(result!.llm_extraction_cache_quarantine).toBeUndefined()
+    expect(result!.llm_extraction_cache).toBeUndefined()
+    expect(result!.llm_extraction_cache_quarantine).toEqual({
+      count: 1,
+      reason: "missing-evidence-backed-provenance",
+    })
   })
 
   it("returns null for null input", () => {
@@ -363,7 +365,7 @@ describe("PR 3 wave-9 — duplicate decision-ID repair", () => {
     source_session_id: source,
     source_audit_session_id: `audit-${source}`,
     confidence: "llm-corroborated" as const,
-    evidence: [] as never[],
+    evidence: [{ kind: "transcript" as const, ref: `tr-${source}`, digest: "a".repeat(64) }],
   })
 
   function v3StateWith(decisions: unknown[]): Record<string, unknown> {
@@ -514,7 +516,7 @@ describe("PR 3 wave-10 — deterministic duplicate-ID repair", () => {
     source_session_id: source,
     source_audit_session_id: `audit-${source}`,
     confidence: "llm-corroborated" as const,
-    evidence: [] as never[],
+    evidence: [{ kind: "transcript" as const, ref: `tr-${source}`, digest: "a".repeat(64) }],
   })
   const humanProvision = {
     extractor: "human" as const,
@@ -788,7 +790,7 @@ describe("PR 6 Wave 1 — pre-v3 cache quarantine preserves STATE", () => {
     expect(result!.next_steps).toEqual(["real-step"])
   })
 
-  it("mix of evidence-backed and unproven v2 cache entries: unproven dropped, valid retained, STATE untouched", () => {
+  it("mix of broad v2 cache entries: all dropped while STATE remains untouched", () => {
     const validEntry = {
       cache_key: "source:valid:provider/model",
       source_session_id: "valid-session",
@@ -841,11 +843,10 @@ describe("PR 6 Wave 1 — pre-v3 cache quarantine preserves STATE", () => {
 
     const result = loadAndMigrate(v2State)
     expect(result).not.toBeNull()
-    // Unproven dropped, evidence-backed retained
-    expect(result!.llm_extraction_cache).toHaveLength(1)
-    expect(result!.llm_extraction_cache![0]!.provenance?.source_audit_session_id).toBe("audit-session")
+    // v2 cache payloads are broad and cannot be retained under the decisions-only contract.
+    expect(result!.llm_extraction_cache).toBeUndefined()
     expect(result!.llm_extraction_cache_quarantine).toEqual({
-      count: 1,
+      count: 2,
       reason: "missing-evidence-backed-provenance",
     })
     // STATE untouched

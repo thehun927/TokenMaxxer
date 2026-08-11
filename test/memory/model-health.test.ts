@@ -144,13 +144,7 @@ describe("local model health circuit breaker", () => {
     const prior = healthMemory(worktree)
     const ref = makeTranscriptEvidenceRef("health-message")
     const candidate = buildTranscriptEvidenceCandidateMap(source)[ref]!
-    const facts = {
-      current_task: "Cached health result",
-      active_files: [],
-      decisions: [],
-      blockers: [],
-      next_steps: [],
-    }
+    const facts = { decisions: [] }
     const model = { providerID: "provider", modelID: "model" }
     // Wave 5: Compute source identity so the cache key matches what the
     // writer computes at runtime (v2e format with full identity).
