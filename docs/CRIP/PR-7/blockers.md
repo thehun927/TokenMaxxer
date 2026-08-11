@@ -72,3 +72,25 @@ decisions, and validation results; do not rewrite prior entries.
   Wave-1 hook/config assertions.
 - Wave 1 exit: **complete**. Production implementation remains intentionally
   untouched; proceed to Wave 2 only after this test-freeze commit.
+
+## 2026-08-11 — Wave 2 validation
+
+- Integrated Wave 2 production changes in `src/types.ts`, `src/config.ts`, and
+  `src/index.ts`. Scope remained limited to explicit mode configuration,
+  native augmentation routing, and hook metadata.
+- Review correction: an explicitly invalid new mode now fails closed to
+  `augment` even when the legacy flag requests replacement; this is covered by
+  an added config contract test.
+- Review correction: compaction logs and `last_compaction.log` now record
+  `requested_mode`, `effective_mode`, and `kind` metadata as required by §11.
+- `npm test -- test/compaction/config.test.ts`: **passed, 13 tests**.
+- `npm test -- test/index.test.ts -t "PR 7 Wave 1"`: **passed, 5 tests;
+  6 skipped**.
+- `npx tsc --noEmit`: **passed**.
+- `npm run typecheck:host-contract`: **passed**.
+- Full `npm test -- --reporter=dot`: **5 test files failed, 38 passed; 74
+  tests failed, 671 passed**. Remaining failures are the intentionally
+  unfrozen Wave 3/4/5/6/7 contracts; Wave-2-owned config and hook tests are
+  green.
+- Wave 2 exit: **complete**. Production changes are ready for one coherent
+  commit before Wave 3.

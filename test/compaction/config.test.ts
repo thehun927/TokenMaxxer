@@ -89,6 +89,13 @@ describe("loadOptions — PR 7 Wave 1 config contract", () => {
       const options = loadOptions({} as unknown)
       expect(options.compactionMode).toBe("augment")
     })
+
+    it("invalid new mode cannot silently opt into legacy replacement", () => {
+      process.env.TOKENMAXXER_COMPACTION_MODE = "invalid-mode"
+      process.env.TOKENMAXXER_NO_PROMPT = "0"
+      const options = loadOptions({} as unknown)
+      expect(options.compactionMode).toBe("augment")
+    })
   })
 
   describe("§14.A.8 — Augment appends context and leaves output.prompt unset", () => {

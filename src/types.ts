@@ -28,8 +28,8 @@ export type ExtractedFacts = HeuristicFacts
 
 /** Plugin options (read from env vars) */
 export interface TokenmaxxerOptions {
-  /** Kill switch for compaction prompt replacement. false = inject durable block via context only. */
-  compactionPrompt: boolean
+  /** Compaction mode: "augment" (default) or "replace" */
+  compactionMode: "augment" | "replace"
 }
 
 /** A session transcript message as returned by client.session.messages() */

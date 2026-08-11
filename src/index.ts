@@ -57,19 +57,32 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
     "experimental.session.compacting": async (input: CompactionInput, output: CompactionOutput) => {
       try {
         const durable = await buildDurableBlock({ worktree, directory, client })
+        const requestedMode = process.env.TOKENMAXXER_COMPACTION_MODE
+          ?? (process.env.TOKENMAXXER_NO_PROMPT === "1"
+            ? "augment"
+            : process.env.TOKENMAXXER_NO_PROMPT === "0"
+              ? "replace"
+              : "unset")
 
-        if (options.compactionPrompt) {
+        // PR 7 Wave 2: Use compactionMode instead of compactionPrompt
+        if (options.compactionMode === "replace") {
+          // Replace mode: set prompt, preserve unrelated context
           output.prompt = buildCompactionPrompt(durable)
+          // Preserve pre-existing context entries (do not erase)
+          // output.context already contains any pre-existing entries
         } else {
-          // Kill switch: inject durable block via context, keep default prompt
+          // Augment mode (default): append context, leave prompt unset
+          // Preserve pre-existing context entries
           output.context.push(durable)
+          // output.prompt remains undefined (native augmentation)
         }
 
         setLastCompaction(new Date().toISOString())
 
         await log(client, "info", "compaction hook fired", {
           session: input.sessionID,
-          promptReplaced: options.compactionPrompt,
+          requested_mode: requestedMode,
+          effective_mode: options.compactionMode,
           durableLength: durable.length,
         })
 
@@ -78,7 +91,16 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
         // newest compaction payload visible to diagnostics.
         try {
           const logPath = join(project, ".opencode", "memory", "last_compaction.log")
-          const snapshot = `[${new Date().toISOString()}] session=${input.sessionID}\n${output.prompt ?? "(durable via context)"}\n---\n`
+          const snapshot = [
+            `timestamp=${new Date().toISOString()}`,
+            `session=${input.sessionID}`,
+            `requested_mode=${requestedMode}`,
+            `effective_mode=${options.compactionMode}`,
+            `kind=${options.compactionMode === "replace" ? "replacement-prompt" : "context-augmentation"}`,
+            output.prompt ?? "(durable via context)",
+            "---",
+            "",
+          ].join("\n")
           await atomicWrite(logPath, snapshot)
         } catch {
           // Non-fatal
