@@ -11,6 +11,7 @@
  * the installed package are already exactly `1.18.15`).
  */
 import { describe, expect, it } from "vitest"
+import { execSync } from "node:child_process"
 import { readFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -42,4 +43,31 @@ describe("PR 4 §12 F / §11 — package metadata contract", () => {
     )
     expect(pluginPkg.version).toBe("1.18.15")
   })
+})
+
+describe("PR 4 §10 / §12 F cases 43-44 — host-contract compile fixture in CI", () => {
+  it("compiles the minimum-host contract fixture (tsconfig.host-contract.json)", () => {
+    // The dedicated compile fixture (test/host-contract/typecheck.ts) proves the
+    // real v1.18.15 ToolContext does not expose/require `client`. It lives in
+    // its own tsconfig because the normal tsconfig excludes tests. This Vitest
+    // test spawns the same `tsc -p ... --noEmit` as `typecheck:host-contract`,
+    // so the release invariant is enforced on every `npm test` CI run even if
+    // the workflow edit cannot be pushed.
+    let output = ""
+    let exitCode = 0
+    try {
+      output = execSync("npx tsc -p tsconfig.host-contract.json --noEmit", {
+        encoding: "utf-8",
+        cwd: process.cwd(),
+        timeout: 120_000,
+      }).toString()
+    } catch (e) {
+      const err = e as { status?: number; stdout?: string; stderr?: string }
+      exitCode = err.status ?? 1
+      output = `${err.stdout ?? ""}${err.stderr ?? ""}`
+    }
+    if (exitCode !== 0) {
+      throw new Error(`host-contract typecheck failed (exit ${exitCode}):\n${output}`)
+    }
+  }, 130_000)
 })

@@ -31,6 +31,9 @@ jobs:
       - name: Type-check TypeScript
         run: npx tsc --noEmit
 
+      - name: Verify host contract (peer range + minimum package + fixture)
+        run: npm run verify:host-contract
+
       - name: Build distribution
         run: npm run build
 

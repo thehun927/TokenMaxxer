@@ -39,7 +39,10 @@ export async function _previewCompaction(
       client,
     })
   } catch (e) {
-    return `Error previewing compaction: ${String(e)}`
+    // Non-blocking concern B (oracle wave-9): a pathological thrown value must
+    // not produce an unbounded model-visible preview error. Route it through
+    // the same sanitizer used by head_files so the output stays bounded.
+    return `Error previewing compaction: ${boundedHostError(e)}`
   }
 }
 
@@ -95,13 +98,36 @@ export function formatHeadFilesOutput(sections: HeadFileSection[]): string {
   return result
 }
 
+/**
+ * Sanitize an arbitrary thrown value into a short deterministic `name/message`
+ * string (oracle wave-9, Blocker 1). A hostile/pathological host error could
+ * otherwise carry an arbitrarily long message that bypasses every output cap.
+ *
+ * Always returns at most 256 chars: `"Name: message"` when the thrown value
+ * has a string `name` and `message`, otherwise `String(e)` — both sliced to
+ * 256 chars. No raw error text ever reaches the model-unbounded.
+ */
+function boundedHostError(e: unknown): string {
+  if (
+    e && typeof e === "object" &&
+    "name" in e && typeof (e as { name?: unknown }).name === "string"
+  ) {
+    const name = (e as { name: string }).name
+    const message =
+      "message" in e && typeof (e as { message?: unknown }).message === "string"
+        ? (e as { message: string }).message
+        : String(e)
+    return `${name}: ${message}`.slice(0, 256)
+  }
+  return String(e).slice(0, 256)
+}
+
 export async function _headFiles(
   args: HeadFilesArgs,
   context: HostProjectContext,
   client: HostClient,
 ): Promise<string> {
   const sections: HeadFileSection[] = []
-  const notes: string[] = []
   for (const p of args.paths) {
     try {
       // PR 4 §6.2: the closure client is stable, but the request directory is
@@ -113,7 +139,10 @@ export async function _headFiles(
           query: { path: p, directory: context.directory },
         })).data?.content ?? ""
       if (!content) {
-        notes.push(`### ${p}\n(empty or not found)`)
+        // Empty/not-found is a model-visible section, exactly like success or
+        // error — one bounded channel, one final total-cap pass (oracle
+        // Blocker 1: no separate unbounded `notes` channel).
+        sections.push({ path: p, content: "(empty or not found)" })
         continue
       }
       // PR 4 §7.4 step 1 — retain at most `headLinesMax` requested lines. The
@@ -127,12 +156,16 @@ export async function _headFiles(
       sections.push({ path: p, content: contentText })
     } catch (e) {
       // PR 4 §13: a host file.read failure is a bounded per-file result, not a
-      // thrown error that aborts the whole tool call.
-      notes.push(`### ${p}\n(error: ${e})`)
+      // thrown error that aborts the whole tool call. The raw host error is
+      // sanitized to <=256 chars BEFORE it becomes a section, so a pathological
+      // 100 KB message can never bypass the per-file or total output caps.
+      sections.push({ path: p, content: `(error: ${boundedHostError(e)})` })
     }
   }
-  const formatted = formatHeadFilesOutput(sections)
-  return [...(formatted.length > 0 ? [formatted] : []), ...notes].join("\n\n")
+  // The single formatter applies per-line, per-file, and total bounds exactly
+  // once over the COMPLETE response (success + empty + error sections). No text
+  // is ever appended after the total truncation marker.
+  return formatHeadFilesOutput(sections)
 }
 
 // --- Tool registration ---

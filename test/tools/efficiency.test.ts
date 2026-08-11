@@ -6,6 +6,7 @@ vi.mock("../../src/compaction/durable", () => ({
 }))
 
 import { buildDurableBlock } from "../../src/compaction/durable"
+import { TOOL_LIMITS, TOTAL_TRUNCATED_MARKER } from "../../src/tools/bounds"
 import {
   _previewCompaction,
   _headFiles,
@@ -307,5 +308,111 @@ describe("PR 4 §12 A — client ownership / ToolContext", () => {
     expect(result).toContain("### missing.ts")
     expect(result).toContain("(error: ")
     expect(result).toContain("host-read-boom")
+  })
+})
+
+// ─── Oracle wave-9 regression — Blocker 1: `_headFiles` total bound ─────────
+// The oracle proved the previous composition appended empty/error notes AFTER
+// formatHeadFilesOutput() had already enforced the total cap, so mixed
+// success/error input and raw 100 KB host errors could exceed
+// headTotalOutputChars and surface hidden tail text after the marker.
+// These tests drive `_headFiles` end-to-end (not just the formatter) and pin
+// the final model-visible string to the total cap across every outcome mix.
+describe("oracle wave-9 — _headFiles total bound across success/empty/error", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  /** A client whose file.read always throws `makeError()`. */
+  function errorClient(makeError: () => unknown) {
+    const read = vi.fn(async () => {
+      throw makeError()
+    })
+    return { client: { file: { read } }, read }
+  }
+
+  /** A client whose file.read returns ~13 KB for normal paths and throws for `bad.ts`. */
+  function mixedSuccessErrorClient() {
+    const read = vi.fn(
+      async ({ query }: { query: { path: string } }) => {
+        if (query.path === "bad.ts") throw new Error("boom")
+        return { data: { content: ("v".repeat(100) + "\n").repeat(130) } }
+      },
+    )
+    return { client: { file: { read } }, read }
+  }
+
+  it("1. single large host error remains bounded", async () => {
+    const { client } = errorClient(() => new Error("x".repeat(100_000)))
+    const result = await _headFiles(
+      { paths: ["boom.ts"], lines: 40 },
+      toolContext as any,
+      client as any,
+    )
+    expect(result.length).toBeLessThanOrEqual(TOOL_LIMITS.headTotalOutputChars)
+    // The raw 100 KB error must never surface, not even a 5000-char tail.
+    expect(result).not.toContain("x".repeat(5000))
+    expect(result).toContain("### boom.ts")
+    expect(result).toContain("(error: Error: ")
+    // The sanitized error section is tiny (<=256 chars) — far below any cap.
+    expect(result.length).toBeLessThan(2000)
+  })
+
+  it("2. mixed success/error remains bounded with no content after the marker", async () => {
+    // Six successful sections of 130 lines each (~13 KB per section) far exceed
+    // the 64 KB total cap once `lines` keeps the whole file (schema max 200),
+    // then the seventh path throws a normal short host error. The oracle's
+    // deterministic reproduction 1.
+    const paths = ["file-0.ts", "file-1.ts", "file-2.ts", "file-3.ts", "file-4.ts", "file-5.ts", "bad.ts"]
+    const { client } = mixedSuccessErrorClient()
+    const result = await _headFiles(
+      { paths, lines: 200 },
+      toolContext as any,
+      client as any,
+    )
+    expect(result.length).toBeLessThanOrEqual(TOOL_LIMITS.headTotalOutputChars)
+    // The total marker must be the last text — nothing appended after it.
+    expect(result.endsWith(TOTAL_TRUNCATED_MARKER)).toBe(true)
+    // The error section lands after the total cut and must never surface.
+    expect(result).not.toContain("boom")
+    expect(result).not.toContain("(error:")
+  })
+
+  it("3a. sixteen empty paths remain bounded", async () => {
+    const paths = Array.from({ length: 16 }, (_, i) => `empty-${i}.ts`)
+    const client = createMockClient(Object.fromEntries(paths.map((p) => [p, ""])))
+    const result = await _headFiles(
+      { paths, lines: 40 },
+      toolContext as any,
+      client as any,
+    )
+    expect(result.length).toBeLessThanOrEqual(TOOL_LIMITS.headTotalOutputChars)
+    expect(result).toContain("(empty or not found)")
+  })
+
+  it("3b. sixteen throwing paths remain bounded", async () => {
+    const paths = Array.from({ length: 16 }, (_, i) => `boom-${i}.ts`)
+    const { client } = errorClient(() => new Error("e".repeat(100_000)))
+    const result = await _headFiles(
+      { paths, lines: 40 },
+      toolContext as any,
+      client as any,
+    )
+    expect(result.length).toBeLessThanOrEqual(TOOL_LIMITS.headTotalOutputChars)
+    // No raw error tail may surface from any of the sixteen paths.
+    expect(result).not.toContain("e".repeat(5000))
+  })
+
+  it("4. hidden tail text in a large error string is never appended", async () => {
+    const { client } = errorClient(() => new Error("X".repeat(100_000)))
+    const result = await _headFiles(
+      { paths: ["hidden.ts"], lines: 40 },
+      toolContext as any,
+      client as any,
+    )
+    expect(result.length).toBeLessThanOrEqual(TOOL_LIMITS.headTotalOutputChars)
+    // Even if a marker were present, no 5000-char tail of the raw error may
+    // appear anywhere after it (or at all).
+    expect(result).not.toContain("X".repeat(5000))
   })
 })

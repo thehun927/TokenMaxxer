@@ -206,4 +206,35 @@ describe("head_files output bounds (§12 C cases 19-23)", () => {
     const result = eff.formatHeadFilesOutput(sections)
     expect(result).not.toContain(hiddenTail)
   })
+
+  // Oracle wave-9 (Blocker 1): `_headFiles` now routes empty/error outcomes
+  // through this same formatter as ordinary sections, so the formatter must
+  // keep an empty/error-only section list bounded end-to-end.
+  it("case 24: empty + error-only input remains bounded through the single formatter", () => {
+    const sections: HeadFileSection[] = [
+      { path: "x", content: "(empty or not found)" },
+      { path: "y", content: "(error: foo)" },
+    ]
+    const result = eff.formatHeadFilesOutput(sections)
+    expect(result).toContain("### x")
+    expect(result).toContain("(empty or not found)")
+    expect(result).toContain("### y")
+    expect(result).toContain("(error: foo)")
+    expect(result.length).toBeLessThanOrEqual(bounds.TOOL_LIMITS.headTotalOutputChars)
+  })
+
+  it("case 25: max-fanout empty/error sections stay within the total cap", () => {
+    // 16 empties + 16 errors is above the schema max (16) for one call, but the
+    // formatter must stay bounded for any section count the helper could build.
+    const empty: HeadFileSection[] = Array.from({ length: 16 }, (_, i) => ({
+      path: `empty-${i}.ts`,
+      content: "(empty or not found)",
+    }))
+    const error: HeadFileSection[] = Array.from({ length: 16 }, (_, i) => ({
+      path: `boom-${i}.ts`,
+      content: `(error: ${"E".repeat(bounds.TOOL_LIMITS.headPathChars)})`,
+    }))
+    const result = eff.formatHeadFilesOutput([...empty, ...error])
+    expect(result.length).toBeLessThanOrEqual(bounds.TOOL_LIMITS.headTotalOutputChars)
+  })
 })

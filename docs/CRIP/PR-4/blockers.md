@@ -97,3 +97,11 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [audit] src/memory/llm-adapter.ts is the only file with structured-output compatibility casts: the `format: { type: "json_schema" }` request cast (llm-adapter.ts:265-283) and the `data.info.structured` envelope validation (llm-adapter.ts:285-340). extract-llm.ts's own V1ClientLike shape (src/memory/extract-llm.ts:245-256) predates PR 4 and is a model-discovery/session-surface probe (config.get / provider.list / surface guard), not a structured-output response cast; it does not inspect the envelope.
 - [audit] CI workflow change (.github/workflows/ci.yml adds npm run verify:host-contract between tsc and build) is local-only and not pushed because the PAT lacks the `workflow` scope; documented in the wave-7 commit fabeb34.
 - [test-gap] Wave 8 adds no new tests: the audit is verification that the Wave 1-7 fixtures (§12 A-G, all 50 release-gate cases) already cover every original concern; full suite 37 files / 478 tests green at audit time.
+
+## 2026-08-10 — wave-9 PR 4 release-gate blocker fix
+- [bug-fix] Blocker 1: head_files routes all outcomes (success, empty, error) through formatHeadFilesOutput with a single bounded section list; no separate notes channel; one total-cap pass.
+- [bug-fix] Blocker 1: boundedHostError helper caps name+message at 256 chars; error sections cannot carry unbounded raw host errors.
+- [bug-fix] preview_compaction's error text also bounded via the same helper (Non-blocking concern B).
+- [design-decision] The host-contract typecheck is now also enforced via Vitest (test/host/package-meta.test.ts) so every CI run via npm test proves the real v1.18.15 ToolContext contract; the standalone scripts/verify-host-contract.mjs and the workflow edit remain as defence in depth.
+- [test-gap] §12 C items 22-23 + new regression tests (#1-#4 above) prove _headFiles end-to-end output bound under success/empty/error/mixed input.
+- [scope-deviation] The .github/workflows/ci.yml edit is staged locally; pushing it requires a token with workflow scope. The Vitest-level enforcement is the primary release-invariant guarantee; the workflow edit is defence in depth.
