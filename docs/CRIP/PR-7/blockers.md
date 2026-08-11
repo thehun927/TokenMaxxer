@@ -308,3 +308,12 @@ decisions, and validation results; do not rewrite prior entries.
 - Full local release chain: **46 files passed, 844 tests passed**;
   TypeScript, build, host-contract, bundle, installer, and CLI smoke checks
   all passed.
+
+## 2026-08-11 — Final residual exact-head CI evidence
+
+- Residual implementation head: `141bec9`.
+- Handoff/documentation head: `383d0190dc3fc43fbdc27d34b4065660222dbc1e`.
+- GitHub Actions run `31548137271`: **success**.
+- Authoritative CI counts: **45 test files passed + 1 skipped; 843 tests
+  passed + 1 skipped**. The skipped launcher test is the expected pre-build
+  condition; all release-chain steps passed.
