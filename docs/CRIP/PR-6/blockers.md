@@ -108,3 +108,15 @@ Append-only implementation log for PR 6. Do not delete or rewrite prior entries.
   `origin:"llm"` is confined to the decisions-only merge function.
 - [verification] `npx tsc --noEmit` passed and `npm test` passed: 38 files, 631
   tests.
+
+## 2026-08-11 — Wave 8 release evidence
+
+- [verification] `npm run verify:host-contract` passed; `npm run build` passed;
+  self-contained `dist/index.js`, `dist/tui.js`, and `dist/cli.js` verification
+  passed; `npm run verify-cli-bundle` passed; `npm run smoke:cli` passed; and
+  `bash -n install.sh` plus `bash -n bin/tokenmaxxer` passed.
+- [verification] Exact-head GitHub Actions CI run `31527531666` passed all jobs:
+  full tests, TypeScript, host contract, build, self-contained bundles, CLI
+  verification, smoke, and syntax checks.
+- [worktree] Generated `dist/*` and local `opencode.json` changes remain
+  intentionally uncommitted and unrelated to PR-6 implementation commits.
