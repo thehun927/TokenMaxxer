@@ -104,6 +104,15 @@ Append-only implementation log for PR 6. Do not delete or rewrite prior entries.
 - [verification] `npx tsc --noEmit` passed; `npm test` passed: 39 files, 651
   tests.
 
+## 2026-08-11 — Oracle B1–B4 remediation release evidence
+
+- [verification] Exact remediation-head GitHub Actions run `31529085213` passed
+  on rerun: full test suite, TypeScript, host contract, distribution build,
+  self-contained bundles, CLI verification/smoke, and syntax checks.
+- [environment] The first attempt of the same run hit the existing asynchronous
+  activity-marker timing assertion in `test/memory/activity-state.test.ts`; no
+  PR-6 code was changed for it, and the rerun passed.
+
 ## 2026-08-11 — Wave 6 durable provenance invariants
 
 - [implementation] Provenance schema now enforces extractor/confidence pairing
