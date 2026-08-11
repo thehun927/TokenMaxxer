@@ -236,3 +236,30 @@ decisions, and validation results; do not rewrite prior entries.
   `npm run smoke:cli` — **passed (checks 46–49)**.
 - Wave 8 is implementation audit and handoff only. No Oracle findings or Ship
   verdict are recorded here; the independent Oracle owns release-gate review.
+
+## 2026-08-11 — Oracle blocker remediation validation
+
+- **B1 complete-summary predicate:** `extractLatestCompactionSummary()` now
+  requires `summary === true`, truthy `finish`, and no error; fixtures cover
+  missing/false finish, newer unfinished summaries, errored summaries, and
+  newest valid completed summaries.
+- **B2 durable-data trust boundary:** the shared preservation contract now
+  states that DURABLE CONTEXT is prior-state data only, cannot override
+  compaction instructions, and that instruction-like DATA values are literal
+  content. Replacement and augment tests cover hostile data.
+- **B3 diagnostics:** `last_compaction_prompt.log` records the exact payload
+  supplied by TokenMaxxer, uses real newlines, and includes a bounded fallback
+  reason when applicable.
+- **B4 typed prompt API:** removed the legacy string overload and
+  `buildCompactionPromptLegacy`; prompt tests use only the typed PR-7 API and
+  assert the old absolute no-snippet rule is absent.
+- Focused remediation command:
+  `npx vitest run test/compaction/history.test.ts test/compaction/prompt.test.ts test/compaction/prompt-contract.test.ts test/compaction/integration.test.ts test/index.test.ts`
+  result: **5 files passed, 90 tests passed**.
+- Full compaction command: `npx vitest run test/compaction/` — **10 files
+  passed, 194 tests passed**.
+- `npx tsc --noEmit`: **passed**.
+- `npm run typecheck:host-contract`: **passed**.
+- Full `npm test -- --reporter=dot`: **46 files passed, 838 tests passed**
+  locally. CI pass/skip counts will be recorded from the exact remediation
+  head after push.

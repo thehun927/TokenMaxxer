@@ -52,6 +52,17 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
     // Non-fatal — best effort
   }
 
+  /**
+   * Bound arbitrary fallback/error text to a deterministic character cap.
+   * Preserves the first `maxLen` characters and adds a truncation suffix when
+   * the original exceeds the cap so diagnostics never consume unbounded
+   * storage from an arbitrary host error message.
+   */
+  function boundReason(reason: string, maxLen: number): string {
+    if (reason.length <= maxLen) return reason
+    return reason.slice(0, maxLen) + `... [truncated ${reason.length - maxLen} chars]`
+  }
+
   // --- Hooks map ---
   return {
     // Layer 1: compaction-quality hook
@@ -68,6 +79,11 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
         // PR 7: route through the explicit compaction mode.
         let effectiveMode = options.compactionMode
         let fallbackReason: string | undefined
+
+        // Capture the exact TokenMaxxer-supplied payload for diagnostics.
+        // In replace mode this is buildCompactionPrompt(...); in augment/fallback
+        // it is buildCompactionAugmentation(durable). Never use raw durable.
+        let tokenMaxxerPayload: string
 
         if (options.compactionMode === "replace") {
           // Replace mode: attempt to recover previous summary
@@ -86,18 +102,22 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
               durableContext: durable,
               previousSummary: sanitizedSummary,
             })
+            tokenMaxxerPayload = output.prompt!
           } else if (historyResult.status === "none") {
             // First compaction: no prior summary, proceed without anchor
             output.prompt = buildCompactionPrompt({
               durableContext: durable,
             })
+            tokenMaxxerPayload = output.prompt!
           } else {
             // historyResult.status === "unavailable": fallback to augment
             effectiveMode = "augment"
             fallbackReason = historyResult.reason
 
             // Fallback to augment: append context, leave prompt unset
-            output.context.push(buildCompactionAugmentation(durable))
+            const augmentation = buildCompactionAugmentation(durable)
+            output.context.push(augmentation)
+            tokenMaxxerPayload = augmentation
             // output.prompt remains undefined (native augmentation)
           }
 
@@ -106,7 +126,9 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
         } else {
           // Augment mode (default): append context, leave prompt unset
           // Preserve pre-existing context entries
-          output.context.push(buildCompactionAugmentation(durable))
+          const augmentation = buildCompactionAugmentation(durable)
+          output.context.push(augmentation)
+          tokenMaxxerPayload = augmentation
           // output.prompt remains undefined (native augmentation)
         }
 
@@ -125,16 +147,18 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
         // newest compaction payload visible to diagnostics.
         try {
           const logPath = join(project, ".opencode", "memory", "last_compaction_prompt.log")
-          const snapshot = [
+          const snapshotLines = [
             `timestamp=${new Date().toISOString()}`,
             `session=${input.sessionID}`,
             `requested_mode=${requestedMode}`,
             `effective_mode=${effectiveMode}`,
             `kind=${effectiveMode === "replace" ? "replacement-prompt" : "context-augmentation"}`,
-            output.prompt ?? durable,
+            ...(fallbackReason ? [`fallback_reason=${boundReason(fallbackReason, 500)}`] : []),
+            tokenMaxxerPayload,
             "---",
             "",
-          ].join("\\n")
+          ]
+          const snapshot = snapshotLines.join("\n")
           await atomicWrite(logPath, snapshot)
         } catch {
           // Non-fatal

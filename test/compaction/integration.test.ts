@@ -124,7 +124,7 @@ describe("Wave 6 — Repeated-compaction integration (§9, §14.E, §14.D)", () 
       parts: [{ type: "compaction", text: "Compaction request" }],
     },
     {
-      info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true },
+      info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
       parts: [{ type: "text", text: generation1PriorSummary }],
     },
   ]
@@ -426,7 +426,7 @@ describe("Wave 6 — Repeated-compaction integration (§9, §14.E, §14.D)", () 
     it("identifies compaction user messages by part.type === 'compaction'", () => {
       const messages: TranscriptMessage[] = [
         { info: { id: "u1", role: "user", parentID: undefined }, parts: [{ type: "compaction", text: "Compact" }] },
-        { info: { id: "a1", role: "assistant", parentID: "u1", summary: true }, parts: [{ type: "text", text: "Summary 1" }] },
+        { info: { id: "a1", role: "assistant", parentID: "u1", summary: true, finish: "stop" }, parts: [{ type: "text", text: "Summary 1" }] },
       ]
       const result = extractLatestCompactionSummary(messages)
       expect(result).toBe("Summary 1")
@@ -435,9 +435,9 @@ describe("Wave 6 — Repeated-compaction integration (§9, §14.E, §14.D)", () 
     it("finds completed assistant summary with parentID pointing to compaction user", () => {
       const messages: TranscriptMessage[] = [
         { info: { id: "u1", role: "user", parentID: undefined }, parts: [{ type: "compaction", text: "Compact" }] },
-        { info: { id: "a1", role: "assistant", parentID: "u1", summary: true }, parts: [{ type: "text", text: "Summary 1" }] },
+        { info: { id: "a1", role: "assistant", parentID: "u1", summary: true, finish: "stop" }, parts: [{ type: "text", text: "Summary 1" }] },
         { info: { id: "u2", role: "user", parentID: undefined }, parts: [{ type: "compaction", text: "Compact 2" }] },
-        { info: { id: "a2", role: "assistant", parentID: "u2", summary: true }, parts: [{ type: "text", text: "Summary 2" }] },
+        { info: { id: "a2", role: "assistant", parentID: "u2", summary: true, finish: "stop" }, parts: [{ type: "text", text: "Summary 2" }] },
       ]
       const result = extractLatestCompactionSummary(messages)
       expect(result).toBe("Summary 2")
@@ -457,7 +457,7 @@ describe("Wave 6 — Repeated-compaction integration (§9, §14.E, §14.D)", () 
         { info: { id: "u1", role: "user", parentID: undefined }, parts: [{ type: "compaction", text: "Compact" }] },
         { info: { id: "a1", role: "assistant", parentID: "u1", summary: true, error: "failed" }, parts: [{ type: "text", text: "Error summary" }] },
         { info: { id: "u2", role: "user", parentID: undefined }, parts: [{ type: "compaction", text: "Compact 2" }] },
-        { info: { id: "a2", role: "assistant", parentID: "u2", summary: true }, parts: [{ type: "text", text: "Good summary" }] },
+        { info: { id: "a2", role: "assistant", parentID: "u2", summary: true, finish: "stop" }, parts: [{ type: "text", text: "Good summary" }] },
       ]
       const result = extractLatestCompactionSummary(messages)
       expect(result).toBe("Good summary")
@@ -466,7 +466,7 @@ describe("Wave 6 — Repeated-compaction integration (§9, §14.E, §14.D)", () 
     it("combines non-empty assistant text parts", () => {
       const messages: TranscriptMessage[] = [
         { info: { id: "u1", role: "user", parentID: undefined }, parts: [{ type: "compaction", text: "Compact" }] },
-        { info: { id: "a1", role: "assistant", parentID: "u1", summary: true }, parts: [
+        { info: { id: "a1", role: "assistant", parentID: "u1", summary: true, finish: "stop" }, parts: [
           { type: "text", text: "Part 1" },
           { type: "text", text: "Part 2" },
         ] },
@@ -478,9 +478,9 @@ describe("Wave 6 — Repeated-compaction integration (§9, §14.E, §14.D)", () 
     it("selects the newest completed non-empty summary", () => {
       const messages: TranscriptMessage[] = [
         { info: { id: "u1", role: "user", parentID: undefined }, parts: [{ type: "compaction", text: "Compact" }] },
-        { info: { id: "a1", role: "assistant", parentID: "u1", summary: true }, parts: [{ type: "text", text: "Old summary" }] },
+        { info: { id: "a1", role: "assistant", parentID: "u1", summary: true, finish: "stop" }, parts: [{ type: "text", text: "Old summary" }] },
         { info: { id: "u2", role: "user", parentID: undefined }, parts: [{ type: "compaction", text: "Compact 2" }] },
-        { info: { id: "a2", role: "assistant", parentID: "u2", summary: true }, parts: [{ type: "text", text: "New summary" }] },
+        { info: { id: "a2", role: "assistant", parentID: "u2", summary: true, finish: "stop" }, parts: [{ type: "text", text: "New summary" }] },
       ]
       const result = extractLatestCompactionSummary(messages)
       expect(result).toBe("New summary")
@@ -489,7 +489,7 @@ describe("Wave 6 — Repeated-compaction integration (§9, §14.E, §14.D)", () 
     it("returns undefined when no compaction user messages exist", () => {
       const messages: TranscriptMessage[] = [
         { info: { id: "u1", role: "user", parentID: undefined }, parts: [{ type: "text", text: "Regular message" }] },
-        { info: { id: "a1", role: "assistant", parentID: "u1", summary: true }, parts: [{ type: "text", text: "Not a compaction summary" }] },
+        { info: { id: "a1", role: "assistant", parentID: "u1", summary: true, finish: "stop" }, parts: [{ type: "text", text: "Not a compaction summary" }] },
       ]
       const result = extractLatestCompactionSummary(messages)
       expect(result).toBeUndefined()

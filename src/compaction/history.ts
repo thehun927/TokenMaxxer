@@ -80,6 +80,11 @@ export function extractLatestCompactionSummary(
       continue
     }
 
+    // Must have completed finish flag (OpenCode v1.18.15 semantics)
+    if (!msg.info.finish || Boolean(msg.info.finish) !== true) {
+      continue
+    }
+
     // Skip summaries with truthy error or incomplete flags
     if (msg.info.error || msg.info.incomplete) {
       continue

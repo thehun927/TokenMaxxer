@@ -318,7 +318,7 @@ describe("PR 7 Wave 1 — compaction mode assertions", () => {
           parts: [{ type: "compaction", text: "Compaction request" }],
         },
         {
-          info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true },
+          info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
           parts: [{ type: "text", text: "Prior summary content" }],
         },
       ]
@@ -408,6 +408,208 @@ describe("PR 7 Wave 1 — compaction mode assertions", () => {
           output,
         )
       ).resolves.not.toThrow()
+    })
+  })
+})
+
+// ─── PR 7 B3 — last_compaction_prompt.log diagnostics ─────────────────────
+// Oracle blocker: the log must record the actual TokenMaxxer payload
+// (not raw durable), include bounded fallback_reason, and use real newlines.
+describe("PR 7 B3 — last_compaction_prompt.log diagnostics", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    Object.keys(process.env).forEach((key) => {
+      if (key.startsWith("TOKENMAXXER_")) {
+        delete process.env[key]
+      }
+    })
+  })
+
+  describe("augment snapshot contains preservation-contract text", () => {
+    it("augment snapshot contains buildCompactionAugmentation text, not merely raw durable", async () => {
+      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-b3-augment-"))
+      buildDurableBlock.mockResolvedValueOnce("mock durable block content")
+
+      try {
+        const hooks = await TokenmaxxerPlugin(makePluginInput({
+          directory: project,
+          worktree: project,
+        }))
+        // Default mode = augment; no env vars set
+        const output = { context: [] as string[] }
+        await hooks["experimental.session.compacting"]?.(
+          { sessionID: "b3-augment-session" },
+          output,
+        )
+
+        const memoryDir = join(project, ".opencode", "memory")
+        const snapshot = await readFile(join(memoryDir, "last_compaction_prompt.log"), "utf-8")
+
+        // The snapshot must contain the actual augmentation (which includes
+        // preservation-contract text), not just the raw durable string.
+        expect(snapshot).toContain("DURABLE CONTEXT DATA")
+        expect(snapshot).toContain("mock durable block content")
+        // Preservation-contract text present only in augmentation, not raw durable:
+        expect(snapshot).toContain("preserve still-applicable user constraints")
+        expect(snapshot).toContain("keep completed vs active vs blocked state distinct")
+        // Metadata lines
+        expect(snapshot).toContain("kind=context-augmentation")
+
+        // Verify output.prompt is unset in augment mode
+        expect(output.prompt).toBeUndefined()
+      } finally {
+        await rm(project, { recursive: true, force: true })
+      }
+    })
+  })
+
+  describe("fallback reason is present and bounded", () => {
+    it("records bounded fallback_reason when replace mode falls back to augment", async () => {
+      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-b3-fallback-"))
+      buildDurableBlock.mockResolvedValueOnce("durable for fallback test")
+      process.env.TOKENMAXXER_COMPACTION_MODE = "replace"
+
+      // Client with no session property triggers unavailable fallback
+      const mockClient = {} as unknown
+
+      try {
+        const hooks = await TokenmaxxerPlugin({
+          ...makePluginInput({ directory: project, worktree: project }),
+          client: mockClient,
+        })
+
+        const output = { context: [] as string[] }
+        await hooks["experimental.session.compacting"]?.(
+          { sessionID: "fallback-session" },
+          output,
+        )
+
+        const memoryDir = join(project, ".opencode", "memory")
+        const snapshot = await readFile(join(memoryDir, "last_compaction_prompt.log"), "utf-8")
+
+        // Fallback reason line present
+        expect(snapshot).toContain("fallback_reason=session.messages unavailable")
+        // effective_mode should be augment (fallback)
+        expect(snapshot).toContain("effective_mode=augment")
+        // kind should be context-augmentation
+        expect(snapshot).toContain("kind=context-augmentation")
+        // Must contain augmentation text, not raw durable
+        expect(snapshot).toContain("DURABLE CONTEXT DATA")
+        expect(snapshot).toContain("durable for fallback test")
+        // output.prompt unset
+        expect(output.prompt).toBeUndefined()
+      } finally {
+        await rm(project, { recursive: true, force: true })
+      }
+    })
+
+    it("bounds fallback_reason to 500 characters", async () => {
+      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-b3-bound-"))
+      buildDurableBlock.mockResolvedValueOnce("durable bound test")
+      process.env.TOKENMAXXER_COMPACTION_MODE = "replace"
+
+      // Construct a client whose session.messages throws a very long error
+      const longReason = "X".repeat(800)
+      const mockClient = {
+        session: {
+          messages: vi.fn(async () => {
+            throw new Error(longReason)
+          }),
+        },
+      }
+
+      try {
+        const hooks = await TokenmaxxerPlugin({
+          ...makePluginInput({ directory: project, worktree: project }),
+          client: mockClient as unknown as PluginInput["client"],
+        })
+
+        const output = { context: [] as string[] }
+        await hooks["experimental.session.compacting"]?.(
+          { sessionID: "bound-session" },
+          output,
+        )
+
+        const memoryDir = join(project, ".opencode", "memory")
+        const snapshot = await readFile(join(memoryDir, "last_compaction_prompt.log"), "utf-8")
+
+        // Extract the fallback_reason line
+        const reasonMatch = snapshot.match(/fallback_reason=(.+)/)
+        expect(reasonMatch).not.toBeNull()
+        const reasonValue = reasonMatch![1]
+
+        // Must contain the truncation marker
+        expect(reasonValue).toContain("[truncated")
+        // The reason line must not exceed the cap + truncation suffix
+        expect(reasonValue.length).toBeLessThanOrEqual(550) // 500 cap + " [truncated ...]" suffix
+        // Must start with first part of long string
+        expect(reasonValue).toContain("XXX")
+      } finally {
+        await rm(project, { recursive: true, force: true })
+      }
+    })
+
+    it("does not include fallback_reason line when no fallback occurred", async () => {
+      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-b3-no-fallback-"))
+      buildDurableBlock.mockResolvedValueOnce("normal augment durable")
+
+      try {
+        const hooks = await TokenmaxxerPlugin(makePluginInput({
+          directory: project,
+          worktree: project,
+        }))
+        const output = { context: [] as string[] }
+        await hooks["experimental.session.compacting"]?.(
+          { sessionID: "no-fallback-session" },
+          output,
+        )
+
+        const memoryDir = join(project, ".opencode", "memory")
+        const snapshot = await readFile(join(memoryDir, "last_compaction_prompt.log"), "utf-8")
+        expect(snapshot).not.toContain("fallback_reason=")
+      } finally {
+        await rm(project, { recursive: true, force: true })
+      }
+    })
+  })
+
+  describe("file content has real line separators", () => {
+    it("uses real newlines, not literal backslash-n separators", async () => {
+      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-b3-newlines-"))
+      buildDurableBlock.mockResolvedValueOnce("durable for newline test")
+
+      try {
+        const hooks = await TokenmaxxerPlugin(makePluginInput({
+          directory: project,
+          worktree: project,
+        }))
+        const output = { context: [] as string[] }
+        await hooks["experimental.session.compacting"]?.(
+          { sessionID: "newline-session" },
+          output,
+        )
+
+        const memoryDir = join(project, ".opencode", "memory")
+        const snapshot = await readFile(join(memoryDir, "last_compaction_prompt.log"), "utf-8")
+
+        // The file must contain actual newline characters
+        expect(snapshot).toContain("\n")
+
+        // No literal backslash-n should appear as a line separator between metadata fields
+        // (i.e. we should not see patterns like =value\\nfield=)
+        expect(snapshot).not.toMatch(/\\n(session|requested_mode|effective_mode|kind|fallback_reason)=/)
+
+        // Split by real newlines; top metadata lines should be clean
+        const lines = snapshot.split("\n")
+        expect(lines.length).toBeGreaterThan(5)
+
+        // Each metadata line should NOT contain a literal \\n
+        for (let i = 0; i < 6 && i < lines.length; i++) {
+          expect(lines[i]).not.toContain("\\n")
+        }
+      } finally {
+        await rm(project, { recursive: true, force: true })
+      }
     })
   })
 })

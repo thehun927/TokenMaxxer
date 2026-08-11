@@ -69,7 +69,7 @@ describe("extractLatestCompactionSummary", () => {
         parts: [{ type: "compaction", text: "Compaction request" }],
       },
       {
-        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true },
+        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
         parts: [{ type: "tool", tool: "some-tool" }],
       },
     ]
@@ -84,7 +84,7 @@ describe("extractLatestCompactionSummary", () => {
         parts: [{ type: "compaction", text: "Compaction request" }],
       },
       {
-        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true },
+        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
         parts: [{ type: "text", text: "First summary" }],
       },
       {
@@ -92,7 +92,7 @@ describe("extractLatestCompactionSummary", () => {
         parts: [{ type: "compaction", text: "Second compaction request" }],
       },
       {
-        info: { id: "msg-4", role: "assistant", parentID: "msg-3", summary: true },
+        info: { id: "msg-4", role: "assistant", parentID: "msg-3", summary: true, finish: "stop" },
         parts: [{ type: "text", text: "Second summary" }],
       },
     ]
@@ -107,7 +107,7 @@ describe("extractLatestCompactionSummary", () => {
         parts: [{ type: "compaction", text: "Compaction request" }],
       },
       {
-        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true },
+        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
         parts: [
           { type: "text", text: "First part" },
           { type: "text", text: "Second part" },
@@ -126,11 +126,11 @@ describe("extractLatestCompactionSummary", () => {
         parts: [{ type: "compaction", text: "Compaction request" }],
       },
       {
-        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, error: "some error" },
+        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, error: "some error", finish: "stop" },
         parts: [{ type: "text", text: "Errored summary" }],
       },
       {
-        info: { id: "msg-3", role: "assistant", parentID: "msg-1", summary: true },
+        info: { id: "msg-3", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
         parts: [{ type: "text", text: "Valid summary" }],
       },
     ]
@@ -145,11 +145,11 @@ describe("extractLatestCompactionSummary", () => {
         parts: [{ type: "compaction", text: "Compaction request" }],
       },
       {
-        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, incomplete: true },
+        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, incomplete: true, finish: "stop" },
         parts: [{ type: "text", text: "Incomplete summary" }],
       },
       {
-        info: { id: "msg-3", role: "assistant", parentID: "msg-1", summary: true },
+        info: { id: "msg-3", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
         parts: [{ type: "text", text: "Valid summary" }],
       },
     ]
@@ -164,11 +164,11 @@ describe("extractLatestCompactionSummary", () => {
         parts: [{ type: "compaction", text: "Compaction request" }],
       },
       {
-        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true },
+        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
         parts: [{ type: "text", text: "Valid summary" }],
       },
       {
-        info: { id: "msg-3", role: "assistant", parentID: "msg-2", summary: true },
+        info: { id: "msg-3", role: "assistant", parentID: "msg-2", summary: true, finish: "stop" },
         parts: [{ type: "text", text: "Orphaned summary (no compaction parent)" }],
       },
     ]
@@ -183,11 +183,11 @@ describe("extractLatestCompactionSummary", () => {
         parts: [{ type: "compaction", text: "Compaction request" }],
       },
       {
-        info: { id: "msg-2", role: "user", parentID: "msg-1", summary: true },
+        info: { id: "msg-2", role: "user", parentID: "msg-1", summary: true, finish: "stop" },
         parts: [{ type: "text", text: "User message with summary flag" }],
       },
       {
-        info: { id: "msg-3", role: "assistant", parentID: "msg-1", summary: true },
+        info: { id: "msg-3", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
         parts: [{ type: "text", text: "Valid summary" }],
       },
     ]
@@ -223,7 +223,7 @@ describe("readPreviousCompactionSummary", () => {
         parts: [{ type: "compaction", text: "Compaction request" }],
       },
       {
-        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true },
+        info: { id: "msg-2", role: "assistant", parentID: "msg-1", summary: true, finish: "stop" },
         parts: [{ type: "text", text: "Recovered summary" }],
       },
     ]
