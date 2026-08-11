@@ -269,3 +269,15 @@ decisions, and validation results; do not rewrite prior entries.
   removal after a fixed 10 ms while `beginMemoryActivity` cleanup is
   fire-and-forget. It was stabilized with bounded polling; no production
   behavior changed.
+
+## 2026-08-11 — Exact remediation-head CI evidence
+
+- Remediation head: `4827099c9fde67a0151d6d973f8d300f1debeffc`.
+- GitHub Actions run `31546528968`: **success**.
+- Authoritative CI counts: **45 test files passed + 1 skipped; 837 tests
+  passed + 1 skipped**. The skipped launcher test is the expected pre-build
+  condition; all remaining release steps passed.
+- The exact-head CI also passed TypeScript checking, host-contract
+  verification, distribution build, self-contained bundle verification, CLI
+  bundle/launcher/installer verification, post-build CLI smoke, and syntax
+  validation.
