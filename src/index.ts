@@ -56,7 +56,7 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
     // Layer 1: compaction-quality hook
     "experimental.session.compacting": async (input: CompactionInput, output: CompactionOutput) => {
       try {
-        const durable = await buildDurableBlock({ worktree, directory, client })
+        const durable = (await buildDurableBlock({ worktree, directory, client })) ?? ""
         const requestedMode = process.env.TOKENMAXXER_COMPACTION_MODE
           ?? (process.env.TOKENMAXXER_NO_PROMPT === "1"
             ? "augment"
@@ -97,7 +97,7 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
             `requested_mode=${requestedMode}`,
             `effective_mode=${options.compactionMode}`,
             `kind=${options.compactionMode === "replace" ? "replacement-prompt" : "context-augmentation"}`,
-            output.prompt ?? "(durable via context)",
+            output.prompt ?? durable,
             "---",
             "",
           ].join("\n")
