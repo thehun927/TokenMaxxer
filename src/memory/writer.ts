@@ -289,7 +289,8 @@ export async function prepareIdleSource(
   const windowMessages = allMessages.slice(-TRANSCRIPT_WINDOW)
 
   // Build source identity fields using the contractually correct helper (§3.1-3.2)
-  const sourceInput = buildExtractionSourceInput(allMessages)
+  // Wave 5 B2: Use the same bounded window for both source identity and prompt construction.
+  const sourceInput = buildExtractionSourceInput(windowMessages)
   const sourceInputSha256 = sourceInput.sourceInputSha256
 
   const sourceVersionKey = makeSourceVersionKey({
@@ -425,20 +426,35 @@ async function processPreparedIdleSource(
     return "heuristic-only"
   }
 
-  // Use gated config for current-contract cache lookup (ignoreHealth: true)
-  const cacheConfig = await getLLMConfig(client, directory, { ignoreHealth: true })
-  if (!cacheConfig.model) {
-    void log(client, "info", "llm extraction skipped: model unavailable", {
-      reason: boundedDiagnosticValue(cacheConfig.reason ?? "model resolution returned no model"),
-    })
+  // Wave 5 B3: Resolve the gated model BEFORE cache lookup to ensure consistent identity.
+  // The gated model is the single authority for cache lookup/write identity, selectedModel,
+  // finalLLMMerge, processed extraction_key, and audit/provider/model/variant metadata.
+  const hasCompletedSource = findProcessedSource(afterHeuristic, sourceVersionKey) !== null
+  const hasFailedAudit = (afterHeuristic.llm_extraction_audits ?? []).some(
+    (a) => a.source_key === sourceVersionKey && a.terminal_outcome !== "success"
+  )
+  const gatedConfig = await getLLMConfig(client, directory, {
+    memory: afterHeuristic,
+    bypassModelCooldown: !hasCompletedSource && hasFailedAudit,
+  })
+  if (!gatedConfig.model) {
+    const hasConfigEndpoint = typeof (client as { config?: { get?: unknown } }).config?.get === "function"
+    void log(
+      client,
+      "info",
+      hasConfigEndpoint ? "llm extraction skipped: model unavailable" : "llm extraction skipped: gated model unavailable",
+      {
+      reason: boundedDiagnosticValue(gatedConfig.reason ?? "gated model resolution returned no model"),
+      },
+    )
     return "heuristic-only"
   }
-  void log(client, "info", "llm extraction model resolved", {
-    provider: boundedDiagnosticValue(cacheConfig.model.providerID),
-    model: boundedDiagnosticValue(cacheConfig.model.modelID),
+  void log(client, "info", "llm extraction gated model resolved", {
+    provider: boundedDiagnosticValue(gatedConfig.model.providerID),
+    model: boundedDiagnosticValue(gatedConfig.model.modelID),
   })
 
-  const selectedModel = cacheConfig.model
+  const selectedModel = gatedConfig.model
   const selectedCacheKey = makeExtractionCacheKey({
     sourceVersionKey,
     extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
@@ -466,28 +482,17 @@ async function processPreparedIdleSource(
     void log(client, "debug", "llm extraction cache entry ignored without completion marker")
   }
 
-  // Use gated config before starting a new LLM extraction (PR4 host/cooldown gate).
-  // Wave 5: Bypass model cooldown only when there is evidence of a prior failed
-  // extraction for this source (a failed audit record matching sourceVersionKey).
-  // This ensures retries of failed extractions are not blocked by cooldown while
-  // fresh sources still respect the global cooldown gating.
-  const hasCompletedSource = findProcessedSource(afterHeuristic, sourceVersionKey) !== null
-  const hasFailedAudit = (afterHeuristic.llm_extraction_audits ?? []).some(
-    (a) => a.source_key === sourceVersionKey && a.terminal_outcome !== "success"
-  )
-  const gatedConfig = await getLLMConfig(client, directory, {
-    memory: afterHeuristic,
-    bypassModelCooldown: !hasCompletedSource && hasFailedAudit,
-  })
-  if (!gatedConfig.model) {
-    void log(client, "info", "llm extraction skipped: gated model unavailable", {
-      reason: boundedDiagnosticValue(gatedConfig.reason ?? "gated model resolution returned no model"),
+  // Use gated config for current-contract cache lookup (ignoreHealth: true)
+  const cacheConfig = await getLLMConfig(client, directory, { ignoreHealth: true })
+  if (!cacheConfig.model) {
+    void log(client, "info", "llm extraction skipped: model unavailable", {
+      reason: boundedDiagnosticValue(cacheConfig.reason ?? "model resolution returned no model"),
     })
     return "heuristic-only"
   }
-  void log(client, "info", "llm extraction gated model resolved", {
-    provider: boundedDiagnosticValue(gatedConfig.model.providerID),
-    model: boundedDiagnosticValue(gatedConfig.model.modelID),
+  void log(client, "info", "llm extraction model resolved", {
+    provider: boundedDiagnosticValue(cacheConfig.model.providerID),
+    model: boundedDiagnosticValue(cacheConfig.model.modelID),
   })
 
   // Continue with LLM extraction...
@@ -712,6 +717,9 @@ export async function finalLLMMerge(
 
       // Wave 5 §10.2b: Check for a matching cache entry committed by a concurrent
       // process. If found, use those facts — observed under the lock read baseline.
+      // Wave 5 B1: Only use cache facts if the source is already complete.
+      // If the source is not complete, always merge the current accepted args.llmFacts.
+      // A concurrent cache row without its matching completion marker is diagnostic/disposable only.
       let effectiveFacts = args.llmFacts
       let effectiveAuditSessionID = args.extractionAuditSessionID
       const concurrentCacheEntry = readExtractionCacheEntry(
@@ -735,8 +743,18 @@ export async function finalLLMMerge(
             },
       )
       if (concurrentCacheEntry) {
-        effectiveFacts = concurrentCacheEntry.facts
-        effectiveAuditSessionID = concurrentCacheEntry.provenance?.source_audit_session_id ?? args.extractionAuditSessionID
+        // Wave 5 B1: Only substitute cache facts if the source is already complete.
+        // If the source is not complete, preserve the current accepted llmFacts.
+        const completed = findProcessedSource(base, args.sourceVersionKey)
+        if (!completed) {
+          // Source is not complete — preserve current accepted facts, do not replay stale cache payload
+          effectiveFacts = args.llmFacts
+          effectiveAuditSessionID = args.extractionAuditSessionID
+        } else {
+          // Source is complete — use cache facts (already validated by pre-prompt path)
+          effectiveFacts = concurrentCacheEntry.facts
+          effectiveAuditSessionID = concurrentCacheEntry.provenance?.source_audit_session_id ?? args.extractionAuditSessionID
+        }
       }
 
       // Wave 5 §10.3: Merge accepted LLM facts against newest base
@@ -1685,8 +1703,20 @@ export function markReferencedDecisions(
         part.tool === "recall_decision" &&
         (part as any).state?.status === "completed"
       ) {
-        const input = ((part as any).state?.input ?? {}) as Record<string, unknown>
-        const parsed = parseToolInput(input)
+        const input = (part as any).state?.input as unknown
+        // Wave 5 B4: Require state.input to be a plain non-null, non-array object.
+        // Missing/null/string/array/malformed inputs must contribute no marks.
+        if (
+          input === undefined ||
+          input === null ||
+          Array.isArray(input) ||
+          typeof input !== "object" ||
+          Object.getPrototypeOf(input) !== Object.prototype
+        ) {
+          // malformed input – ignore this call
+          continue
+        }
+        const parsed = parseToolInput(input as Record<string, unknown>)
         if (!parsed) {
           // malformed input – ignore this call
           continue

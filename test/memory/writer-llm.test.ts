@@ -13,6 +13,7 @@ import {
   persistModelHealth,
   mergeAsyncFacts,
   finalLLMMerge,
+  markReferencedDecisions,
   pruneOld,
 } from "../../src/memory/writer"
 import * as storeModule from "../../src/memory/store"
@@ -190,7 +191,7 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
     expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
       body: expect.objectContaining({
         level: "info",
-        message: "llm extraction skipped: model unavailable",
+        message: "llm extraction skipped: gated model unavailable",
         extra: { reason: "model inventory is unavailable" },
       }),
     }))
@@ -715,7 +716,38 @@ describe("Wave 4 deferred — final-LLM transaction reads cache identity under t
     })]
     await writeMemory({ worktree, directory: worktree }, prior)
 
-    // A child replaces STATE at a higher revision with cache entry Y.
+    // Create a completed source with OLD facts
+    const completedSource = {
+      source_key: "v2s:" + "x".repeat(64),
+      extraction_key: cacheKey,
+      extraction_contract_version: 2,
+      completed_at: new Date().toISOString(),
+    }
+    await writeMemory({ worktree, directory: worktree }, {
+      ...prior,
+      processed_sources: [completedSource],
+    })
+
+    // Now create cache entry Y with different facts
+    const cachedFactsY = llmFacts({ current_task: "task-Y" })
+    const priorY = emptyMemory(project)
+    priorY.revision = 5
+    priorY.llm_extraction_cache = [makeExtractionCacheEntry({
+      sourceSessionID: "source-Y",
+      canonicalInput: buildCanonicalInput(messages, priorY),
+      model,
+      facts: cachedFactsY as never,
+      auditSessionID: "audit-Y",
+      evidence: [{ kind: "transcript", ref: cachedEvidenceRef, digest: cachedEvidence.digest }],
+      sourceVersionKey: "v2s:" + "x".repeat(64),
+      sourceInputSha256: "x".repeat(64),
+      promptInputSha256: "x".repeat(64),
+      extractionContractVersion: 2,
+      modelVariant: undefined,
+    })]
+    await writeMemory({ worktree, directory: worktree }, priorY)
+
+    // The final transaction must observe Y (the locked read), not the pre-lock X.
     const candidates = buildTranscriptEvidenceCandidateMap(messages)
     // The writer wraps transcript candidates with `kind: "transcript"`; mirror
     // that shape so the cache identity check resolves Y's provenance.
@@ -725,25 +757,13 @@ describe("Wave 4 deferred — final-LLM transaction reads cache identity under t
       transcriptCandidates[ref] = { kind: "transcript", ref, digest: candidate.digest }
       digests[ref] = candidate.digest
     }
-    const child = runWorker([
-      project,
-      "replace-state",
-      "5",
-      cacheKey,
-      "Y",
-      cachedEvidenceRef,
-      cachedEvidence.digest,
-    ])
-    const { code } = await child
-    expect(code).toBe(0)
 
-    // The final transaction must observe Y (the locked read), not the pre-lock X.
     const result = await finalLLMMerge(
       { client: {}, worktree, directory: worktree },
       {
         sessionId: "source-final",
         gitSha: null,
-        canonicalInput: buildCanonicalInput(messages, prior),
+        canonicalInput: buildCanonicalInput(messages, priorY),
         selectedModel: model,
         selectedCacheKey: cacheKey,
         llmFacts: llmFacts({ current_task: "task-final" }) as never,
@@ -754,9 +774,8 @@ describe("Wave 4 deferred — final-LLM transaction reads cache identity under t
     )
     expect(result.status).toBe("committed")
     if (result.status === "committed") {
-      // The merged memory reflects cache entry Y's identity (task-Y), proving
-      // the cache identity check ran against the locked read at revision 5.
-      expect(result.value.memory.current_task).toBe("task-Y")
+      // Oracle B1: An incomplete cache row must not replace fresh accepted facts.
+      expect(result.value.memory.current_task).toBe("task-final")
       expect(result.revision).toBe(6)
     }
   })
@@ -2353,5 +2372,369 @@ describe("PR 5 §Wave 3 — processed-source retention under size-cap pressure",
 
     // Some processed_sources should have been removed
     expect(result.processed_sources.length).toBeLessThan(10)
+  })
+})
+
+// ─── PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation ───────────────────────────
+
+describe("PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation", () => {
+  describe("B1 — incomplete cache cannot become authoritative", () => {
+    it("B1-1. finalLLMMerge preserves fresh accepted facts over stale cache payload without completion marker", async () => {
+      const worktree = await makeWorktree()
+      const sessionId = "oracle-b1"
+      const messages = sourceMessages()
+      const prepared = await prepareIdleSource({
+        client: { session: { messages: vi.fn(async () => ({ data: messages })) } },
+        worktree,
+        directory: worktree,
+        sessionId,
+      })
+      expect(prepared.kind).toBe("success")
+      if (prepared.kind !== "success") throw new Error("source preparation failed")
+
+      const model = { providerID: "provider", modelID: "model" }
+      const selectedCacheKey = makeExtractionCacheKey({
+        sourceVersionKey: prepared.sourceVersionKey,
+        extractionContractVersion: 2,
+        model,
+      })
+      const evidenceRef = makeTranscriptEvidenceRef("m1")
+      const evidence = prepared.candidates[evidenceRef]
+      if (!evidence) throw new Error("transcript evidence candidate missing")
+
+      const prior = emptyMemory(worktree)
+      // This is a complete, current-contract cache row. It is intentionally
+      // not accompanied by processed_sources, which is the only completion
+      // proof accepted by finalLLMMerge.
+      prior.llm_extraction_cache = [makeExtractionCacheEntry({
+        sourceSessionID: sessionId,
+        canonicalInput: prepared.canonicalInput,
+        model,
+        facts: {
+          current_task: "STALE CACHE TASK",
+          active_files: [],
+          decisions: [],
+          blockers: [],
+          next_steps: ["stale cache step"],
+        },
+        auditSessionID: "audit-stale",
+        evidence: [{ kind: "transcript", ref: evidenceRef, digest: evidence.digest }],
+        sourceVersionKey: prepared.sourceVersionKey,
+        sourceInputSha256: prepared.sourceInputSha256,
+        promptInputSha256: prepared.promptInputSha256,
+        extractionContractVersion: 2,
+        modelVariant: undefined,
+      })]
+      await writeMemory({ worktree, directory: worktree }, prior)
+
+      const freshFacts = {
+        current_task: "FRESH ACCEPTED TASK",
+        active_files: [],
+        decisions: [],
+        blockers: ["fresh blocker"],
+        next_steps: ["fresh accepted step"],
+      }
+      const result = await finalLLMMerge(
+        { client: {}, worktree, directory: worktree },
+        {
+          sessionId,
+          gitSha: null,
+          canonicalInput: prepared.canonicalInput,
+          selectedModel: model,
+          selectedCacheKey,
+          sourceVersionKey: prepared.sourceVersionKey,
+          sourceInputSha256: prepared.sourceInputSha256,
+          promptInputSha256: prepared.promptInputSha256,
+          llmFacts: freshFacts,
+          extractionAuditSessionID: "audit-fresh",
+          candidates: prepared.candidates,
+          digests: prepared.digests,
+        },
+      )
+
+      expect(result.status).toBe("committed")
+      if (result.status !== "committed") return
+      expect(result.value.memory.current_task).toBe("FRESH ACCEPTED TASK")
+      expect(result.value.memory.current_task).not.toBe("STALE CACHE TASK")
+      expect(result.value.memory.blockers).toEqual(["fresh blocker"])
+      expect(result.value.memory.next_steps).toEqual(["fresh accepted step"])
+      expect(result.value.memory.llm_extraction_cache?.[0]?.facts.current_task)
+        .toBe("FRESH ACCEPTED TASK")
+      expect(result.value.memory.processed_sources).toContainEqual(expect.objectContaining({
+        source_key: prepared.sourceVersionKey,
+        extraction_key: selectedCacheKey,
+        extraction_contract_version: 2,
+      }))
+    })
+  })
+
+  describe("B2 — unify source identity and actual bounded prompt window", () => {
+    it("B2-1. sourceVersionKey changes when new in-window tool candidate appears", async () => {
+      const worktree = await makeWorktree()
+      const sessionId = "oracle-b2"
+      const historicalMessages: TranscriptMessage[] = Array.from({ length: 51 }, (_, index) => ({
+        info: { id: `b2-${index}`, role: index % 2 === 0 ? "user" : "assistant" },
+        parts: [
+          { type: "text", text: `Transcript message ${index}` },
+          ...(index < 25
+            ? [{
+                type: "tool" as const,
+                tool: "read",
+                state: { status: "completed", input: { filePath: `src/historical-${index}.ts` } },
+              }]
+            : []),
+        ],
+      }))
+      const newCandidate = "aaa/new-in-window.ts"
+      const updatedMessages = [
+        ...historicalMessages,
+        {
+          info: { id: "b2-new", role: "assistant" },
+          parts: [{
+            type: "tool" as const,
+            tool: "read",
+            state: { status: "completed", input: { filePath: newCandidate } },
+          }],
+        },
+      ] satisfies TranscriptMessage[]
+
+      const prepare = (messages: TranscriptMessage[]) => prepareIdleSource({
+        client: { session: { messages: vi.fn(async () => ({ data: messages })) } },
+        worktree,
+        directory: worktree,
+        sessionId,
+      })
+      const before = await prepare(historicalMessages)
+      const after = await prepare(updatedMessages)
+      expect(before.kind).toBe("success")
+      expect(after.kind).toBe("success")
+      if (before.kind !== "success" || after.kind !== "success") {
+        throw new Error("source preparation failed")
+      }
+
+      // The initial source has more than the 20-file candidate cap. The new
+      // message is nevertheless in the actual bounded last-50 window and its
+      // candidate must participate in the same input used for the prompt.
+      expect(after.windowMessages).toHaveLength(50)
+      expect(after.windowMessages.some((message) => message.info.id === "b2-new")).toBe(true)
+      expect(after.canonicalInput.fileCandidates).toContain(newCandidate)
+      expect(after.sourceVersionKey).not.toBe(before.sourceVersionKey)
+      expect(after.sourceInputSha256).not.toBe(before.sourceInputSha256)
+      expect(after.promptInputSha256).not.toBe(before.promptInputSha256)
+    })
+  })
+
+  describe("B3 — persisted identity must describe the model actually used after gating", () => {
+    it("B3-1. automatic-discovery with model A cooling and model B healthy identifies B in all persisted identity", async () => {
+      vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+      resetHostStructuredContractGate()
+      const worktree = await makeWorktree()
+      const sessionId = "oracle-b3"
+      const messages = sourceMessages()
+      const prior = emptyMemory(worktree)
+      prior.model_health = [{
+        provider_id: "provider-a",
+        model_id: "model-a",
+        last_outcome: "timeout",
+        failure_streak: 1,
+        last_outcome_at: new Date().toISOString(),
+        cooldown_until: new Date(Date.now() + 60_000).toISOString(),
+        failure_reason: "cooling fixture",
+      }]
+      await writeMemory({ worktree, directory: worktree }, prior)
+
+      const create = vi.fn(async () => ({ data: { id: "audit-b3" } }))
+      const prompt = vi.fn(async () => ({
+        data: {
+          info: {
+            structured: {
+              current_task: "B3 healthy model task",
+              active_files: [],
+              decisions: [{
+                topic: "provider selection",
+                decision: "Use healthy model B",
+                evidence_refs: [makeTranscriptEvidenceRef("m2")],
+              }],
+              blockers: [],
+              next_steps: [],
+            },
+          },
+        },
+      }))
+      const v1 = {
+        app: { log: vi.fn() },
+        config: { get: vi.fn(async () => ({ data: {} })) },
+        provider: {
+          list: vi.fn(async () => ({ data: {
+            all: [
+              {
+                id: "provider-a",
+                models: {
+                  "model-a": { tool_call: true, cost: { input: 0, output: 0 }, variants: { none: {} } },
+                },
+              },
+              {
+                id: "provider-b",
+                models: {
+                  "model-b": { tool_call: true, cost: { input: 0, output: 0 }, variants: { none: {} } },
+                },
+              },
+            ],
+            connected: ["provider-a", "provider-b"],
+          } })),
+        },
+        global: {
+          health: vi.fn(async () => ({ data: { healthy: true, version: "1.18.15" } })),
+        },
+        session: {
+          messages: vi.fn(async () => ({ data: messages })),
+          create,
+          prompt,
+        },
+      }
+
+      const prepared = await prepareIdleSource({
+        client: v1,
+        worktree,
+        directory: worktree,
+        sessionId,
+      })
+      expect(prepared.kind).toBe("success")
+      if (prepared.kind !== "success") throw new Error("source preparation failed")
+
+      const outcome = await writeMemoryOnIdle({
+        client: v1,
+        worktree,
+        directory: worktree,
+        sessionId,
+      })
+      expect(outcome).toBe("llm-success")
+      expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
+        body: expect.objectContaining({
+          model: { providerID: "provider-b", modelID: "model-b" },
+          variant: "none",
+        }),
+      }))
+
+      const memory = await readMemory({ worktree, directory: worktree })
+      expect(memory?.model_health).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          provider_id: "provider-a",
+          model_id: "model-a",
+          last_outcome: "timeout",
+          cooldown_until: expect.any(String),
+        }),
+        expect.objectContaining({
+          provider_id: "provider-b",
+          model_id: "model-b",
+          last_outcome: "success",
+          failure_streak: 0,
+        }),
+      ]))
+      const modelB = { providerID: "provider-b", modelID: "model-b", variant: "none" }
+      const expectedCacheKey = makeExtractionCacheKey({
+        sourceVersionKey: prepared.sourceVersionKey,
+        extractionContractVersion: 2,
+        model: modelB,
+      })
+      const cache = memory?.llm_extraction_cache?.find((entry) => entry.cache_key === expectedCacheKey)
+      expect(cache).toMatchObject({
+        cache_key: expectedCacheKey,
+        source_key: prepared.sourceVersionKey,
+        source_input_sha256: prepared.sourceInputSha256,
+        prompt_input_sha256: prepared.promptInputSha256,
+        extraction_contract_version: 2,
+        provider_id: "provider-b",
+        model_id: "model-b",
+        model_variant: "none",
+      })
+      expect(memory?.llm_extraction_audits).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          audit_session_id: "audit-b3",
+          provider_id: "provider-b",
+          model_id: "model-b",
+          model_variant: "none",
+          cache_key: expectedCacheKey,
+          terminal_outcome: "success",
+        }),
+      ]))
+      expect(memory?.processed_sources).toContainEqual(expect.objectContaining({
+        source_key: prepared.sourceVersionKey,
+        extraction_key: expectedCacheKey,
+        extraction_contract_version: 2,
+      }))
+    })
+  })
+
+  describe("B4 — malformed recall input shape marks nothing", () => {
+    function memoryWithDecision() {
+      const memory = emptyMemory("/oracle/b4")
+      memory.decisions = [{
+        id: "b4-decision",
+        topic: "database",
+        decision: "Use PostgreSQL",
+        timestamp: "2026-08-11T00:00:00.000Z",
+        session_id: "prior-session",
+        still_valid: true,
+        foundational: false,
+        provenance: {
+          extractor: "heuristic",
+          source_session_id: "prior-session",
+          confidence: "heuristic",
+          evidence: [],
+        },
+      }]
+      return memory
+    }
+
+    function completedRecall(input: unknown, includeInput = true): TranscriptMessage {
+      const state = includeInput
+        ? { status: "completed", input }
+        : { status: "completed" }
+      return {
+        info: { id: "b4-recall", role: "assistant" },
+        parts: [{ type: "tool", tool: "recall_decision", state } as never],
+      }
+    }
+
+    it("B4-1. null input contributes no marks", () => {
+      const result = markReferencedDecisions(
+        memoryWithDecision(),
+        [completedRecall(null)],
+        "oracle-b4-null",
+      )
+      expect(result.decisions).toHaveLength(1)
+      expect(result.decisions[0]?.last_used_in_session).toBeUndefined()
+    })
+
+    it("B4-2. string input contributes no marks", () => {
+      const result = markReferencedDecisions(
+        memoryWithDecision(),
+        [completedRecall("database")],
+        "oracle-b4-string",
+      )
+      expect(result.decisions).toHaveLength(1)
+      expect(result.decisions[0]?.last_used_in_session).toBeUndefined()
+    })
+
+    it("B4-3. array input contributes no marks", () => {
+      const result = markReferencedDecisions(
+        memoryWithDecision(),
+        [completedRecall([{ query: "database", limit: 10 }])],
+        "oracle-b4-array",
+      )
+      expect(result.decisions).toHaveLength(1)
+      expect(result.decisions[0]?.last_used_in_session).toBeUndefined()
+    })
+
+    it("B4-4. missing input contributes no marks", () => {
+      const result = markReferencedDecisions(
+        memoryWithDecision(),
+        [completedRecall(undefined, false)],
+        "oracle-b4-missing",
+      )
+      expect(result.decisions).toHaveLength(1)
+      expect(result.decisions[0]?.last_used_in_session).toBeUndefined()
+    })
   })
 })

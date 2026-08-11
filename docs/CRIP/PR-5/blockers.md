@@ -121,3 +121,12 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [scope] PR 5 does not claim cross-process in-progress prompt deduplication; concurrent pre-completion requests may both reach model work but converge at the durable completion transaction.
 - [release-verification] `npm run verify:host-contract` passed; `npm run build` passed; the CI-equivalent self-contained bundle check passed for `dist/index.js`, `dist/tui.js`, and `dist/cli.js`; `npm run verify-cli-bundle` passed; `npm run smoke:cli` passed; `bash -n install.sh` and `bash -n bin/tokenmaxxer` passed.
 - [release-gate] No GitHub Actions run for final commit `c9903a4` was available during this implementation session; CI case 84 remains pending independent execution.
+
+## 2026-08-11 — Oracle B1–B4 remediation wave
+- [remediation] B1: `finalLLMMerge` now preserves fresh accepted LLM facts when an incomplete concurrent cache row has no processed-source completion proof; stale payload facts are not promoted.
+- [remediation] B2: source identity and prompt construction now use the same bounded transcript window, including bounded file candidates.
+- [remediation] B3: the health-gated model is now the single persisted extraction-identity authority for cache, audit, and processed-source metadata.
+- [remediation] B4: recall recency rejects missing, null, string, array, and other non-plain `state.input` shapes before applying defaults or querying decisions.
+- [verification] `npx tsc --noEmit` passed after B1–B4 remediation.
+- [verification] `npx vitest run test/memory/writer-llm.test.ts test/memory/writer.test.ts test/memory/model-health.test.ts test/memory/extract-llm.test.ts test/memory/extract.test.ts test/tools/recall.test.ts` passed: 6 files, 197 tests.
+- [verification] `npm test` passed: 38 files, 578 tests; real B1–B4 adversarial regressions are included in `test/memory/writer-llm.test.ts`.
