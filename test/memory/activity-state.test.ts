@@ -33,8 +33,12 @@ describe("memory activity marker", () => {
     first()
     expect(await isMemoryActivityFresh(path)).toBe(true)
     second()
-    await new Promise((resolve) => setTimeout(resolve, 10))
-    expect(await isMemoryActivityFresh(path)).toBe(false)
+    let fresh = true
+    for (let attempt = 0; attempt < 20 && fresh; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      fresh = await isMemoryActivityFresh(path)
+    }
+    expect(fresh).toBe(false)
   })
 
   it("treats malformed and stale state as inactive without throwing", async () => {

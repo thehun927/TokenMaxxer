@@ -263,3 +263,9 @@ decisions, and validation results; do not rewrite prior entries.
 - Full `npm test -- --reporter=dot`: **46 files passed, 838 tests passed**
   locally. CI pass/skip counts will be recorded from the exact remediation
   head after push.
+- Exact-head CI run `31546328092` and its unchanged failed-job rerun both
+  reached the pre-existing asynchronous cleanup assertion in
+  `test/memory/activity-state.test.ts` (line 37). The test asserted marker
+  removal after a fixed 10 ms while `beginMemoryActivity` cleanup is
+  fire-and-forget. It was stabilized with bounded polling; no production
+  behavior changed.
