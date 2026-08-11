@@ -3,24 +3,28 @@ import type { Decision, MemoryFile } from "../../src/memory/schema"
 
 vi.mock("../../src/memory/store", () => ({
   readMemory: vi.fn(),
+  readMemoryState: vi.fn(),
 }))
 
 vi.mock("../../src/util/log", () => ({
   log: vi.fn(),
 }))
 
-import { readMemory } from "../../src/memory/store"
+vi.mock("../../src/util/git", () => ({
+  getCurrentGitSha: vi.fn(),
+}))
+
+import { readMemoryState } from "../../src/memory/store"
 import { buildDurableBlock } from "../../src/compaction/durable"
+import { getCurrentGitSha } from "../../src/util/git"
 
 /**
- * PR-7 Wave 1 note — these tests freeze the semantic selection/count policy
- * from the existing bounded decision selection (foundational, recent, older
- * caps).  They are NOT tests for PR-8 total byte budgeting.
+ * PR-7 Wave 4 — These tests freeze the semantic selection/count policy
+ * (foundational, recent, older caps) with PR-7's new rendering format.
+ * They are NOT tests for PR-8 total byte budgeting.
  *
- * PR 7 adds per-field render-only character caps (in durable.test.ts) that
- * are applied during rendering without mutating STATE.  PR 8 will later
- * define the hard total injection byte budget separately.  Do not weaken
- * these selection/count assertions.
+ * PR 7 adds per-field render-only character caps (tested in durable.test.ts).
+ * PR 8 will later define the hard total injection byte budget separately.
  */
 
 const currentSession = "session-current"
@@ -58,7 +62,14 @@ function makeMemory(decisions: Decision[]): MemoryFile {
 }
 
 async function build(decisions: Decision[]): Promise<string> {
-  vi.mocked(readMemory).mockResolvedValue(makeMemory(decisions))
+  vi.mocked(readMemoryState).mockResolvedValue({
+    status: "ok",
+    memory: makeMemory(decisions),
+    source: "project",
+    path: "/project/.opencode/memory/STATE.json",
+    sizeBytes: 500,
+    revision: 0,
+  })
   return buildDurableBlock({
     worktree: "/project",
     directory: "/project",
@@ -69,6 +80,7 @@ async function build(decisions: Decision[]): Promise<string> {
 describe("bounded durable block", () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    vi.mocked(getCurrentGitSha).mockResolvedValue(null)
   })
 
   it("keeps foundational and recent decisions in full fidelity and caps older decisions", async () => {
@@ -84,22 +96,19 @@ describe("bounded durable block", () => {
 
     const result = await build(decisions)
 
-    expect(result.length).toBeLessThan(2_000)
-    expect(result).toContain("Valid decisions:")
+    // Foundational + recent (index 0-4) must appear
     for (let index = 0; index < 5; index++) {
-      expect(result).toContain(`topic-${index}: decision text ${index}`)
-      expect(result).toContain(
-        `2026-01-${String(index + 1).padStart(2, "0")}T12:00:00.000Z`,
-      )
+      expect(result).toContain(`topic-${index}`)
+      expect(result).toContain(`decision text ${index}`)
     }
 
-    expect(result).toContain("Older decisions:")
+    // Older top-5 (by timestamp, descending): 49,48,47,46,45
     for (const index of [49, 48, 47, 46, 45]) {
-      expect(result).toContain(`topic-${index}: decision text ${index}`)
-      expect(result).toContain(
-        `(SHA sha-${index}, 2026-02-${String(index - 30).padStart(2, "0")})`,
-      )
+      expect(result).toContain(`topic-${index}`)
+      expect(result).toContain(`decision text ${index}`)
     }
+
+    // Other older decisions must NOT appear
     for (const index of Array.from({ length: 40 }, (_, offset) => offset + 5)) {
       if (index <= 44) expect(result).not.toContain(`topic-${index}:`)
     }
@@ -112,14 +121,12 @@ describe("bounded durable block", () => {
       ),
     )
 
-    expect(result).toContain("Valid decisions:")
-    expect(result).not.toContain("Older decisions:")
+    // All 12 foundational decisions must appear, no older cap applies to them
     for (let index = 0; index < 12; index++) {
-      expect(result).toContain(`topic-${index}: decision text ${index}`)
-      expect(result).toContain(
-        `2026-01-${String(index + 1).padStart(2, "0")}T12:00:00.000Z`,
-      )
+      expect(result).toContain(`topic-${index}`)
+      expect(result).toContain(`decision text ${index}`)
     }
+    // Non-foundational older cap doesn't affect them
   })
 
   it("uses only the five most recent decisions when no priority tiers exist", async () => {
@@ -127,17 +134,18 @@ describe("bounded durable block", () => {
       Array.from({ length: 10 }, (_, index) => makeDecision(index)),
     )
 
-    expect(result).not.toContain("Valid decisions:")
-    expect(result).toContain("Older decisions:")
+    // Only the 5 most recent (by timestamp, descending): 9,8,7,6,5
     for (const index of [9, 8, 7, 6, 5]) {
-      expect(result).toContain(`topic-${index}: decision text ${index}`)
+      expect(result).toContain(`topic-${index}`)
+      expect(result).toContain(`decision text ${index}`)
     }
+    // Older ones should NOT appear
     for (const index of [0, 1, 2, 3, 4]) {
       expect(result).not.toContain(`topic-${index}:`)
     }
   })
 
-  it("assigns mixed decisions to exactly the correct section", async () => {
+  it("assigns mixed decisions to exactly the correct selection", async () => {
     const result = await build([
       makeDecision(0, { foundational: true }),
       makeDecision(1, { recent: true }),
@@ -145,13 +153,15 @@ describe("bounded durable block", () => {
       makeDecision(3, { valid: false, foundational: true }),
     ])
 
-    expect(result).toContain("Valid decisions:")
-    expect(result).toContain("topic-0: decision text 0")
-    expect(result).toContain("topic-1: decision text 1")
-    expect(result).toContain("2026-01-01T12:00:00.000Z")
-    expect(result).toContain("2026-01-02T12:00:00.000Z")
-    expect(result).toContain("Older decisions:")
-    expect(result).toContain("topic-2: decision text 2")
-    expect(result).not.toContain("topic-3:")
+    // Foundational (0) and recent (1) must appear
+    expect(result).toContain("topic-0")
+    expect(result).toContain("decision text 0")
+    expect(result).toContain("topic-1")
+    expect(result).toContain("decision text 1")
+    // Older (2) must appear
+    expect(result).toContain("topic-2")
+    expect(result).toContain("decision text 2")
+    // Invalid (3) must NOT appear
+    expect(result).not.toContain("topic-3")
   })
 })

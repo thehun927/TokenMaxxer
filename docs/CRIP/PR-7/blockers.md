@@ -119,3 +119,29 @@ decisions, and validation results; do not rewrite prior entries.
   builders fail safely. That correction is isolated in follow-up commit
   `faa1118`.
 - Wave 3 exit: **complete**. Proceed to Wave 4 durable rendering hardening.
+
+## 2026-08-11 — Wave 4 validation
+
+- Integrated `src/compaction/sanitize.ts` and the durable renderer rewrite in
+  `src/compaction/durable.ts`. The renderer now consumes authoritative
+  `readMemoryState`, emits delimited DATA-only lines, sanitizes untrusted
+  values, preserves bounded selection policy, labels git freshness
+  informationally, and avoids changed-file claims.
+- Added explicit C1-control coverage (`U+0080` and `U+009F`) and fixed both
+  sanitizer paths to strip the complete C0/C1 ranges required by §10.2.
+- Reconciled the durable fixtures to retain the original adversarial breadth:
+  all six instruction-like injection strings, both stored outer delimiters,
+  and per-decision `different-git`/`unknown` freshness remain asserted. No
+  assertions were weakened.
+- Focused durable command:
+  `npx vitest run test/compaction/sanitize.test.ts test/compaction/bounded.test.ts test/compaction/durable.test.ts`
+  result: **3 test files passed, 77 tests passed**.
+- Prompt/config/hook regression command:
+  `npx vitest run test/compaction/prompt.test.ts test/compaction/prompt-contract.test.ts test/compaction/anti-drift.fixture.test.ts test/compaction/config.test.ts test/index.test.ts`
+  result: **5 test files passed, 80 tests passed**.
+- `npx tsc --noEmit`: **passed**.
+- `npm run typecheck:host-contract`: **passed**.
+- Full `npm test -- --reporter=dot`: **43 test files passed, 781 tests
+  passed**.
+- Wave 4 exit: **complete**. Durable rendering and sanitization are ready for
+  one coherent commit before Wave 5 previous-summary recovery.

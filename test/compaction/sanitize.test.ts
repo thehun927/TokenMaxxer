@@ -82,6 +82,8 @@ describe("sanitizeDurableValue — control character normalization", () => {
     { char: "\x0c", label: "FF" },
     { char: "\x1b", label: "ESC" },
     { char: "\x7f", label: "DEL" },
+    { char: "\x80", label: "C1 control" },
+    { char: "\x9f", label: "C1 control upper bound" },
   ]
 
   for (const { char, label } of C0_CHARS) {
@@ -169,8 +171,13 @@ describe("sanitizeDurableValue — truncation by Unicode code points", () => {
     // Length of the truncated content (before marker) must not exceed max code points
     const beforeMarker = result.split(TRUNC_MARKER)[0]!
     expect([...beforeMarker].length).toBeLessThanOrEqual(max)
-    // Must not contain lone surrogates (U+D800–U+DFFF)
-    expect(beforeMarker).not.toMatch(/[\uD800-\uDFFF]/)
+    // Must not contain unpaired surrogates.  Valid surrogate pairs (emoji)
+    // appear as 2-char elements in [...]; unpaired surrogates appear as
+    // single-char elements in the surrogate range.
+    const unpaired = [...beforeMarker].some(
+      (c) => c.length === 1 && c >= "\uD800" && c <= "\uDFFF",
+    )
+    expect(unpaired).toBe(false)
   })
 
   it("appends explicit truncation marker when capped", () => {
