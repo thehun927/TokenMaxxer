@@ -114,3 +114,10 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [verification] `npx tsc --noEmit` passed after remediation.
 - [verification] `npx vitest run test/memory/writer.test.ts test/memory/writer-llm.test.ts test/memory/model-health.test.ts test/memory/source-processing.test.ts test/memory/transaction.test.ts test/memory/store.test.ts test/tools/recall.test.ts` passed: 7 files, 203 tests.
 - [verification] `npm test` passed: 38 files, 572 tests.
+
+## 2026-08-11 — Wave 8 audit and release evidence
+- [audit] Production audit found no remaining violations for source-version queue keys, structured recall replay, formatted-output parsing, split processed-source writes, or network calls inside `mutateMemory`; the two discovered blockers were remediated above.
+- [audit] Legacy `canonical_input_sha256` fields and legacy cache-key helpers remain only for compatibility/readability paths; current production idempotency uses explicit source/prompt/contract/model identity. Callers that omit explicit source identity retain a latent compatibility fallback and are not part of the production idle path.
+- [scope] PR 5 does not claim cross-process in-progress prompt deduplication; concurrent pre-completion requests may both reach model work but converge at the durable completion transaction.
+- [release-verification] `npm run verify:host-contract` passed; `npm run build` passed; the CI-equivalent self-contained bundle check passed for `dist/index.js`, `dist/tui.js`, and `dist/cli.js`; `npm run verify-cli-bundle` passed; `npm run smoke:cli` passed; `bash -n install.sh` and `bash -n bin/tokenmaxxer` passed.
+- [release-gate] No GitHub Actions run for final commit `c9903a4` was available during this implementation session; CI case 84 remains pending independent execution.
