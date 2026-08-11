@@ -99,3 +99,4 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [verification] `npx tsc --noEmit` passed after the Wave 5 implementation and contract polish.
 - [verification] `npx vitest run test/memory/writer-llm.test.ts test/memory/extract-llm.test.ts test/memory/source-processing.test.ts test/memory/transaction.test.ts test/memory/store.test.ts test/memory/extract.test.ts` passed: 6 files, 127 tests.
 - [verification] `npm test` passed: 38 files, 551 tests.
+- [doc-clarification] The Wave-4 STATE-unavailable mapping note above is retained as history; the Wave-5 implementation now maps preparation-time authoritative STATE unavailability to `write-failed`, satisfying the existing PR-1 regression. The complete Wave-6 public outcome state machine and centralized publication work remain out of scope and unimplemented.
