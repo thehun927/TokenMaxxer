@@ -14,8 +14,8 @@ This directory is the canonical home for TokenMaxxer's **Concrete Reliability Im
 | PR 1 | Storage authority and read semantics | **Complete — Ship** | [`PR-1/`](./PR-1/) |
 | PR 2 | Cross-process transactions | **Complete — Ship** | [`PR-2/`](./PR-2/) |
 | PR 3 | Decision authority and promotion trust | **Complete — Ship** | [`PR-3/`](./PR-3/) |
-| PR 4 | OpenCode host contract | **Implementation plan ready** | [`PR-4/`](./PR-4/) |
-| PR 5 | Source idempotency and truthful outcomes | Planned | `PR-5/` |
+| PR 4 | OpenCode host contract | **Complete — Ship** | [`PR-4/`](./PR-4/) |
+| PR 5 | Source idempotency and truthful outcomes | **Next** | `PR-5/` |
 | PR 6 | Complete LLM trust boundary | Planned | `PR-6/` |
 | PR 7 | Compaction quality and anti-drift | Planned | `PR-7/` |
 | PR 8 | Guaranteed storage and injection budgets | Planned | `PR-8/` |
