@@ -48,10 +48,7 @@ describe("mergeMemory", () => {
       next_steps: ["step1"],
       decisions: [],
     };
-    const extracted = {
-      ...makeExtracted({ decisions: [{ topic: "db", decision: "Use MySQL", evidence_refs: ["tr-1"] }] }),
-    };
-    const meta = {
+    const llmMeta = {
       sessionId: "session-1",
       gitSha: "abc123",
       timestamp: new Date().toISOString(),
@@ -59,7 +56,7 @@ describe("mergeMemory", () => {
       auditSessionID: "audit-1",
       evidenceCandidates: {
         "tr-1": {
-          kind: "transcript",
+          kind: "transcript" as const,
           ref: "tr-1",
           digest: "a".repeat(64),
           text: "dummy transcript",
@@ -67,7 +64,10 @@ describe("mergeMemory", () => {
         },
       },
     };
-    const result = mergeMemory(existing, extracted, meta);
+    // Wave 7: Use the typed decisions-only entry point directly.
+    const result = mergeLLMDecisionFacts(existing, {
+      decisions: [{ topic: "db", decision: "Use MySQL", evidence_refs: ["tr-1"] }],
+    }, llmMeta);
     expect(result.current_task).toBe(existing.current_task);
     expect(result.active_files).toEqual(existing.active_files);
     expect(result.blockers).toEqual(existing.blockers);
@@ -295,14 +295,22 @@ describe("mergeMemory", () => {
       } as never],
     })
 
-    const result = mergeMemory(existing, extracted, {
+    const llmConflictMeta = {
       ...meta,
-      origin: "llm",
+      origin: "llm" as const,
       auditSessionID: "audit-1",
       evidenceCandidates: {
-        "tr-1": { kind: "transcript", ref: "tr-1", digest: "b".repeat(64) },
+        "tr-1": { kind: "transcript" as const, ref: "tr-1", digest: "b".repeat(64) },
       },
-    })
+    }
+    // Wave 7: Use the typed decisions-only entry point directly.
+    const result = mergeLLMDecisionFacts(existing, {
+      decisions: [{
+        topic: "database",
+        decision: "Use MySQL instead",
+        evidence_refs: ["tr-1"],
+      }],
+    }, llmConflictMeta)
 
     expect(result.decisions.find((d) => d.id === "heuristic-1")).toMatchObject({
       still_valid: true,
@@ -448,9 +456,10 @@ describe("PR 3 §7 merge semantics", () => {
       ],
     }
 
-    const result = mergeMemory(existing, makeExtracted({
-      decisions: [{ topic: "database", decision: "Use Postgres", evidence_refs: ["tr-1"] } as never],
-    }), llmMeta)
+    // Wave 7: Use the typed decisions-only entry point directly.
+    const result = mergeLLMDecisionFacts(existing, {
+      decisions: [{ topic: "database", decision: "Use Postgres", evidence_refs: ["tr-1"] }],
+    }, llmMeta)
 
     const valid = result.decisions.filter((d) => d.topic === "database" && d.still_valid)
     // Corroboration enriches the one stable authority instead of appending a
@@ -469,9 +478,10 @@ describe("PR 3 §7 merge semantics", () => {
       ],
     }
 
-    const result = mergeMemory(existing, makeExtracted({
-      decisions: [{ topic: "database", decision: "Use MySQL", evidence_refs: ["tr-1"] } as never],
-    }), llmMeta)
+    // Wave 7: Use the typed decisions-only entry point directly.
+    const result = mergeLLMDecisionFacts(existing, {
+      decisions: [{ topic: "database", decision: "Use MySQL", evidence_refs: ["tr-1"] }],
+    }, llmMeta)
 
     const h = result.decisions.find((d) => d.id === "h1")!
     expect(h.still_valid).toBe(true)
@@ -503,9 +513,10 @@ describe("PR 3 §7 merge semantics", () => {
       ],
     }
 
-    const result = mergeMemory(existing, makeExtracted({
-      decisions: [{ topic: "database", decision: "Use MySQL", evidence_refs: ["tr-1"] } as never],
-    }), llmMeta)
+    // Wave 7: Use the typed decisions-only entry point directly.
+    const result = mergeLLMDecisionFacts(existing, {
+      decisions: [{ topic: "database", decision: "Use MySQL", evidence_refs: ["tr-1"] }],
+    }, llmMeta)
 
     const human = result.decisions.find((d) => d.id === "human-1")!
     expect(human.still_valid).toBe(true)
@@ -534,9 +545,10 @@ describe("PR 3 §7 merge semantics", () => {
       ],
     }
 
-    const result = mergeMemory(existing, makeExtracted({
-      decisions: [{ topic: "database", decision: "Use DynamoDB", evidence_refs: ["tr-1"] } as never],
-    }), llmMeta)
+    // Wave 7: Use the typed decisions-only entry point directly.
+    const result = mergeLLMDecisionFacts(existing, {
+      decisions: [{ topic: "database", decision: "Use DynamoDB", evidence_refs: ["tr-1"] }],
+    }, llmMeta)
 
     const legacy = result.decisions.find((d) => d.id === "legacy-1")!
     expect(legacy.still_valid).toBe(false)
@@ -743,12 +755,11 @@ describe("PR 3 wave-9 — durable human conflict quarantine", () => {
   })
 })
 
-// ─── PR 6 Wave 1 — LLM decisions-only trust boundary ─────────────────────────
-// The PR-6 trust boundary says the LLM path in mergeMemory is decisions-only:
-// it must not mutate current_task, active_files, blockers, or next_steps.
-// These tests document the boundary. Tests that fail against current production
-// code reveal where the boundary is not yet enforced.
-describe("PR 6 Wave 1 — LLM decisions-only trust boundary", () => {
+// ─── PR 6 Wave 7 — LLM decisions-only trust boundary ─────────────────────────
+// The PR-6 trust boundary says the LLM path is decisions-only via
+// mergeLLMDecisionFacts: it must not mutate current_task, active_files,
+// blockers, or next_steps. These tests enforce the enforced boundary.
+describe("PR 6 Wave 7 — LLM decisions-only trust boundary", () => {
   const llmMeta = {
     ...meta,
     origin: "llm" as const,
@@ -764,7 +775,7 @@ describe("PR 6 Wave 1 — LLM decisions-only trust boundary", () => {
     },
   }
 
-  it("LLM merge cannot mutate current_task when extracted task is non-null and existing has heuristic provenance", () => {
+  it("LLM merge cannot mutate current_task when existing has heuristic provenance", () => {
     const existing = {
       ...emptyMemory("/test"),
       current_task: "Existing heuristic task",
@@ -775,12 +786,10 @@ describe("PR 6 Wave 1 — LLM decisions-only trust boundary", () => {
         evidence: [],
       },
     }
-    const extracted = makeExtracted({
-      current_task: "LLM-injected task override",
-      decisions: [{ topic: "db", decision: "Use Postgres" }],
-    })
-    const result = mergeMemory(existing, extracted, llmMeta)
-    // PR-6: LLM decisions-only merge must not overwrite an existing heuristic task
+    // Wave 7: Use the typed decisions-only entry point directly.
+    const result = mergeLLMDecisionFacts(existing, {
+      decisions: [{ topic: "db", decision: "Use Postgres", evidence_refs: ["tr-1"] }],
+    }, llmMeta)
     expect(result.current_task).toBe("Existing heuristic task")
     expect(result.current_task_provenance?.extractor).toBe("heuristic")
   })
@@ -792,12 +801,10 @@ describe("PR 6 Wave 1 — LLM decisions-only trust boundary", () => {
         { path: "src/main.ts", reason: "entry point", last_touched: "2026-08-01T00:00:00Z" },
       ],
     }
-    const extracted = makeExtracted({
-      active_files: [{ path: "src/llm-file.ts", reason: "LLM claim" }],
-      decisions: [{ topic: "db", decision: "Use Postgres" }],
-    })
-    const result = mergeMemory(existing, extracted, llmMeta)
-    // PR-6: LLM decisions-only merge cannot add, replace, or erase files.
+    // Wave 7: Use the typed decisions-only entry point directly.
+    const result = mergeLLMDecisionFacts(existing, {
+      decisions: [{ topic: "db", decision: "Use Postgres", evidence_refs: ["tr-1"] }],
+    }, llmMeta)
     expect(result.active_files).toEqual(existing.active_files)
     expect(result.active_files.some(f => f.path === "src/main.ts")).toBe(true)
   })
@@ -807,14 +814,11 @@ describe("PR 6 Wave 1 — LLM decisions-only trust boundary", () => {
       ...emptyMemory("/test"),
       blockers: ["Existing blocker: awaiting review"],
     }
-    const extracted = makeExtracted({
-      blockers: ["LLM-injected blocker"],
-      decisions: [{ topic: "db", decision: "Use Postgres" }],
-    })
-    const result = mergeMemory(existing, extracted, llmMeta)
-    // PR-6 boundary: LLM decisions-only merge must never overwrite blockers.
-    // This currently FAILS because mergeMemory unconditionally sets
-    // `blockers: extracted.blockers` regardless of origin.
+    // Wave 7: Use the typed decisions-only entry point directly.
+    const result = mergeLLMDecisionFacts(existing, {
+      decisions: [{ topic: "db", decision: "Use Postgres", evidence_refs: ["tr-1"] }],
+    }, llmMeta)
+    // Wave 7: mergeLLMDecisionFacts preserves all non-decision state.
     expect(result.blockers).toEqual(["Existing blocker: awaiting review"])
   })
 
@@ -823,14 +827,11 @@ describe("PR 6 Wave 1 — LLM decisions-only trust boundary", () => {
       ...emptyMemory("/test"),
       next_steps: ["Existing step: run integration tests"],
     }
-    const extracted = makeExtracted({
-      next_steps: ["LLM-injected next step"],
-      decisions: [{ topic: "db", decision: "Use Postgres" }],
-    })
-    const result = mergeMemory(existing, extracted, llmMeta)
-    // PR-6 boundary: LLM decisions-only merge must never overwrite next_steps.
-    // This currently FAILS because mergeMemory unconditionally sets
-    // `next_steps: extracted.next_steps` regardless of origin.
+    // Wave 7: Use the typed decisions-only entry point directly.
+    const result = mergeLLMDecisionFacts(existing, {
+      decisions: [{ topic: "db", decision: "Use Postgres", evidence_refs: ["tr-1"] }],
+    }, llmMeta)
+    // Wave 7: mergeLLMDecisionFacts preserves all non-decision state.
     expect(result.next_steps).toEqual(["Existing step: run integration tests"])
   })
 })
@@ -866,10 +867,10 @@ describe("PR 6 Wave 1 — extractor/confidence pairing", () => {
 
   it("LLM origin produces extractor=llm + confidence=llm-corroborated with audit session ID and 1-3 transcript evidence", () => {
     const existing = emptyMemory("/test")
-    const extracted = makeExtracted({
-      decisions: [{ topic: "db", decision: "Use Postgres", evidence_refs: ["tr-1"] } as never],
-    })
-    const result = mergeMemory(existing, extracted, llmMeta)
+    // Wave 7: Use the typed decisions-only entry point directly.
+    const result = mergeLLMDecisionFacts(existing, {
+      decisions: [{ topic: "db", decision: "Use Postgres", evidence_refs: ["tr-1"] }],
+    }, llmMeta)
     const provenance = result.decisions[0]?.provenance
     expect(provenance?.extractor).toBe("llm")
     expect(provenance?.confidence).toBe("llm-corroborated")

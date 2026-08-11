@@ -269,39 +269,33 @@ describe("v1 structured extraction", () => {
     }))
   })
 
-  it("does not create a session for a validated cache hit", async () => {
+  it("does not short-circuit on caller cache lookups — always creates/prompts audit sessions", async () => {
+    // Wave 7: The extractFactsLLM function no longer accepts a cachedFacts shortcut.
+    // Cache decisions are governed by the caller's processed-source ledger.
     const client = {
       session: {
-        create: vi.fn(),
-        prompt: vi.fn(),
+        create: vi.fn(async () => ({ data: { id: "audit-cache" } })),
+        prompt: vi.fn(async () => ({
+          data: { info: { structured: { decisions: [{ topic: "t", decision: "d", evidence_refs: ["tr-source-evidence"] }] } } },
+        })),
       },
     }
     const input = canonical()
     const model = { providerID: "anthropic", modelID: "haiku" }
-    const entry = makeExtractionCacheEntry({
-      sourceSessionID: "source",
-      canonicalInput: input,
-      model,
-      facts,
-      auditSessionID: "audit-cache",
-      evidence: [{ kind: "transcript", ref: "tr-source-evidence", digest: "a".repeat(64) }],
-    })
-    const memory = { ...emptyMemory("/worktree"), llm_extraction_cache: [entry] }
+    await extractFactsLLM(
+      input,
+      "source",
+      "project",
+      client,
+      { enabled: true, model },
+      { directory: "/worktree", ...evidenceOptions },
+    )
+    // Wave 7: Always creates an audit session and prompts (no cachedFacts shortcut).
+    expect(client.session.create).toHaveBeenCalled()
+    expect(client.session.prompt).toHaveBeenCalled()
+  })
 
-     const cached = readExtractionCache(memory, entry.cache_key)
-     await expect(extractFactsLLM(
-       input,
-       "source",
-       "project",
-       client,
-       { enabled: true, model },
-       { directory: "/worktree", cachedFacts: cached, ...evidenceOptions },
-     )).resolves.toEqual({ status: "success", facts })
-     expect(client.session.create).not.toHaveBeenCalled()
-     expect(client.session.prompt).not.toHaveBeenCalled()
-   })
-
-   it("retries exactly once for invalid structured output and request errors", async () => {
+  it("retries exactly once for invalid structured output and request errors", async () => {
      const invalidThenError = vi.fn()
        .mockResolvedValueOnce({ data: { info: { structured: { nope: true } } } })
        .mockRejectedValueOnce(new Error("request failed"))

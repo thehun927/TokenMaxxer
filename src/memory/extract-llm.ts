@@ -414,8 +414,6 @@ export async function getLLMConfig(
   options?: {
     /** Used by the writer to gate a model after a real failed extraction. */
     memory?: HealthMemoryFile | null
-    /** Resolve a model for an already accepted cache lookup. */
-    ignoreHealth?: boolean
     /** Bypass only the model cooldown check while still respecting the host gate. */
     bypassModelCooldown?: boolean
   },
@@ -424,13 +422,11 @@ export async function getLLMConfig(
     return { enabled: false, reason: "TOKENMAXXER_LLM_EXTRACT is disabled" }
   }
 
-  if (!options?.ignoreHealth) {
-    const hostGate = await getHostStructuredContractGate(clientValue)
-    if (!hostGate.allowed) {
-      return {
-        enabled: false,
-        reason: `host structured contract gate: ${hostGate.reason}`,
-      }
+  const hostGate = await getHostStructuredContractGate(clientValue)
+  if (!hostGate.allowed) {
+    return {
+      enabled: false,
+      reason: `host structured contract gate: ${hostGate.reason}`,
     }
   }
 
@@ -455,7 +451,6 @@ export async function getLLMConfig(
       client,
       directory,
       configuredModel,
-      options?.ignoreHealth,
     )
     lastModelResolution = {
       candidate_count: 1,
@@ -466,7 +461,7 @@ export async function getLLMConfig(
       ...(resolved.reason ? { reason: resolved.reason } : {}),
     }
     if (resolved.reason) return { enabled: false, reason: resolved.reason }
-    const skipCooldown = options?.ignoreHealth || options?.bypassModelCooldown
+    const skipCooldown = options?.bypassModelCooldown
     if (!skipCooldown && isModelCoolingDown(options?.memory, resolved.model)) {
       lastModelResolution = {
         ...lastModelResolution,
@@ -483,7 +478,7 @@ export async function getLLMConfig(
   const discovered = await discoverFreeSmallModel(
     client,
     directory,
-    (options?.ignoreHealth || options?.bypassModelCooldown) ? null : options?.memory,
+    options?.bypassModelCooldown ? null : options?.memory,
   )
   if (discovered.model) {
     lastModelResolution = {
@@ -596,8 +591,6 @@ export interface ExtractFactsLLMOptions {
   directory?: string
   /** Stable resolved project key for process-local in-flight coalescing. */
   projectKey?: string
-  /** A validated cache result, checked before creating an audit session. */
-  cachedFacts?: LLMDecisionFacts | null
   /**
    * Ephemeral deterministic evidence candidates.  Candidate text is accepted
    * here only so the caller can corroborate the current transcript; it is
@@ -863,13 +856,6 @@ export async function extractFactsLLM(
     return { status: "unavailable", reason: "missing-session-endpoint" }
   }
 
-  // A validated cache hit is already a successful extraction result.  It must
-  // be returned before checking the optional session capability so cache hits
-  // never create or prompt an audit session.
-  if (options?.cachedFacts) {
-    return { status: "success", facts: options.cachedFacts }
-  }
-
   const client = (clientValue ?? {}) as V1ClientLike
   if (!client.session?.create || !client.session.prompt) {
     // Wave 6: Missing session endpoints -> unavailable (no model request attempted)
@@ -917,10 +903,6 @@ async function extractFactsLLMOnce(
   if (!config.enabled || !config.model) {
     // Wave 6: No model available -> unavailable (no model request attempted)
     return { status: "unavailable", reason: "missing-session-endpoint" }
-  }
-
-  if (options?.cachedFacts) {
-    return { status: "success", facts: options.cachedFacts }
   }
 
   const client = (clientValue ?? {}) as V1ClientLike

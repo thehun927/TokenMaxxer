@@ -390,7 +390,6 @@ async function processPreparedIdleSource(
         sessionId,
         gitSha,
         timestamp: new Date().toISOString(),
-        origin: "heuristic",
         evidenceCandidates: mergedCandidates,
       })
       const heuristicMemory = pruneOld(recordRecentSession(merged, sessionId), client)
@@ -499,19 +498,6 @@ async function processPreparedIdleSource(
     // the normal gated extraction path.
     void log(client, "debug", "llm extraction cache entry ignored without completion marker")
   }
-
-  // Use gated config for current-contract cache lookup (ignoreHealth: true)
-  const cacheConfig = await getLLMConfig(client, directory, { ignoreHealth: true })
-  if (!cacheConfig.model) {
-    void log(client, "info", "llm extraction skipped: model unavailable", {
-      reason: boundedDiagnosticValue(cacheConfig.reason ?? "model resolution returned no model"),
-    })
-    return "heuristic-only"
-  }
-  void log(client, "info", "llm extraction model resolved", {
-    provider: boundedDiagnosticValue(cacheConfig.model.providerID),
-    model: boundedDiagnosticValue(cacheConfig.model.modelID),
-  })
 
   // Continue with LLM extraction...
   const projectName = basename(project) || project
@@ -1027,47 +1013,6 @@ function setAuditTerminalOutcome(
         : audit
     )),
   }
-}
-
-/** Merge cache/LLM facts against the state that exists at merge time. */
-export async function mergeAsyncFacts(
-  opts: { client: unknown; worktree: string; directory: string; sessionId: string },
-  facts: ExtractedFacts,
-  gitSha: string | null,
-  sessionId: string,
-  mergeOptions: MergeOptions,
-): Promise<boolean> {
-  const project = resolveProjectPath(opts.worktree, opts.directory)
-  // Cache-hit merge is one short transaction (PR 2 §11.E). On any
-  // lock/read/commit failure return false so the writer maps it to "llm-failed".
-  const result = await mutateMemory<{ outcome: "committed" | "noop"; memory: MemoryFile }>(
-    { worktree: opts.worktree, directory: opts.directory, client: opts.client },
-    (base) => {
-      const merged = mergeMemory(base, facts, {
-        sessionId,
-        gitSha,
-        timestamp: new Date().toISOString(),
-        ...mergeOptions,
-      })
-      const finalMemory = pruneOld(recordRecentSession(merged, sessionId), opts.client)
-      return { kind: "commit", memory: finalMemory, value: { outcome: "committed", memory: finalMemory } }
-    },
-  )
-  if (result.status === "lock-timeout") {
-    void log(opts.client, "warn", "cache-hit transaction lock-timeout", { project })
-    return false
-  }
-  if (result.status === "unavailable") {
-    void log(opts.client, "warn", "cache-hit transaction unavailable", { project })
-    return false
-  }
-  if (result.status === "commit-failed") {
-    void log(opts.client, "warn", "cache-hit transaction commit-failed", { project })
-    return false
-  }
-  // HEADER is best-effort and lives outside the lock.
-  await writeHeaderBestEffort(opts.client, opts.worktree, opts.directory, result.value.memory)
-  return true
 }
 
 // ─── extractFactsHeuristic ───────────────────────────────────────────────────
@@ -1765,39 +1710,25 @@ export function markReferencedDecisions(
 
 // ─── mergeMemory ─────────────────────────────────────────────────────────────
 
-type MergeOptions = {
-  origin?: "heuristic" | "llm"
-  auditSessionID?: string
-  evidenceCandidates?: EvidenceCandidateMap
-  provenanceEvidence?: Evidence[]
-}
-
 type MergeMeta = {
   sessionId: string
   gitSha: string | null
   timestamp: string
-} & MergeOptions
+  evidenceCandidates?: EvidenceCandidateMap
+}
 
 function normalizedFact(value: string): string {
   return value.toLowerCase().trim().replace(/\s+/g, " ")
-}
-
-function existingProvenance(value: { provenance?: Provenance }): Provenance | undefined {
-  return value.provenance
 }
 
 function makeProvenance(
   meta: MergeMeta,
   evidence: Evidence[],
 ): Provenance {
-  const llm = meta.origin === "llm"
   return {
-    extractor: llm ? "llm" : "heuristic",
+    extractor: "heuristic",
     source_session_id: meta.sessionId,
-    ...(llm && meta.auditSessionID
-      ? { source_audit_session_id: meta.auditSessionID }
-      : {}),
-    confidence: llm ? "llm-corroborated" : "heuristic",
+    confidence: "heuristic",
     evidence: evidence.slice(0, 3),
   }
 }
@@ -1844,7 +1775,7 @@ export function mergeHeuristicMemory(
   if (extracted.current_task !== null) {
     current_task = extracted.current_task
     current_task_provenance = makeProvenance(
-      { ...meta, origin: "heuristic" },
+      meta,
       heuristicEvidenceFor({ decision: extracted.current_task }, meta.evidenceCandidates),
     )
   }
@@ -1859,7 +1790,7 @@ export function mergeHeuristicMemory(
       reason: oldReason && isGeneric ? oldReason : f.reason,
       last_touched: meta.timestamp,
       provenance: makeProvenance(
-        { ...meta, origin: "heuristic" },
+        meta,
         heuristicEvidenceFor(f, meta.evidenceCandidates),
       ),
     }
@@ -1885,19 +1816,12 @@ export function mergeHeuristicMemory(
   }
 }
 
-/** Compatibility dispatcher for pre-Wave4 callers; production paths use typed entry points. */
+/** Heuristic-only merge entry point for pre-Wave4 callers. */
 export function mergeMemory(
   existing: MemoryFile,
   extracted: ExtractedFacts,
   meta: MergeMeta,
 ): MemoryFile {
-  if (meta.origin === "llm") {
-    return mergeLLMDecisionFacts(
-      existing,
-      { decisions: extracted.decisions as LLMDecisionFacts["decisions"] },
-      meta,
-    )
-  }
   return mergeHeuristicMemory(existing, extracted, meta)
 }
 

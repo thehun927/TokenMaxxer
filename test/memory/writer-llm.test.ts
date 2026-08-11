@@ -11,7 +11,6 @@ import {
   persistAuditGuard,
   persistTerminalTransaction,
   persistModelHealth,
-  mergeAsyncFacts,
   finalLLMMerge,
   markReferencedDecisions,
   pruneOld,
@@ -366,11 +365,11 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
     })
     const messages = appLog.mock.calls.map(([call]) => call.body.message)
     expect(messages).toEqual(expect.arrayContaining([
-      "llm extraction model resolved",
+      "llm extraction gated model resolved",
       "llm extraction audit session requested",
       "llm extraction facts merged",
     ]))
-    expect(appLog.mock.calls.find(([call]) => call.body.message === "llm extraction model resolved")?.[0].body.extra)
+    expect(appLog.mock.calls.find(([call]) => call.body.message === "llm extraction gated model resolved")?.[0].body.extra)
       .toEqual({ provider: "provider", model: "model" })
   })
 
@@ -708,60 +707,6 @@ describe("Wave 4 deferred — model-health transaction failure is best-effort", 
 
     // No fallback writeMemory after the transaction failure.
     expect(writeSpy).not.toHaveBeenCalled()
-  })
-})
-
-describe("Wave 4 deferred — cache-hit transaction is inside the lock", () => {
-  it("times out against a held lock and writes no STATE", async () => {
-    const worktree = await makeWorktree()
-    const project = worktree
-    const barrier = join(tmpdir(), `w4-cache-lock-${Date.now()}-${Math.random()}`)
-    barrierFiles.push(barrier, `${barrier}.release`)
-
-    // Seed a cache row so the cache-hit path is exercised.
-    const prior = emptyMemory(project)
-    const messages = sourceMessages()
-    const model = { providerID: "provider", modelID: "model" }
-    // Wave 5: Cache stores only decisions
-    const cachedFacts = {
-      decisions: [{
-        topic: "cached-decision",
-        decision: "Use cached DB",
-        evidence_refs: [makeTranscriptEvidenceRef("m1")],
-      }],
-    }
-    const cachedEvidenceRef = makeTranscriptEvidenceRef("m1")
-    const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[cachedEvidenceRef]!
-    prior.llm_extraction_cache = [makeExtractionCacheEntry({
-      sourceSessionID: "source-cache",
-      canonicalInput: buildCanonicalInput(messages, prior),
-      model,
-      facts: cachedFacts,
-      auditSessionID: "audit-cache",
-      evidence: [{ kind: "transcript", ref: cachedEvidenceRef, digest: cachedEvidence.digest }],
-    })]
-    await writeMemory({ worktree, directory: worktree }, prior)
-
-    // A child holds the project lock behind a barrier.
-    const child = runWorker([project, "hold-lock", barrier])
-    await waitFor(barrier)
-
-    const result = await mergeAsyncFacts(
-      { client: {}, worktree, directory: worktree, sessionId: "source-cache" },
-      cachedFacts,
-      null,
-      "source-cache",
-      { origin: "llm", auditSessionID: "audit-cache", evidenceCandidates: {} },
-    )
-
-    expect(result).toBe(false)
-    // No STATE was written while the lock was held.
-    const memory = await readMemory({ worktree, directory: worktree })
-    expect(memory?.revision).toBe(0)
-
-    await writeFile(`${barrier}.release`, "go", "utf-8")
-    const { code } = await child
-    expect(code).toBe(0)
   })
 })
 

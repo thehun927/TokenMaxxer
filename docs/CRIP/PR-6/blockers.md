@@ -97,3 +97,14 @@ Append-only implementation log for PR 6. Do not delete or rewrite prior entries.
 - [verification] `npm test` passed: 38 files, 632 tests.
 - [scope] All five previously gated provenance tests are re-enabled and green;
   no Wave 7 cleanup has started.
+
+## 2026-08-11 — Wave 7 obsolete seam cleanup
+
+- [audit] Removed the redundant second model lookup, extractor `cachedFacts`
+  early-success path, obsolete `mergeAsyncFacts()` seam, and compatibility
+  `origin:"llm"` full-facts dispatcher.
+- [audit] Repository search found no `firstCandidateEvidence` helper/use. The
+  remaining `ExtractedFacts` references are heuristic-only; remaining
+  `origin:"llm"` is confined to the decisions-only merge function.
+- [verification] `npx tsc --noEmit` passed and `npm test` passed: 38 files, 631
+  tests.
