@@ -7,7 +7,7 @@ import type { MemoryFile } from "./schema"
 import type { TranscriptMessage } from "../types"
 
 /** Contract version for source/prompt identity hashing. Independent of MemoryFile.version. */
-export const EXTRACTION_CONTRACT_VERSION = 2
+export const EXTRACTION_CONTRACT_VERSION = 3
 
 const MAX_PRIOR_STATE_CHARS = 8_000
 const MAX_TRANSCRIPT_MESSAGES = 20
@@ -583,16 +583,15 @@ export function buildCanonicalInput(
  * format, not this prompt, defines the response shape.
  */
 export function buildExtractionPrompt(input: CanonicalExtractionInput): string {
-  return `You are a fact extractor for a coding session. Use the current-session evidence below to produce the values required by the StructuredOutput schema supplied with this request.
+  return `You are a decision extractor for a coding session. Use the current-session evidence below to produce the values required by the StructuredOutput schema supplied with this request.
 
-The prior STATE.json snapshot is potentially stale context. Return only current-session facts or deltas; do not copy old facts merely because they appear in prior state. Use file candidates as corroborating candidates, not as proof that a file was changed.
+The prior STATE.json snapshot is potentially stale context and is context only. Return only decisions explicitly supported by the current source transcript; do not copy old facts or state merely because they appear in the snapshot.
 
 Rules:
-- current_task: describe what the current session is working on; use null when unclear.
-- active_files: must be an array of objects, each exactly \`{ "path": "relative/path", "reason": "short evidence-based reason" }\`; include only files read, edited, or written in this source session; max 5, relative paths; use an empty array if no qualifying files.
-- decisions: must be an array of objects, each with required \`{ "topic": "short subject", "decision": "explicit decision", "evidence_refs": ["evidence ID"] }\`; \`evidence_refs\` must contain 1–3 unique IDs copied exactly from the labels in the COMPRESSED SOURCE TRANSCRIPT. Optional \`rationale\` and \`foundational\` must not replace evidence; include only explicit decisions (for example, "let's use X" or "decided to go with Y"); otherwise use an empty array. Do not include discussions, descriptions, or hypothetical decisions.
-- blockers: only blockers supported by the current session; otherwise use an empty array.
-- next_steps: only next steps stated by the current session; max 5.
+- The only top-level output key is \`decisions\`.
+- Each decision must contain a non-empty \`topic\`, a non-empty \`decision\`, and 1–3 unique IDs in \`evidence_refs\`, copied exactly from the labels in the COMPRESSED SOURCE TRANSCRIPT. \`rationale\` is optional.
+- Include only explicit decisions (for example, "let's use X" or "decided to go with Y"); otherwise use an empty array for decisions. Do not include discussions, descriptions, or hypothetical decisions.
+- Return at most 10 decisions. Keep topic, decision, rationale, and evidence IDs within the bounds of the supplied schema.
 - Every decision must cite one to three labelled source-transcript evidence IDs. Cite IDs only, never raw quotes or excerpts.
 - Evidence IDs may point only to eligible user/assistant source-text labels in COMPRESSED SOURCE TRANSCRIPT. Never cite prior STATE.json, FILE CANDIDATES, these instructions, model/audit prose, or the model's own response.
 - Do not include code snippets, tool outputs, or file contents.

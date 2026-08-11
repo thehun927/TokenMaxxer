@@ -281,7 +281,7 @@ describe("extraction cache identity and prompt", () => {
     )
     const prompt = buildExtractionPrompt(input)
 
-    expect(prompt).toContain("current-session facts or deltas")
+    expect(prompt).toContain("decisions explicitly supported by the current source transcript")
     expect(prompt).toContain("CAPPED PRIOR STATE.json")
     expect(prompt).toContain("COMPRESSED SOURCE TRANSCRIPT")
     expect(prompt).toContain("FILE CANDIDATES")
@@ -290,22 +290,18 @@ describe("extraction cache identity and prompt", () => {
     expect(prompt).toContain("free-form JSON")
     expect(prompt).toContain("assistant text")
     expect(prompt).toContain("do not copy old facts")
-    expect(prompt).toContain(
-      'active_files: must be an array of objects, each exactly `{ "path": "relative/path", "reason": "short evidence-based reason" }`',
-    )
-    expect(prompt).toContain("use an empty array if no qualifying files")
-    expect(prompt).toContain(
-      'decisions: must be an array of objects, each with required `{ "topic": "short subject", "decision": "explicit decision", "evidence_refs": ["evidence ID"] }`',
-    )
+    expect(prompt).toContain("The only top-level output key is `decisions`")
+    expect(prompt).toContain("Each decision must contain a non-empty `topic`")
     expect(prompt).toContain("evidence_refs")
     expect(prompt).toContain("1–3 unique IDs")
     expect(prompt).toContain("never raw quotes or excerpts")
     expect(prompt).toContain("Never cite prior STATE.json, FILE CANDIDATES")
     expect(prompt).toContain("model/audit prose")
     expect(prompt).toContain("otherwise use an empty array")
-    for (const field of ExtractedFactsJsonSchema.required) {
-      expect(prompt).toContain(`- ${field}:`)
-    }
+    expect(prompt).not.toContain("active_files:")
+    expect(prompt).not.toContain("current_task:")
+    expect(prompt).not.toContain("blockers:")
+    expect(prompt).not.toContain("next_steps:")
   })
 })
 

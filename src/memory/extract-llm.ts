@@ -4,11 +4,12 @@
  * The client is deliberately used lazily: config discovery and all session
  * requests are made only from the session.idle path.
  */
-import type { ExtractedFacts } from "../types"
 import {
-  ExtractedFactsJsonSchema,
-  validateStructuredResult,
+  LLMDecisionFactsJsonSchema,
+  validateLLMDecisionResult,
+  type LLMDecisionFacts,
 } from "./extract-schema"
+import type { ExtractedFacts } from "../types"
 import {
   LLMExtractionCacheEntrySchema,
   type AuditTerminalOutcome,
@@ -597,7 +598,7 @@ export interface ExtractFactsLLMOptions {
   /** Stable resolved project key for process-local in-flight coalescing. */
   projectKey?: string
   /** A validated cache result, checked before creating an audit session. */
-  cachedFacts?: ExtractedFacts | null
+  cachedFacts?: LLMDecisionFacts | null
   /**
    * Ephemeral deterministic evidence candidates.  Candidate text is accepted
    * here only so the caller can corroborate the current transcript; it is
@@ -720,9 +721,9 @@ export function resolveEvidenceReferences(
  * rejected as a whole, so it cannot create a cache row without proof.
  */
 export function corroborateLLMFacts(
-  facts: ExtractedFacts,
+  facts: LLMDecisionFacts,
   options?: Pick<ExtractFactsLLMOptions, "evidenceCandidateMap" | "evidenceDigestMap" | "evidenceCandidates" | "evidenceDigests" | "onDiagnostic">,
-): ExtractedFacts | null {
+): LLMDecisionFacts | null {
   const decisions = facts.decisions as Array<{ evidence_refs?: unknown } & Record<string, unknown>>
   if (decisions.length === 0) return facts
 
@@ -751,7 +752,7 @@ export function corroborateLLMFacts(
   if (accepted.length === 0) return null
   return {
     ...facts,
-    decisions: accepted as ExtractedFacts["decisions"],
+    decisions: accepted as LLMDecisionFacts["decisions"],
   }
 }
 
@@ -834,7 +835,7 @@ async function notifyHealthOutcome(
  * - retained session-create/prompt/retry/validation/evidence failure -> llm-failed
  */
 export type LLMExtractionRunResult =
-  | { status: "success"; facts: ExtractedFacts }
+  | { status: "success"; facts: LLMDecisionFacts }
   | { status: "unavailable"; reason: "missing-session-endpoint" }
   | {
       status: "guard-failed"
@@ -1034,7 +1035,7 @@ async function extractFactsLLMOnce(
             modelID: config.model.modelID,
           },
           prompt: buildExtractionPrompt(canonicalInput),
-          schema: ExtractedFactsJsonSchema,
+          schema: LLMDecisionFactsJsonSchema,
           ...(config.model.variant !== undefined ? { variant: config.model.variant } : {}),
         }),
         options?.requestTimeoutMs ?? LLM_REQUEST_TIMEOUT_MS,
@@ -1057,7 +1058,7 @@ async function extractFactsLLMOnce(
       // Structured output is the only response value that is inspected. In
       // particular, assistant text and free-form JSON are never fallbacks.
       const structured = result.value
-      const facts = validateStructuredResult(structured)
+      const facts = validateLLMDecisionResult(structured)
       if (facts) {
         const corroborated = corroborateLLMFacts(facts, options)
         if (corroborated) {

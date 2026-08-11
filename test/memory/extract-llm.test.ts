@@ -25,16 +25,15 @@ import type { MemoryFile } from "../../src/memory/schema"
 import type { TranscriptMessage } from "../../src/types"
 
 const facts = {
-  current_task: "Ship the SDK integration",
-  active_files: [{ path: "src/memory/writer.ts", reason: "edited" }],
   decisions: [{
     topic: "transport",
     decision: "Use SDK v2",
+    rationale: "The source transcript selected the SDK transport.",
     evidence_refs: ["tr-source-evidence"],
   }],
-  blockers: [],
-  next_steps: ["Run tests"],
 }
+
+const decisionsOnlyFacts = { decisions: facts.decisions }
 
 const evidenceCandidateMap = {
   "tr-source-evidence": {
@@ -134,7 +133,7 @@ describe("v1 structured extraction", () => {
 
   it("uses nested v1 calls and retains one visible audit session", async () => {
     const create = vi.fn(async (parameters: unknown) => ({ data: { id: "audit-1" }, parameters }))
-    const prompt = vi.fn(async () => ({ data: { info: { structured: facts } } }))
+    const prompt = vi.fn(async () => ({ data: { info: { structured: decisionsOnlyFacts } } }))
     const client = { session: { create, prompt } }
     expect(isRetainedExtractionSession("audit-1")).toBe(false)
 
@@ -145,7 +144,7 @@ describe("v1 structured extraction", () => {
       client,
       { enabled: true, model: { providerID: "anthropic", modelID: "haiku" } },
       { directory: "/worktree", ...evidenceOptions },
-    )).resolves.toEqual({ status: "success", facts })
+    )).resolves.toEqual({ status: "success", facts: decisionsOnlyFacts })
     expect(isRetainedExtractionSession("audit-1")).toBe(true)
     resetRetainedExtractionSessionIDs()
     expect(isRetainedExtractionSession("audit-1")).toBe(false)
@@ -177,7 +176,7 @@ describe("v1 structured extraction", () => {
       const client = {
         session: {
           create,
-          prompt: vi.fn(async () => ({ data: { info: { structured: facts } } })),
+          prompt: vi.fn(async () => ({ data: { info: { structured: decisionsOnlyFacts } } })),
         },
       }
 
@@ -228,7 +227,7 @@ describe("v1 structured extraction", () => {
       }),
       prompt: vi.fn(function (this: unknown) {
         expect(this).toBe(session)
-        return Promise.resolve({ data: { info: { structured: facts } } })
+        return Promise.resolve({ data: { info: { structured: decisionsOnlyFacts } } })
       }),
     }
 

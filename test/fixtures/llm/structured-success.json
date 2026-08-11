@@ -3,16 +3,7 @@
     "id": "audit-sanitized-001",
     "info": {
       "structured": {
-        "current_task": "Harden the structured response boundary",
-        "active_files": [
-          {
-            "path": "src/memory/llm-adapter.ts",
-            "reason": "boundary implementation"
-          }
-        ],
-        "decisions": [],
-        "blockers": [],
-        "next_steps": ["Run focused tests"]
+        "decisions": []
       }
     }
   }

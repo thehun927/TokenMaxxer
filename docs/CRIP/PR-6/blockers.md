@@ -26,3 +26,18 @@ Append-only implementation log for PR 6. Do not delete or rewrite prior entries.
   incomplete-claim compatibility repair gaps.
 - [scope] Wave 2 is the next dependency-gated implementation step; no Wave 2
   production work has started.
+
+## 2026-08-11 — Wave 2 contract v3/type separation
+
+- [implementation] `EXTRACTION_CONTRACT_VERSION` is now 3; heuristic facts and
+  decisions-only LLM facts have separate type/schema boundaries with required
+  evidence references and bounded strict structured output.
+- [compatibility] A temporary double assertion remains at the legacy
+  `finalLLMMerge` full-facts seam solely to keep the repository compiling until
+  Wave 4 replaces that merge with the decisions-only path. It must be removed
+  before the final audit.
+- [expected-downstream] Owned Wave 2 tests pass: `extract.test.ts` 39/39 and
+  `llm-adapter.test.ts` 17/17. `extract-llm.test.ts` has 22 passed and 3
+  downstream failures for cache replay/capping and heuristic-candidate evidence;
+  those are reserved for Waves 3 and 5.
+- [verification] `npx tsc --noEmit` passed after the temporary integration bridge.

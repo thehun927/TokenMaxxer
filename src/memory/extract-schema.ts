@@ -23,8 +23,9 @@ export const ExtractedDecisionSchema = z
       .array(z.string().min(1).max(128))
       .min(1)
       .max(3)
-      // Keep the TypeScript boundary compatible with the legacy heuristic
-      // facts type; the runtime refinement and JSON Schema remain required.
+      // Legacy full-facts compatibility is retained until the cache wave. The
+      // decisions-only LLM schema below has a required, directly inferred
+      // evidence_refs field and does not use this compatibility seam.
       .optional()
       .superRefine((refs, ctx) => {
         if (refs === undefined) {
@@ -120,5 +121,75 @@ export const ExtractedFactsJsonSchema = {
 /** Validate only the structured value returned by the SDK. */
 export function validateStructuredResult(result: unknown): ExtractedFacts | null {
   const parsed = ExtractedFactsSchema.safeParse(result)
+  return parsed.success ? parsed.data : null
+}
+
+const boundedNonEmpty = (max: number) => z
+  .string()
+  .max(max)
+  .refine((value) => value.trim().length > 0, "must be non-empty")
+
+const evidenceRef = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine((value) => value.trim().length > 0, "evidence ref must be non-empty")
+
+/** One evidence-backed decision proposed by the structured LLM extractor. */
+export const LLMDecisionSchema = z
+  .object({
+    topic: boundedNonEmpty(256),
+    decision: boundedNonEmpty(500),
+    rationale: boundedNonEmpty(500).optional(),
+    evidence_refs: z
+      .array(evidenceRef)
+      .min(1)
+      .max(3)
+      .refine((refs) => new Set(refs).size === refs.length, "evidence refs must be unique"),
+  })
+  .strict()
+
+/** Decisions-only structured LLM result. */
+export const LLMDecisionFactsSchema = z
+  .object({
+    decisions: z.array(LLMDecisionSchema).max(10),
+  })
+  .strict()
+
+export type LLMDecisionFacts = z.infer<typeof LLMDecisionFactsSchema>
+
+/** JSON Schema for the decisions-only structured-output request. */
+export const LLMDecisionFactsJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    decisions: {
+      type: "array",
+      maxItems: 10,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          topic: { type: "string", minLength: 1, maxLength: 256 },
+          decision: { type: "string", minLength: 1, maxLength: 500 },
+          rationale: { type: "string", minLength: 1, maxLength: 500 },
+          evidence_refs: {
+            type: "array",
+            minItems: 1,
+            maxItems: 3,
+            uniqueItems: true,
+            items: { type: "string", minLength: 1, maxLength: 128, pattern: "\\S" },
+          },
+        },
+        required: ["topic", "decision", "evidence_refs"],
+      },
+    },
+  },
+  required: ["decisions"],
+} as const
+
+/** Validate only the decisions-only structured value returned by the SDK. */
+export function validateLLMDecisionResult(result: unknown): LLMDecisionFacts | null {
+  const parsed = LLMDecisionFactsSchema.safeParse(result)
   return parsed.success ? parsed.data : null
 }

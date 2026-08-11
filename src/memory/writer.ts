@@ -575,7 +575,9 @@ async function processPreparedIdleSource(
       sourceVersionKey,
       sourceInputSha256: prepared.sourceInputSha256,
       promptInputSha256: prepared.promptInputSha256,
-      llmFacts,
+      // Temporary Wave-2 compile bridge: Wave 4 replaces this legacy full-facts
+      // merge seam with a decisions-only merge and removes this assertion.
+      llmFacts: llmFacts as unknown as ExtractedFacts,
       extractionAuditSessionID,
       candidates,
       digests,

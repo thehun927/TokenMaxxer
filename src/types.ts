@@ -11,14 +11,20 @@ export interface CompactionOutput {
   prompt?: string
 }
 
-/** Facts extracted from a session transcript by the heuristic extractor */
-export interface ExtractedFacts {
+/** Full facts extracted from a session transcript by the heuristic extractor. */
+export interface HeuristicFacts {
   current_task: string | null
   active_files: { path: string; reason: string }[]
   decisions: { topic: string; decision: string; rationale?: string; foundational?: boolean }[]
   blockers: string[]
   next_steps: string[]
 }
+
+/**
+ * Backward-compatible name for the pre-PR6 heuristic boundary.
+ * Structured LLM extraction uses LLMDecisionFacts instead.
+ */
+export type ExtractedFacts = HeuristicFacts
 
 /** Plugin options (read from env vars) */
 export interface TokenmaxxerOptions {
