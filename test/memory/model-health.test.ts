@@ -8,7 +8,7 @@ import {
   makeExtractionCacheEntry,
   upsertModelHealth,
 } from "../../src/memory/extract-llm"
-import { buildCanonicalInput, buildTranscriptEvidenceCandidateMap, makeTranscriptEvidenceRef } from "../../src/memory/extract-prompt"
+import { buildCanonicalInput, buildExtractionSourceInput, buildTranscriptEvidenceCandidateMap, makeSourceVersionKey, makeTranscriptEvidenceRef } from "../../src/memory/extract-prompt"
 import { pruneOld, writeMemoryOnIdle } from "../../src/memory/writer"
 import { emptyMemory } from "../../src/memory/schema"
 import { readMemory, writeMemory } from "../../src/memory/store"
@@ -151,13 +151,27 @@ describe("local model health circuit breaker", () => {
       blockers: [],
       next_steps: [],
     }
+    const model = { providerID: "provider", modelID: "model" }
+    // Wave 5: Compute source identity so the cache key matches what the
+    // writer computes at runtime (v2e format with full identity).
+    const sourceInput = buildExtractionSourceInput(source)
+    const sourceVersionKey = makeSourceVersionKey({
+      sourceSessionID: "source-health-cache",
+      sourceInputSha256: sourceInput.sourceInputSha256,
+      extractionContractVersion: 2,
+    })
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
       sourceSessionID: "source-health-cache",
       canonicalInput: buildCanonicalInput(source, prior),
-      model: { providerID: "provider", modelID: "model" },
+      model,
       facts,
       auditSessionID: "audit-health-cache",
       evidence: [{ kind: "transcript", ref, digest: candidate.digest }],
+      sourceVersionKey,
+      sourceInputSha256: sourceInput.sourceInputSha256,
+      promptInputSha256: buildCanonicalInput(source, prior).promptInputSha256,
+      extractionContractVersion: 2,
+      modelVariant: undefined,
     })]
     await expect(writeMemory({ worktree, directory: worktree }, prior)).resolves.toBe(true)
 

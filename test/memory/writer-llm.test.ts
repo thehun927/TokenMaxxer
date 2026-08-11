@@ -20,8 +20,11 @@ import { readMemory, writeMemory } from "../../src/memory/store"
 import { emptyMemory } from "../../src/memory/schema"
 import {
   buildCanonicalInput,
+  buildExtractionSourceInput,
   buildTranscriptEvidenceCandidateMap,
   makeTranscriptEvidenceRef,
+  makeSourceVersionKey,
+  makeExtractionCacheKey,
 } from "../../src/memory/extract-prompt"
 import { makeExtractionCacheEntry } from "../../src/memory/extract-llm"
 import { resetHostStructuredContractGate } from "../../src/memory/llm-adapter"
@@ -308,9 +311,23 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
     }
     const cachedEvidenceRef = makeTranscriptEvidenceRef("m1")
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[cachedEvidenceRef]!
+    // Wave 5: Compute source identity from actual messages so the cache key
+    // matches what processPreparedIdleSource computes at runtime.
+    const sourceInput = buildExtractionSourceInput(messages)
+    const sourceVersionKey = makeSourceVersionKey({
+      sourceSessionID: "source-cache",
+      sourceInputSha256: sourceInput.sourceInputSha256,
+      extractionContractVersion: 2,
+    })
+    const canonicalInput = buildCanonicalInput(messages, prior)
+    const extractionKey = makeExtractionCacheKey({
+      sourceVersionKey,
+      extractionContractVersion: 2,
+      model,
+    })
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
       sourceSessionID: "source-cache",
-      canonicalInput: buildCanonicalInput(messages, prior),
+      canonicalInput,
       model,
       facts: cachedFacts,
       auditSessionID: "audit-cache",
@@ -319,6 +336,11 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
         ref: cachedEvidenceRef,
         digest: cachedEvidence.digest,
       }],
+      sourceVersionKey,
+      sourceInputSha256: sourceInput.sourceInputSha256,
+      promptInputSha256: canonicalInput.promptInputSha256,
+      extractionContractVersion: 2,
+      modelVariant: undefined,
     })]
     await writeMemory({ worktree, directory: worktree }, prior)
 
@@ -678,6 +700,11 @@ describe("Wave 4 deferred — final-LLM transaction reads cache identity under t
       facts: cachedFactsX as never,
       auditSessionID: "audit-X",
       evidence: [{ kind: "transcript", ref: cachedEvidenceRef, digest: cachedEvidence.digest }],
+      sourceVersionKey: "v2s:" + "x".repeat(64),
+      sourceInputSha256: "x".repeat(64),
+      promptInputSha256: "x".repeat(64),
+      extractionContractVersion: 2,
+      modelVariant: undefined,
     })]
     await writeMemory({ worktree, directory: worktree }, prior)
 
@@ -987,7 +1014,7 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
     expect(processedSources).toBeDefined()
     expect(Array.isArray(processedSources)).toBe(true)
     expect(processedSources).toHaveLength(1)
-    expect(processedSources[0]).toMatch(/^v2s:[a-f0-9]{64}$/)
+    expect(processedSources[0].source_key).toMatch(/^v2s:[a-f0-9]{64}$/)
   })
 
   it("12. accepted facts and completion commit share one final revision", async () => {
@@ -1011,6 +1038,8 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
         canonicalInput: prepared.canonicalInput,
         selectedModel: { providerID: "provider", modelID: "model" },
         selectedCacheKey: `v2e:${"c".repeat(64)}`,
+        sourceVersionKey: prepared.sourceVersionKey,
+        sourceInputSha256: prepared.sourceInputSha256,
         llmFacts: {
           current_task: "LLM task",
           active_files: [],
@@ -1520,9 +1549,22 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
       next_steps: [],
     }
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[evidenceRef]!
+    const canonicalInput = buildCanonicalInput(messages, prior)
+    const sourceInput = buildExtractionSourceInput(messages)
+    const sourceVersionKey = makeSourceVersionKey({
+      sourceSessionID: sessionId,
+      sourceInputSha256: sourceInput.sourceInputSha256,
+      extractionContractVersion: 2,
+    })
+    const extractionKey = makeExtractionCacheKey({
+      sourceVersionKey,
+      extractionContractVersion: 2,
+      model,
+    })
+    // Seed with new v2e format for PR 5 compatibility
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
       sourceSessionID: sessionId,
-      canonicalInput: buildCanonicalInput(messages, prior),
+      canonicalInput,
       model,
       facts: cachedFacts,
       auditSessionID: "audit-cache",
@@ -1531,6 +1573,11 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
         ref: evidenceRef,
         digest: cachedEvidence.digest,
       }],
+      sourceVersionKey,
+      sourceInputSha256: sourceInput.sourceInputSha256,
+      promptInputSha256: canonicalInput.promptInputSha256,
+      extractionContractVersion: 2,
+      modelVariant: undefined,
     })]
     await writeMemory({ worktree, directory: worktree }, prior)
     return { model, evidenceRef }
@@ -1543,8 +1590,8 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
     const messages = advancedMessages()
     const evidenceRef = makeTranscriptEvidenceRef("m2")
 
-    const create = vi.fn(async () => ({ data: { id: `audit-${sessionId}` } }))
-    const prompt = vi.fn(async () => ({
+    const create1 = vi.fn(async () => ({ data: { id: `audit-${sessionId}` } }))
+    const prompt1 = vi.fn(async () => ({
       data: {
         info: {
           structured: {
@@ -1561,19 +1608,14 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
         },
       },
     }))
-    const v1 = {
-      app: { log: vi.fn() },
-      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
-      session: {
-        messages: vi.fn(async () => ({ data: messages })),
-        create,
-        prompt,
-      },
-    }
 
     // First call - should succeed
     const outcome1 = await writeMemoryOnIdle({
-      client: v1,
+      client: {
+        app: { log: vi.fn() },
+        config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+        session: { messages: vi.fn(async () => ({ data: messages })), create: create1, prompt: prompt1 },
+      },
       worktree,
       directory: worktree,
       sessionId,
@@ -1587,16 +1629,22 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
     // Seed a cache entry for the same source
     await seedCacheEntry(worktree, sessionId, messages)
 
-    // Third call - should be cache-hit
+    // Third call - should be cache-hit; fresh mocks verify no new audit/prompt calls
+    const create2 = vi.fn()
+    const prompt2 = vi.fn()
     const outcome3 = await writeMemoryOnIdle({
-      client: v1,
+      client: {
+        app: { log: vi.fn() },
+        config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+        session: { messages: vi.fn(async () => ({ data: messages })), create: create2, prompt: prompt2 },
+      },
       worktree,
       directory: worktree,
       sessionId,
     })
     expect(outcome3).toBe("cache-hit")
-    expect(create).toHaveBeenCalledTimes(0)
-    expect(prompt).toHaveBeenCalledTimes(0)
+    expect(create2).toHaveBeenCalledTimes(0)
+    expect(prompt2).toHaveBeenCalledTimes(0)
   })
 
   it("19. after deleting cache row, same source still cache-hit via completion ledger", async () => {
@@ -1606,8 +1654,8 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
     const messages = advancedMessages()
     const evidenceRef = makeTranscriptEvidenceRef("m2")
 
-    const create = vi.fn(async () => ({ data: { id: `audit-${sessionId}` } }))
-    const prompt = vi.fn(async () => ({
+    const create1 = vi.fn(async () => ({ data: { id: `audit-${sessionId}` } }))
+    const prompt1 = vi.fn(async () => ({
       data: {
         info: {
           structured: {
@@ -1624,19 +1672,14 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
         },
       },
     }))
-    const v1 = {
-      app: { log: vi.fn() },
-      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
-      session: {
-        messages: vi.fn(async () => ({ data: messages })),
-        create,
-        prompt,
-      },
-    }
 
     // First call - should succeed
     const outcome1 = await writeMemoryOnIdle({
-      client: v1,
+      client: {
+        app: { log: vi.fn() },
+        config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+        session: { messages: vi.fn(async () => ({ data: messages })), create: create1, prompt: prompt1 },
+      },
       worktree,
       directory: worktree,
       sessionId,
@@ -1653,15 +1696,21 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
     }
 
     // Second call - should still be cache-hit via completion ledger
+    const create2 = vi.fn()
+    const prompt2 = vi.fn()
     const outcome2 = await writeMemoryOnIdle({
-      client: v1,
+      client: {
+        app: { log: vi.fn() },
+        config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+        session: { messages: vi.fn(async () => ({ data: messages })), create: create2, prompt: prompt2 },
+      },
       worktree,
       directory: worktree,
       sessionId,
     })
     expect(outcome2).toBe("cache-hit")
-    expect(create).toHaveBeenCalledTimes(0)
-    expect(prompt).toHaveBeenCalledTimes(0)
+    expect(create2).toHaveBeenCalledTimes(0)
+    expect(prompt2).toHaveBeenCalledTimes(0)
   })
 
   it("20. evidence exceeding provenance cap still succeeds with processed_sources entry", async () => {
@@ -1715,7 +1764,7 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
     expect(processedSources).toBeDefined()
     expect(Array.isArray(processedSources)).toBe(true)
     expect(processedSources).toHaveLength(1)
-    expect(processedSources[0]).toMatch(/^v2s:[a-f0-9]{64}$/)
+    expect(processedSources[0].source_key).toMatch(/^v2s:[a-f0-9]{64}$/)
   })
 
   it("21. repeat #20: still cache-hit after first success", async () => {

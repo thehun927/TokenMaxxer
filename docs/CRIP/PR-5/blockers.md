@@ -86,3 +86,16 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] Second race check after heuristic transaction remains valid design.
 - [test-gap] test/memory/source-processing.test.ts is untracked and incomplete; represents an incomplete Wave 3 commit that must be documented as a blocker.
 - [doc-clarification] Current validation/test status is pending until lanes finish; do not claim tests green prematurely.
+
+## 2026-08-11 — wave-4 reconciliation against a955f55
+- [doc-clarification] Current a955f55 production source was inspected; the committed Wave 4 implementation does use `buildExtractionSourceInput(allMessages)`, so source file candidates participate in source identity.
+- [doc-clarification] The completed-source fast path is before heuristic mutation; `extractFactsLLM` accepts `sourceVersionKey` for source-version in-flight identity; and activity cleanup runs in the public wrapper's `finally`.
+- [scope-deviation] The earlier contradictory Wave-4 correction notes above are retained as append-only history and do not describe the current a955f55 implementation.
+- [test-gap] Wave 5 completion persistence remains genuinely outstanding: the successful LLM final transaction does not yet durably write `processed_sources` atomically with accepted facts.
+- [test-gap] STATE-unavailable outcome mapping remains outstanding for Wave 6: preparation currently returns a generic preparation error that the public wrapper reports as `error`, while required processing with authoritative STATE unavailable must report `write-failed`.
+
+## 2026-08-11 — Wave 5 implementation evidence
+- [implementation] Wave 5 now atomically persists the required `processed_sources` completion record with accepted LLM facts inside the final `mutateMemory()` transaction, carries source/prompt/contract/model identity through cache and audit metadata, validates current-contract cache identity, and preserves the completed-source no-op fast path.
+- [verification] `npx tsc --noEmit` passed after the Wave 5 implementation and contract polish.
+- [verification] `npx vitest run test/memory/writer-llm.test.ts test/memory/extract-llm.test.ts test/memory/source-processing.test.ts test/memory/transaction.test.ts test/memory/store.test.ts test/memory/extract.test.ts` passed: 6 files, 127 tests.
+- [verification] `npm test` passed: 38 files, 551 tests.

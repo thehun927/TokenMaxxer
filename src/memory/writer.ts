@@ -12,7 +12,7 @@ import type {
   ProcessedSource,
 } from "./schema"
 import { MAX_PROCESSED_SOURCES, ProcessedSourceSchema } from "./schema"
-import { findProcessedSource } from "./source-processing"
+import { findProcessedSource, upsertProcessedSource } from "./source-processing"
 import type { ExtractedFacts, TranscriptMessage } from "../types"
 import { mergeDecisions } from "./merge"
 import { readMemoryState, emptyMemory, resolveProjectPath, mutateMemory } from "./store"
@@ -49,6 +49,7 @@ import {
   type LLMHealthOutcomeReport,
   type SmallModel,
 } from "./extract-llm"
+import { makeExtractionCacheKey } from "./extract-prompt"
 import type { CanonicalExtractionInput } from "./extract-prompt"
 import { log } from "../util/log"
 import { beginMemoryActivity } from "./activity-state"
@@ -228,6 +229,7 @@ export type PreparedIdleSource =
     }
   | { kind: "no-messages" }
   | { kind: "error"; reason: string }
+  | { kind: "write-failed"; reason: string }
 
 type IdleWriteOptions = {
   client: unknown
@@ -286,7 +288,7 @@ export async function prepareIdleSource(
   const existingState = await readMemoryState({ worktree, directory })
   if (existingState.status === "unavailable") {
     // Preparation-time readMemoryState unavailable → typed write-failed (not error)
-    return { kind: "error", reason: "memory read failed" }
+    return { kind: "write-failed", reason: "memory read failed" }
   }
   const existing = existingState.memory ?? emptyMemory(worktree)
   const canonicalPrior = { ...existing, llm_extraction_audits: undefined, revision: 0 }
@@ -319,7 +321,7 @@ async function processPreparedIdleSource(
   opts: IdleWriteOptions,
   prepared: Awaited<ReturnType<typeof prepareIdleSource>>,
 ): Promise<IdleWriteOutcome> {
-  if (prepared.kind === "no-messages" || prepared.kind === "error") {
+  if (prepared.kind === "no-messages" || prepared.kind === "error" || prepared.kind === "write-failed") {
     return prepared.kind
   }
 
@@ -423,12 +425,23 @@ async function processPreparedIdleSource(
   })
 
   const selectedModel = cacheConfig.model
-  const selectedCacheKey = extractionCacheKey(sessionId, canonicalInput, selectedModel)
+  const selectedCacheKey = makeExtractionCacheKey({
+    sourceVersionKey,
+    extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
+    model: selectedModel,
+  })
 
-  // Check cache before prompting
+  // Check cache before prompting with full identity validation
   const cachedEntry = readExtractionCacheEntry(afterHeuristic, selectedCacheKey, {
     evidenceCandidateMap: candidates,
     evidenceDigestMap: digests,
+    sourceVersionKey,
+    sourceInputSha256: prepared.sourceInputSha256,
+    promptInputSha256: prepared.promptInputSha256,
+    extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
+    providerID: selectedModel.providerID,
+    modelID: selectedModel.modelID,
+    modelVariant: selectedModel.variant,
   })
   if (cachedEntry) {
     void log(client, "debug", "llm extraction cache hit")
@@ -443,8 +456,19 @@ async function processPreparedIdleSource(
     return "cache-hit"
   }
 
-  // Use gated config before starting a new LLM extraction (PR4 host/cooldown gate)
-  const gatedConfig = await getLLMConfig(client, directory, { memory: afterHeuristic })
+  // Use gated config before starting a new LLM extraction (PR4 host/cooldown gate).
+  // Wave 5: Bypass model cooldown only when there is evidence of a prior failed
+  // extraction for this source (a failed audit record matching sourceVersionKey).
+  // This ensures retries of failed extractions are not blocked by cooldown while
+  // fresh sources still respect the global cooldown gating.
+  const hasCompletedSource = findProcessedSource(afterHeuristic, sourceVersionKey) !== null
+  const hasFailedAudit = (afterHeuristic.llm_extraction_audits ?? []).some(
+    (a) => a.source_key === sourceVersionKey && a.terminal_outcome !== "success"
+  )
+  const gatedConfig = await getLLMConfig(client, directory, {
+    memory: afterHeuristic,
+    bypassModelCooldown: !hasCompletedSource && hasFailedAudit,
+  })
   if (!gatedConfig.model) {
     void log(client, "info", "llm extraction skipped: gated model unavailable", {
       reason: boundedDiagnosticValue(gatedConfig.reason ?? "gated model resolution returned no model"),
@@ -481,6 +505,12 @@ async function processPreparedIdleSource(
       directory,
       projectKey: project,
       sourceVersionKey,
+      sourceInputSha256: prepared.sourceInputSha256,
+      promptInputSha256: prepared.promptInputSha256,
+      extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
+      providerID: gatedConfig.model.providerID,
+      modelID: gatedConfig.model.modelID,
+      modelVariant: gatedConfig.model.variant,
       evidenceCandidateMap: candidates,
       evidenceDigestMap: digests,
       onDiagnostic: (diagnostic) => logLLMDiagnostic(client, diagnostic),
@@ -504,6 +534,9 @@ async function processPreparedIdleSource(
       canonicalInput,
       selectedModel,
       selectedCacheKey,
+      sourceVersionKey,
+      sourceInputSha256: prepared.sourceInputSha256,
+      promptInputSha256: prepared.promptInputSha256,
       llmFacts,
       extractionAuditSessionID,
       candidates,
@@ -521,6 +554,9 @@ async function processPreparedIdleSource(
   if (finalResult.status === "commit-failed") {
     void log(client, "warn", "final llm transaction commit-failed", { project })
     return "llm-failed"
+  }
+  if (finalResult.status === "noop" && finalResult.value.outcome === "noop") {
+    return "cache-hit"
   }
   const finalMemory = finalResult.value.memory
   await writeHeaderBestEffort(client, worktree, directory, finalMemory)
@@ -552,6 +588,9 @@ export async function writeMemoryOnIdle(opts: IdleWriteOptions): Promise<IdleWri
     } else if (prepared.kind === "error") {
       setProjectQueueOutcome(project, "error")
       outcome = "error"
+    } else if (prepared.kind === "write-failed") {
+      setProjectQueueOutcome(project, "write-failed")
+      outcome = "write-failed"
     } else {
       // Queue key is the source-version key, not just session ID
       const queueKey = `idle:${prepared.sourceVersionKey}`
@@ -577,6 +616,9 @@ export async function writeMemoryOnIdle(opts: IdleWriteOptions): Promise<IdleWri
  * so a concurrent commit of the same cache identity is observed rather than a
  * pre-lock snapshot. Exported as a test seam for the Wave-4/6 cross-process
  * and no-lock-prompt-zone tests.
+ *
+ * Wave 5: Refactored to carry explicit identities and ensure processed-source
+ * completion record is written atomically with accepted LLM facts.
  */
 export async function finalLLMMerge(
   opts: { client: unknown; worktree: string; directory: string },
@@ -586,6 +628,9 @@ export async function finalLLMMerge(
     canonicalInput: CanonicalExtractionInput
     selectedModel: SmallModel
     selectedCacheKey: string
+    sourceVersionKey: string
+    sourceInputSha256: string
+    promptInputSha256: string
     llmFacts: ExtractedFacts
     extractionAuditSessionID?: string
     candidates: EvidenceCandidateMap
@@ -596,34 +641,56 @@ export async function finalLLMMerge(
   return mutateMemory<{ outcome: "committed" | "noop"; memory: MemoryFile }>(
     { worktree, directory, client },
     (base) => {
-      const cacheAlreadyCommitted = readExtractionCacheEntry(base, args.selectedCacheKey, {
-        evidenceCandidateMap: args.candidates,
-        evidenceDigestMap: args.digests,
-      })
-      if (cacheAlreadyCommitted) {
-        const merged = mergeMemory(base, cacheAlreadyCommitted.facts, {
-          sessionId: args.sessionId,
-          gitSha: args.gitSha,
-          timestamp: new Date().toISOString(),
-          origin: "llm",
-          auditSessionID: cacheAlreadyCommitted.provenance?.source_audit_session_id,
-          evidenceCandidates: args.candidates,
-          provenanceEvidence: cacheAlreadyCommitted.provenance?.evidence,
-        })
-        const finalMemory = pruneOld(recordRecentSession(merged, args.sessionId), client)
-        return { kind: "commit", memory: finalMemory, value: { outcome: "committed", memory: finalMemory } }
+      // Wave 5 §10.1: Re-check processed_sources by sourceVersionKey (explicit identity)
+      const completed = findProcessedSource(base, args.sourceVersionKey)
+      if (completed) {
+        // Wave 5 §10.2: Already completed - return noop without replaying cached facts
+        return { kind: "noop", value: { outcome: "noop", memory: base } }
       }
+
+      // Wave 5 §10.2b: Check for a matching cache entry committed by a concurrent
+      // process. If found, use those facts — observed under the lock read baseline.
+      let effectiveFacts = args.llmFacts
+      let effectiveAuditSessionID = args.extractionAuditSessionID
+      const concurrentCacheEntry = readExtractionCacheEntry(
+        base,
+        args.selectedCacheKey,
+        args.sourceVersionKey !== undefined
+          ? {
+              evidenceCandidateMap: args.candidates,
+              evidenceDigestMap: args.digests,
+              sourceVersionKey: args.sourceVersionKey,
+              sourceInputSha256: args.sourceInputSha256,
+              promptInputSha256: args.promptInputSha256,
+              extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
+              providerID: args.selectedModel.providerID,
+              modelID: args.selectedModel.modelID,
+              modelVariant: args.selectedModel.variant,
+            }
+          : {
+              evidenceCandidateMap: args.candidates,
+              evidenceDigestMap: args.digests,
+            },
+      )
+      if (concurrentCacheEntry) {
+        effectiveFacts = concurrentCacheEntry.facts
+        effectiveAuditSessionID = concurrentCacheEntry.provenance?.source_audit_session_id ?? args.extractionAuditSessionID
+      }
+
+      // Wave 5 §10.3: Merge accepted LLM facts against newest base
       const timestamp = new Date().toISOString()
-      const mergedLLM = mergeMemory(base, args.llmFacts, {
+      const mergedLLM = mergeMemory(base, effectiveFacts, {
         sessionId: args.sessionId,
         gitSha: args.gitSha,
         timestamp,
         origin: "llm",
-        auditSessionID: args.extractionAuditSessionID,
+        auditSessionID: effectiveAuditSessionID,
         evidenceCandidates: args.candidates,
       })
+
+      // Wave 5 §10.4: Optionally store result-cache payload when safe
       const decisionEvidence = [
-        ...args.llmFacts.decisions.flatMap((decision) => candidateEvidence(
+        ...effectiveFacts.decisions.flatMap((decision) => candidateEvidence(
           (decision as { evidence_refs?: unknown }).evidence_refs,
           args.candidates,
         )),
@@ -634,21 +701,41 @@ export async function finalLLMMerge(
         ? decisionEvidence
         : firstCandidateEvidence(args.candidates)
       const cacheCanRepresentAllEvidence = decisionEvidence.length <= 3
-      const withCache = cacheCanRepresentAllEvidence && cacheEvidence.length > 0 && args.extractionAuditSessionID
+      const withCache = cacheCanRepresentAllEvidence && cacheEvidence.length > 0 && effectiveAuditSessionID
         ? upsertExtractionCache(
             recordRecentSession(mergedLLM, args.sessionId),
             makeExtractionCacheEntry({
               sourceSessionID: args.sessionId,
               canonicalInput: args.canonicalInput,
               model: args.selectedModel,
-              facts: args.llmFacts,
-              auditSessionID: args.extractionAuditSessionID,
+              facts: effectiveFacts,
+              auditSessionID: effectiveAuditSessionID,
               evidence: cacheEvidence,
               completedAt: timestamp,
+              sourceVersionKey: args.sourceVersionKey,
+              sourceInputSha256: args.sourceInputSha256,
+              promptInputSha256: args.promptInputSha256,
+              extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
+              modelVariant: args.selectedModel.variant,
             }),
           )
         : recordRecentSession(mergedLLM, args.sessionId)
-      const finalMemory = pruneOld(withCache, client)
+
+      // Wave 5 §10.5: ALWAYS store compact processed-source completion record
+      // Use current v2e key (not an arbitrary stale selectedCacheKey)
+      const processedSourceRecord: ProcessedSource = {
+        source_key: args.sourceVersionKey,
+        extraction_key: args.selectedCacheKey,
+        extraction_contract_version: EXTRACTION_CONTRACT_VERSION,
+        completed_at: timestamp,
+      }
+      const withProcessedSource = upsertProcessedSource(withCache, processedSourceRecord)
+
+      // Wave 5 §10.6: Prune while preserving newly written source key
+      // The newly created source key is temporarily protected from eviction
+      const finalMemory = pruneOld(withProcessedSource, client)
+
+      // Wave 5 §10.7: Commit exactly once
       return { kind: "commit", memory: finalMemory, value: { outcome: "committed", memory: finalMemory } }
     },
   )

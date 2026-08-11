@@ -19,7 +19,7 @@ import {
 } from "./schema"
 import type { EvidenceKind, Evidence } from "./schema"
 import type { CanonicalExtractionInput } from "./extract-prompt"
-import { buildExtractionPrompt, makeExtractionCacheKeyLegacy, makeSourceVersionKey, EXTRACTION_CONTRACT_VERSION } from "./extract-prompt"
+import { buildExtractionPrompt, makeExtractionCacheKeyLegacy, makeExtractionCacheKey, makeSourceVersionKey, EXTRACTION_CONTRACT_VERSION } from "./extract-prompt"
 import { readMemory } from "./store"
 import {
   createAuditSession,
@@ -416,6 +416,8 @@ export async function getLLMConfig(
     memory?: HealthMemoryFile | null
     /** Resolve a model for an already accepted cache lookup. */
     ignoreHealth?: boolean
+    /** Bypass only the model cooldown check while still respecting the host gate. */
+    bypassModelCooldown?: boolean
   },
 ): Promise<LLMExtractionConfig> {
   if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
@@ -464,7 +466,8 @@ export async function getLLMConfig(
       ...(resolved.reason ? { reason: resolved.reason } : {}),
     }
     if (resolved.reason) return { enabled: false, reason: resolved.reason }
-    if (!options?.ignoreHealth && isModelCoolingDown(options?.memory, resolved.model)) {
+    const skipCooldown = options?.ignoreHealth || options?.bypassModelCooldown
+    if (!skipCooldown && isModelCoolingDown(options?.memory, resolved.model)) {
       lastModelResolution = {
         ...lastModelResolution,
         reason: "configured model is on cooldown",
@@ -480,7 +483,7 @@ export async function getLLMConfig(
   const discovered = await discoverFreeSmallModel(
     client,
     directory,
-    options?.ignoreHealth ? null : options?.memory,
+    (options?.ignoreHealth || options?.bypassModelCooldown) ? null : options?.memory,
   )
   if (discovered.model) {
     lastModelResolution = {
@@ -606,6 +609,13 @@ export interface ExtractFactsLLMOptions {
   onHealthOutcome?: (report: LLMHealthOutcomeReport) => void | Promise<void>
   /** Test-only/lifecycle override; production remains bounded at two minutes. */
   requestTimeoutMs?: number
+  /** Current source identity fields for cache/audit validation. */
+  sourceInputSha256?: string;
+  promptInputSha256?: string;
+  extractionContractVersion?: number;
+  providerID?: string;
+  modelID?: string;
+  modelVariant?: string;
 }
 
 /** A bounded candidate at the LLM corroboration boundary. */
@@ -640,7 +650,7 @@ function isSha256(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value)
 }
 
-function candidateContext(options: ExtractFactsLLMOptions | undefined): {
+function candidateContext(options: CacheEvidenceOptions | undefined): {
   candidates: EvidenceCandidateMap
   digests: Readonly<Record<string, string>>
 } {
@@ -891,23 +901,37 @@ async function extractFactsLLMOnce(
     // never re-enter extraction.
     retainExtractionSession(extractionSessionID)
 
-    const sourceVersionKey = makeSourceVersionKey({
+    // Wave 5: Use caller-provided source identity when available; retain the
+    // legacy key for callers that do not provide one.
+    const extractionContractVersion = options?.extractionContractVersion ?? EXTRACTION_CONTRACT_VERSION
+    const srcInputSha256 = options?.sourceInputSha256 ?? canonicalInput.promptInputSha256
+    const promptInputSha256 = options?.promptInputSha256 ?? canonicalInput.promptInputSha256
+    const sourceVersionKey = options?.sourceVersionKey ?? makeSourceVersionKey({
       sourceSessionID,
-      sourceInputSha256: canonicalInput.promptInputSha256,
-      extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
+      sourceInputSha256: srcInputSha256,
+      extractionContractVersion,
     })
+    const currentSourceIdentity = options?.sourceVersionKey !== undefined
     const audit: LLMAuditMetadata = {
       audit_session_id: extractionSessionID,
       source_session_id: sourceSessionID,
-      cache_key: makeExtractionCacheKeyLegacy(
-        sourceSessionID,
-        canonicalInput.sha256,
-        config.model,
-      ),
+      cache_key: currentSourceIdentity
+        ? makeExtractionCacheKey({
+            sourceVersionKey,
+            extractionContractVersion,
+            model: config.model,
+          })
+        : makeExtractionCacheKeyLegacy(sourceSessionID, canonicalInput.sha256, config.model),
       provider_id: config.model.providerID,
       model_id: config.model.modelID,
       created_at: new Date().toISOString(),
       terminal_outcome: "pending",
+      // Wave 5: Additive source identity fields for current-contract entries
+      source_key: sourceVersionKey,
+      source_input_sha256: srcInputSha256,
+      prompt_input_sha256: promptInputSha256,
+      extraction_contract_version: extractionContractVersion,
+      model_variant: config.model.variant,
     }
 
     if (options?.onAuditCreated) {
@@ -1037,7 +1061,7 @@ async function notifyAuditTerminal(
   }
 }
 
-type CacheEvidenceOptions = Pick<ExtractFactsLLMOptions, "evidenceCandidateMap" | "evidenceDigestMap" | "evidenceCandidates" | "evidenceDigests">
+type CacheEvidenceOptions = Pick<ExtractFactsLLMOptions, "evidenceCandidateMap" | "evidenceDigestMap" | "evidenceCandidates" | "evidenceDigests" | "sourceVersionKey" | "sourceInputSha256" | "promptInputSha256" | "extractionContractVersion" | "providerID" | "modelID" | "modelVariant">
 
 function hasEvidenceBackedProvenance(
   entry: LLMExtractionCacheEntry,
@@ -1075,7 +1099,11 @@ function hasEvidenceBackedProvenance(
   })
 }
 
-/** Return a validated cache entry for a key, or null for a stale/malformed row. */
+/**
+ * Return a validated cache entry for a key, or null for a stale/malformed row.
+ * When identity options are provided, validates current identity fields.
+ * Retains legacy string-key behavior only for callers/tests that do not provide identity.
+ */
 export function readExtractionCacheEntry(
   memory: Pick<MemoryFile, "llm_extraction_cache"> | null | undefined,
   cacheKey: string,
@@ -1083,11 +1111,47 @@ export function readExtractionCacheEntry(
 ): LLMExtractionCacheEntry | null {
   for (const candidate of [...(memory?.llm_extraction_cache ?? [])].reverse()) {
     const parsed = LLMExtractionCacheEntrySchema.safeParse(candidate)
-    if (
-      parsed.success &&
-      parsed.data.cache_key === cacheKey &&
-      hasEvidenceBackedProvenance(parsed.data, options)
-    ) return parsed.data
+    if (!parsed.success) continue
+
+    // Validate cache key match
+    if (parsed.data.cache_key !== cacheKey) continue
+
+    // Any current identity option opts into strict current-identity lookup.
+    // A legacy row without those fields is a safe miss, even when its string
+    // cache key happens to match.
+    const hasIdentityOptions = options !== undefined && (
+      options.sourceVersionKey !== undefined ||
+      options.sourceInputSha256 !== undefined ||
+      options.promptInputSha256 !== undefined ||
+      options.extractionContractVersion !== undefined ||
+      options.providerID !== undefined ||
+      options.modelID !== undefined ||
+      Object.prototype.hasOwnProperty.call(options, "modelVariant")
+    )
+    if (hasIdentityOptions) {
+      const hasCurrentIdentity = (
+        parsed.data.source_key !== undefined &&
+        parsed.data.source_input_sha256 !== undefined &&
+        parsed.data.prompt_input_sha256 !== undefined &&
+        parsed.data.extraction_contract_version !== undefined &&
+        parsed.data.provider_id !== undefined &&
+        parsed.data.model_id !== undefined
+      )
+      if (!hasCurrentIdentity) continue
+
+      if (options.sourceVersionKey !== undefined && parsed.data.source_key !== options.sourceVersionKey) continue
+      if (options.sourceInputSha256 !== undefined && parsed.data.source_input_sha256 !== options.sourceInputSha256) continue
+      if (options.promptInputSha256 !== undefined && parsed.data.prompt_input_sha256 !== options.promptInputSha256) continue
+      if (options.extractionContractVersion !== undefined && parsed.data.extraction_contract_version !== options.extractionContractVersion) continue
+      if (options.providerID !== undefined && parsed.data.provider_id !== options.providerID) continue
+      if (options.modelID !== undefined && parsed.data.model_id !== options.modelID) continue
+      if (Object.prototype.hasOwnProperty.call(options, "modelVariant") && parsed.data.model_variant !== options.modelVariant) continue
+    }
+
+    // Validate evidence-backed provenance
+    if (!hasEvidenceBackedProvenance(parsed.data, options)) continue
+
+    return parsed.data
   }
   return null
 }
@@ -1111,6 +1175,11 @@ export function makeExtractionCacheEntry(args: {
   evidence?: Evidence[]
   provenance?: LLMExtractionCacheEntry["provenance"]
   completedAt?: string
+  sourceVersionKey?: string
+  sourceInputSha256?: string
+  promptInputSha256?: string
+  extractionContractVersion?: number
+  modelVariant?: string
 }): LLMExtractionCacheEntry {
   const provenance = args.provenance ?? (
     args.auditSessionID && args.evidence && args.evidence.length > 0
@@ -1123,12 +1192,21 @@ export function makeExtractionCacheEntry(args: {
         }
       : undefined
   )
+  // Wave 5: Use current-contract v2e hashed identity when available
+  const useNewContract = args.sourceVersionKey && args.extractionContractVersion
+  const cacheKey = useNewContract
+    ? makeExtractionCacheKey({
+        sourceVersionKey: args.sourceVersionKey!,
+        extractionContractVersion: args.extractionContractVersion!,
+        model: args.model,
+      })
+    : makeExtractionCacheKeyLegacy(
+        args.sourceSessionID,
+        args.canonicalInput.sha256,
+        args.model,
+      )
   return {
-    cache_key: makeExtractionCacheKeyLegacy(
-      args.sourceSessionID,
-      args.canonicalInput.sha256,
-      args.model,
-    ),
+    cache_key: cacheKey,
     source_session_id: args.sourceSessionID,
     canonical_input_sha256: args.canonicalInput.sha256,
     provider_id: args.model.providerID,
@@ -1136,6 +1214,14 @@ export function makeExtractionCacheEntry(args: {
     completed_at: args.completedAt ?? new Date().toISOString(),
     ...(provenance ? { provenance } : {}),
     facts: args.facts,
+    // Wave 5: Additive source identity fields for current-contract entries
+    ...(useNewContract ? {
+      source_key: args.sourceVersionKey,
+      source_input_sha256: args.sourceInputSha256,
+      prompt_input_sha256: args.promptInputSha256,
+      extraction_contract_version: args.extractionContractVersion,
+      model_variant: args.modelVariant,
+    } : {}),
   }
 }
 
