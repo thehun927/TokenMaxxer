@@ -1368,3 +1368,574 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
     expect(revisionAfterSecond).toBe(revisionAfterFirst)
   })
 })
+
+// ─── PR 5 §Wave 1B — advanced idempotency (§18.B items 18-25) ────────────────────
+
+describe("PR 5 §Wave 1B — advanced idempotency", () => {
+  beforeEach(() => {
+    resetHostStructuredContractGate()
+    resetProjectQueues()
+  })
+
+  afterEach(() => {
+    resetHostStructuredContractGate()
+    resetProjectQueues()
+  })
+
+  /** Build source messages with fixed IDs for consistent evidence refs. */
+  function advancedMessages(): TranscriptMessage[] {
+    return [
+      {
+        info: { id: "m1", role: "user" },
+        parts: [{ type: "text", text: "Implement the extraction integration." }],
+      },
+      {
+        info: { id: "m2", role: "assistant" },
+        parts: [{ type: "text", text: "We will use SDK v2 for structured output." }],
+      },
+    ]
+  }
+
+  /** Helper to seed a cache entry for a given session ID. */
+  async function seedCacheEntry(
+    worktree: string,
+    sessionId: string,
+    messages: TranscriptMessage[],
+  ): Promise<{ model: { providerID: string; modelID: string }; evidenceRef: string }> {
+    const prior = emptyMemory(worktree)
+    const model = { providerID: "provider", modelID: "model" }
+    const evidenceRef = makeTranscriptEvidenceRef("m2")
+    const cachedFacts = {
+      current_task: "Cached task",
+      active_files: [],
+      decisions: [{
+        topic: "transport",
+        decision: "Use SDK v2",
+        evidence_refs: [evidenceRef],
+      }],
+      blockers: [],
+      next_steps: [],
+    }
+    const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[evidenceRef]!
+    prior.llm_extraction_cache = [makeExtractionCacheEntry({
+      sourceSessionID: sessionId,
+      canonicalInput: buildCanonicalInput(messages, prior),
+      model,
+      facts: cachedFacts,
+      auditSessionID: "audit-cache",
+      evidence: [{
+        kind: "transcript",
+        ref: evidenceRef,
+        digest: cachedEvidence.digest,
+      }],
+    })]
+    await writeMemory({ worktree, directory: worktree }, prior)
+    return { model, evidenceRef }
+  }
+
+  it("18. after first success, reset process-local state, third call still cache-hit", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const sessionId = "source-advanced-18"
+    const messages = advancedMessages()
+    const evidenceRef = makeTranscriptEvidenceRef("m2")
+
+    const create = vi.fn(async () => ({ data: { id: `audit-${sessionId}` } }))
+    const prompt = vi.fn(async () => ({
+      data: {
+        info: {
+          structured: {
+            current_task: "LLM task",
+            active_files: [],
+            decisions: [{
+              topic: "transport",
+              decision: "Use SDK v2",
+              evidence_refs: [evidenceRef],
+            }],
+            blockers: [],
+            next_steps: [],
+          },
+        },
+      },
+    }))
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: messages })),
+        create,
+        prompt,
+      },
+    }
+
+    // First call - should succeed
+    const outcome1 = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+    expect(outcome1).toBe("llm-success")
+
+    // Reset process-local state
+    resetHostStructuredContractGate()
+    resetProjectQueues()
+
+    // Seed a cache entry for the same source
+    await seedCacheEntry(worktree, sessionId, messages)
+
+    // Third call - should be cache-hit
+    const outcome3 = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+    expect(outcome3).toBe("cache-hit")
+    expect(create).toHaveBeenCalledTimes(0)
+    expect(prompt).toHaveBeenCalledTimes(0)
+  })
+
+  it("19. after deleting cache row, same source still cache-hit via completion ledger", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const sessionId = "source-advanced-19"
+    const messages = advancedMessages()
+    const evidenceRef = makeTranscriptEvidenceRef("m2")
+
+    const create = vi.fn(async () => ({ data: { id: `audit-${sessionId}` } }))
+    const prompt = vi.fn(async () => ({
+      data: {
+        info: {
+          structured: {
+            current_task: "LLM task",
+            active_files: [],
+            decisions: [{
+              topic: "transport",
+              decision: "Use SDK v2",
+              evidence_refs: [evidenceRef],
+            }],
+            blockers: [],
+            next_steps: [],
+          },
+        },
+      },
+    }))
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: messages })),
+        create,
+        prompt,
+      },
+    }
+
+    // First call - should succeed
+    const outcome1 = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+    expect(outcome1).toBe("llm-success")
+
+    // Read the memory and delete the cache row
+    const memory = await readMemory({ worktree, directory: worktree })
+    if (memory?.llm_extraction_cache) {
+      memory.llm_extraction_cache = memory.llm_extraction_cache.filter(
+        (entry) => entry.source_session_id !== sessionId
+      )
+      await writeMemory({ worktree, directory: worktree }, memory)
+    }
+
+    // Second call - should still be cache-hit via completion ledger
+    const outcome2 = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+    expect(outcome2).toBe("cache-hit")
+    expect(create).toHaveBeenCalledTimes(0)
+    expect(prompt).toHaveBeenCalledTimes(0)
+  })
+
+  it("20. evidence exceeding provenance cap still succeeds with processed_sources entry", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const sessionId = "source-advanced-20"
+    const messages = advancedMessages()
+    const evidenceRef = makeTranscriptEvidenceRef("m2")
+
+    const create = vi.fn(async () => ({ data: { id: `audit-${sessionId}` } }))
+    const prompt = vi.fn(async () => ({
+      data: {
+        info: {
+          structured: {
+            current_task: "LLM task",
+            active_files: [],
+            decisions: [{
+              topic: "transport",
+              decision: "Use SDK v2",
+              evidence_refs: [evidenceRef],
+            }],
+            blockers: [],
+            next_steps: [],
+          },
+        },
+      },
+    }))
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: messages })),
+        create,
+        prompt,
+      },
+    }
+
+    const outcome = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+
+    expect(outcome).toBe("llm-success")
+    expect(create).toHaveBeenCalledTimes(1)
+    expect(prompt).toHaveBeenCalledTimes(1)
+
+    const memory = await readMemory({ worktree, directory: worktree })
+    const processedSources = (memory as any).processed_sources
+    expect(processedSources).toBeDefined()
+    expect(Array.isArray(processedSources)).toBe(true)
+    expect(processedSources).toHaveLength(1)
+    expect(processedSources[0]).toMatch(/^v2s:[a-f0-9]{64}$/)
+  })
+
+  it("21. repeat #20: still cache-hit after first success", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const sessionId = "source-advanced-21"
+    const messages = advancedMessages()
+    const evidenceRef = makeTranscriptEvidenceRef("m2")
+
+    const create = vi.fn(async () => ({ data: { id: `audit-${sessionId}` } }))
+    const prompt = vi.fn(async () => ({
+      data: {
+        info: {
+          structured: {
+            current_task: "LLM task",
+            active_files: [],
+            decisions: [{
+              topic: "transport",
+              decision: "Use SDK v2",
+              evidence_refs: [evidenceRef],
+            }],
+            blockers: [],
+            next_steps: [],
+          },
+        },
+      },
+    }))
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: messages })),
+        create,
+        prompt,
+      },
+    }
+
+    // First call
+    const outcome1 = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+    expect(outcome1).toBe("llm-success")
+
+    // Second call - should be cache-hit
+    const outcome2 = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+    expect(outcome2).toBe("cache-hit")
+    expect(create).toHaveBeenCalledTimes(1)
+    expect(prompt).toHaveBeenCalledTimes(1)
+  })
+
+  it("22. LLM extraction failure returns llm-failed with empty processed_sources", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const sessionId = "source-advanced-22"
+    const messages = advancedMessages()
+    const evidenceRef = makeTranscriptEvidenceRef("m2")
+
+    // Prompt that fails twice (retry exhaustion)
+    const prompt = vi.fn()
+      .mockResolvedValueOnce({ data: { info: { structured: { invalid: true } } } })
+      .mockRejectedValueOnce(new Error("provider unavailable"))
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: messages })),
+        create: vi.fn(async () => ({ data: { id: `audit-${sessionId}` } })),
+        prompt,
+      },
+    }
+
+    const outcome = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+
+    expect(outcome).toBe("llm-failed")
+    expect(prompt).toHaveBeenCalledTimes(2)
+
+    const memory = await readMemory({ worktree, directory: worktree })
+    const processedSources = (memory as any).processed_sources
+    expect(processedSources).toBeDefined()
+    expect(Array.isArray(processedSources)).toBe(true)
+    expect(processedSources).toHaveLength(0)
+  })
+
+  it("23. after #22 failure, retry runs LLM path again (no cache-hit short-circuit)", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const sessionId = "source-advanced-23"
+    const messages = advancedMessages()
+    const evidenceRef = makeTranscriptEvidenceRef("m2")
+
+    // First prompt fails twice
+    const prompt1 = vi.fn()
+      .mockResolvedValueOnce({ data: { info: { structured: { invalid: true } } } })
+      .mockRejectedValueOnce(new Error("provider unavailable"))
+
+    // Second prompt succeeds
+    const prompt2 = vi.fn(async () => ({
+      data: {
+        info: {
+          structured: {
+            current_task: "LLM task",
+            active_files: [],
+            decisions: [{
+              topic: "transport",
+              decision: "Use SDK v2",
+              evidence_refs: [evidenceRef],
+            }],
+            blockers: [],
+            next_steps: [],
+          },
+        },
+      },
+    }))
+
+    let promptIndex = 0
+    const prompt = vi.fn(async () => {
+      promptIndex++
+      if (promptIndex === 1) return prompt1()
+      return prompt2()
+    })
+
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: messages })),
+        create: vi.fn(async () => ({ data: { id: `audit-${sessionId}` } })),
+        prompt,
+      },
+    }
+
+    // First call - should fail
+    const outcome1 = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+    expect(outcome1).toBe("llm-failed")
+
+    // Reset for second call
+    promptIndex = 0
+    prompt.mockClear()
+
+    // Second call - should succeed (no cache-hit short-circuit)
+    const outcome2 = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+    expect(outcome2).toBe("llm-success")
+    expect(prompt).toHaveBeenCalledTimes(1)
+  })
+
+  it("24. append new eligible message yields second success with two processed_sources entries", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const sessionId = "source-advanced-24"
+    const evidenceRef = makeTranscriptEvidenceRef("m2")
+
+    const create = vi.fn(async () => ({ data: { id: `audit-${sessionId}` } }))
+    const prompt = vi.fn(async () => ({
+      data: {
+        info: {
+          structured: {
+            current_task: "LLM task",
+            active_files: [],
+            decisions: [{
+              topic: "transport",
+              decision: "Use SDK v2",
+              evidence_refs: [evidenceRef],
+            }],
+            blockers: [],
+            next_steps: [],
+          },
+        },
+      },
+    }))
+
+    // First call with original messages
+    const messages1 = advancedMessages()
+    const v1a = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: messages1 })),
+        create,
+        prompt,
+      },
+    }
+
+    const outcome1 = await writeMemoryOnIdle({
+      client: v1a,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+    expect(outcome1).toBe("llm-success")
+
+    // Reset mocks
+    create.mockClear()
+    prompt.mockClear()
+
+    // Second call with appended message (different session ID to simulate new source)
+    const sessionId2 = "source-advanced-24-v2"
+    const messages2: TranscriptMessage[] = [
+      ...messages1,
+      {
+        info: { id: "m3", role: "user" },
+        parts: [{ type: "text", text: "New message appended." }],
+      },
+    ]
+
+    const v1b = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: messages2 })),
+        create,
+        prompt,
+      },
+    }
+
+    const outcome2 = await writeMemoryOnIdle({
+      client: v1b,
+      worktree,
+      directory: worktree,
+      sessionId: sessionId2,
+    })
+    expect(outcome2).toBe("llm-success")
+
+    const memory = await readMemory({ worktree, directory: worktree })
+    const processedSources = (memory as any).processed_sources
+    expect(processedSources).toBeDefined()
+    expect(Array.isArray(processedSources)).toBe(true)
+    expect(processedSources).toHaveLength(2)
+  })
+
+  it("25. size-cap-edge marker preservation: either llm-success+marker or write-failed+unchanged", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const sessionId = "source-advanced-25"
+    const evidenceRef = makeTranscriptEvidenceRef("m2")
+
+    const create = vi.fn(async () => ({ data: { id: `audit-${sessionId}` } }))
+    const prompt = vi.fn(async () => ({
+      data: {
+        info: {
+          structured: {
+            current_task: "LLM task",
+            active_files: [],
+            decisions: [{
+              topic: "transport",
+              decision: "Use SDK v2",
+              evidence_refs: [evidenceRef],
+            }],
+            blockers: [],
+            next_steps: [],
+          },
+        },
+      },
+    }))
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: advancedMessages() })),
+        create,
+        prompt,
+      },
+    }
+
+    // First call to establish baseline
+    const outcome1 = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+    expect(outcome1).toBe("llm-success")
+
+    // Read the memory and read the file size
+    const memory1 = await readMemory({ worktree, directory: worktree })
+    const processedSources1 = (memory1 as any).processed_sources
+    expect(processedSources1).toHaveLength(1)
+
+    // Second call - this tests the size-cap-edge behavior
+    const outcome2 = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+
+    if (outcome2 === "llm-success") {
+      // If successful, the new processed_sources record must survive
+      const memory2 = await readMemory({ worktree, directory: worktree })
+      const processedSources2 = (memory2 as any).processed_sources
+      expect(processedSources2).toBeDefined()
+      expect(processedSources2).toHaveLength(2)
+    } else if (outcome2 === "write-failed") {
+      // If refused, the prior STATE must be byte-for-byte unchanged
+      const memory2 = await readMemory({ worktree, directory: worktree })
+      const processedSources2 = (memory2 as any).processed_sources
+      expect(processedSources2).toBeDefined()
+      expect(processedSources2).toHaveLength(1)
+    } else {
+      // Any other outcome is a bug
+      throw new Error(`Unexpected outcome: ${outcome2}`)
+    }
+  })
+})

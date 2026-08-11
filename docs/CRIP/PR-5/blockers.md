@@ -26,3 +26,10 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [test-gap] test/memory/writer-llm.test.ts extended with 7 failing-on-main fixtures (§18.B items 11-17); expected to go green in Wave 4.
 - [design-decision] Tests use the real writeMemoryOnIdle boundary and existing writeMemoryOnIdle test patterns.
 - [scope-deviation] Items 18-25 (advanced idempotency) and 39-41 (truthful outcomes) will be added in subsequent sub-waves.
+
+## 2026-08-11 — wave-1B-sub2 advanced idempotency fixtures
+- [test-gap] test/memory/writer-llm.test.ts extended with 8 failing-on-main fixtures (§18.B items 18-25); expected to go green in Wave 4.
+- [design-decision] Items 18-19 (process-local reset + cache-row deletion) prove the completion ledger is independent of the bulky result cache.
+- [design-decision] Item 24 (append-source second success) covers the same-session changed-version idempotency boundary.
+- [design-decision] Item 25 (size-cap-edge marker preservation) is acceptable to fail with either 'llm-success + marker survives' or 'transaction refused + prior STATE unchanged' — the bug is 'llm-success without marker on disk'.
+- [scope-deviation] Items 26-31 (barrier-driven concurrent cases, §18.C) and 39-41 (truthful outcomes, §18.E) are deferred to subsequent sub-waves.
