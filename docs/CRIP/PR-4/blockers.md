@@ -83,3 +83,17 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] scripts/verify-host-contract.mjs asserts the peer range, dev dep, and installed version match the approved minimum contract.
 - [design-decision] .github/workflows/ci.yml runs verify-host-contract after tsc --noEmit and before build so host drift fails early.
 - [test-gap] §12 F package-meta fixtures (items 40-42) all green.
+
+## 2026-08-10 — wave-8 repository-wide host-boundary audit
+- [audit] rg 'context as any' in src/ → 0 hits; no production code reads a client from ToolContext.
+- [audit] rg 'context.client' in src/ → 0 hits; the v1.18.15 ToolContext has no client — the exclusion is documented in the HostProjectContext type comment (src/host/contract.ts:24-29), which is a comment, not a read.
+- [audit] rg 'ToolContext.*\{.*client' in src/ → 0 hits.
+- [audit] rg 'client: any' in src/ → 0 hits; no efficiency helper or host-facing signature uses `client: any` (efficiency helpers take a typed HostClient parameter).
+- [audit] rg 'VERIFIED_HOST_CONTRACT_VERSION|MINIMUM_HOST_CONTRACT' in src/ → 3 hits, all legitimate: canonical declaration src/host/contract.ts:39, import src/memory/llm-adapter.ts:12, log usage src/memory/llm-adapter.ts:432. `MINIMUM_HOST_CONTRACT` → 0 hits (the Wave 4 local constant was removed). Exactly one canonical minimum version constant; no duplicates.
+- [audit] rg 'session.prompt' in src/ → 1 literal hit at src/memory/extract-llm.ts:858 — a capability guard (`!client.session?.create || !client.session.prompt`) that emits an unavailable-client diagnostic, NOT response-envelope inspection. llm-adapter.ts touches the surface via `client?.session?.prompt` (src/memory/llm-adapter.ts:249) and is the ONLY file that inspects the structured-output response envelope (`data.info.structured`, src/memory/llm-adapter.ts:285-340). No other file inspects the structured-output envelope.
+- [audit] rg 'format ?\? ?: ?"json"' in src/ → 0 hits (the format field is always built as `format: { type: "json_schema", schema }` inside the adapter request cast, llm-adapter.ts:265-283).
+- [audit] package.json peer range = '>=1.18.15 <2.0.0' (package.json:47); dev dep = '1.18.15' exactly with no ^/~ (package.json:54); installed @opencode-ai/plugin = '1.18.15'.
+- [audit] src/host/contract.ts:36-42 is the only canonical minimum-version/peer-range declaration (MIN_SUPPORTED_OPENCODE_VERSION, VERIFIED_HOST_CONTRACT_VERSION, OPENCODE_PLUGIN_PEER_RANGE); llm-adapter.ts imports from it, so install-time and runtime claims cannot diverge.
+- [audit] src/memory/llm-adapter.ts is the only file with structured-output compatibility casts: the `format: { type: "json_schema" }` request cast (llm-adapter.ts:265-283) and the `data.info.structured` envelope validation (llm-adapter.ts:285-340). extract-llm.ts's own V1ClientLike shape (src/memory/extract-llm.ts:245-256) predates PR 4 and is a model-discovery/session-surface probe (config.get / provider.list / surface guard), not a structured-output response cast; it does not inspect the envelope.
+- [audit] CI workflow change (.github/workflows/ci.yml adds npm run verify:host-contract between tsc and build) is local-only and not pushed because the PAT lacks the `workflow` scope; documented in the wave-7 commit fabeb34.
+- [test-gap] Wave 8 adds no new tests: the audit is verification that the Wave 1-7 fixtures (§12 A-G, all 50 release-gate cases) already cover every original concern; full suite 37 files / 478 tests green at audit time.

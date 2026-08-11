@@ -1,6 +1,6 @@
 # CRIP PR 4 — OpenCode Host Contract
 
-**Status:** Implementation plan ready
+**Status:** Implementation complete — release-gate review pending
 
 PR 4 makes TokenMaxxer's OpenCode integration boundary explicit and verifiable after PR 1 established authoritative storage, PR 2 established cross-process transactions, and PR 3 established trustworthy decision authority/human promotion semantics.
 
@@ -44,5 +44,22 @@ The plan was designed against the exact upstream v1.18.15 plugin/tool/file/struc
 ## Release invariant
 
 > TokenMaxxer uses only declared OpenCode host surfaces, declares only compatibility it actually verifies, and degrades optional structured extraction without compromising durable heuristic memory.
+
+## Implementation summary
+
+Implementation shipped in waves 1-8 (commit range `5a8758b..fabeb34`):
+
+- Wave 1: failing regression fixtures (src/host/contract.ts, tsconfig.host-contract.json, test/host-contract/*, test/host/contract.test.ts, test/tools/bounds.test.ts, extensions to test/tools/efficiency.test.ts, test/tools/recall.test.ts, test/memory/llm-adapter.test.ts, test/memory/writer-llm.test.ts, test/index.test.ts, test/host/package-meta.test.ts)
+- Wave 2: dependency injection (registerEfficiencyTools(client), no more (context as any).client)
+- Wave 3: bounded tool schemas + output truncation (src/tools/bounds.ts, head_files formatter)
+- Wave 4: full version runtime gating (isSupportedHostVersion from src/host/contract)
+- Wave 5: graceful degradation through real writer (verification only — implementation was already correct)
+- Wave 6: clean host mocks (tool-map merge in src/index.ts, satisfies PluginInput fixtures)
+- Wave 7: peer range + CI integration (verify-host-contract script, package.json + lockfile)
+- Wave 8: repository-wide host-boundary audit + oracle investigation brief
+
+Final CI signal: 37 files / 478 tests pass; tsc --noEmit clean; npm run verify:host-contract OK; npm run build produces dist/cli.js; 50 release-gate cases covered.
+
+Pre-release-gate oracle investigation: [oracle-investigation.md](./oracle-investigation.md).
 
 Program authority: [`../implementation-plan.md`](../implementation-plan.md).
