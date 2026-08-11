@@ -1939,3 +1939,110 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
     }
   })
 })
+
+// ─── PR 5 §Wave 1B — truthful outcomes (§18.E items 39-41) ────────────────────────
+
+describe("PR 5 §Wave 1B — truthful outcomes", () => {
+  beforeEach(() => {
+    resetHostStructuredContractGate()
+    resetProjectQueues()
+  })
+
+  afterEach(() => {
+    resetHostStructuredContractGate()
+    resetProjectQueues()
+  })
+
+  /** Build source messages with fixed IDs for consistent evidence refs. */
+  function truthfulMessages(): TranscriptMessage[] {
+    return [
+      {
+        info: { id: "m1", role: "user" },
+        parts: [{ type: "text", text: "Implement the extraction integration." }],
+      },
+      {
+        info: { id: "m2", role: "assistant" },
+        parts: [{ type: "text", text: "We will use SDK v2 for structured output." }],
+      },
+    ]
+  }
+
+  it("39. missing session.messages endpoint → outcome no-messages", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const sessionId = "source-truthful-39"
+
+    // Client without session.messages endpoint
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        create: vi.fn(async () => ({ data: { id: `audit-${sessionId}` } })),
+        prompt: vi.fn(),
+      },
+    }
+
+    const outcome = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+
+    expect(outcome).toBe("no-messages")
+  })
+
+  it("40. empty/missing transcript data → outcome no-messages", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const sessionId = "source-truthful-40"
+    const messages = truthfulMessages()
+
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => ({ data: [] })), // Empty array
+        create: vi.fn(async () => ({ data: { id: `audit-${sessionId}` } })),
+        prompt: vi.fn(),
+      },
+    }
+
+    const outcome = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+
+    expect(outcome).toBe("no-messages")
+  })
+
+  it("41. session.messages throws → outcome error", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const sessionId = "source-truthful-41"
+
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
+      session: {
+        messages: vi.fn(async () => {
+          throw new Error("session.messages failed")
+        }),
+        create: vi.fn(async () => ({ data: { id: `audit-${sessionId}` } })),
+        prompt: vi.fn(),
+      },
+    }
+
+    const outcome = await writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+
+    // The outcome should be "error" (NOT "heuristic-only")
+    expect(outcome).toBe("error")
+  })
+})

@@ -33,3 +33,9 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] Item 24 (append-source second success) covers the same-session changed-version idempotency boundary.
 - [design-decision] Item 25 (size-cap-edge marker preservation) is acceptable to fail with either 'llm-success + marker survives' or 'transaction refused + prior STATE unchanged' — the bug is 'llm-success without marker on disk'.
 - [scope-deviation] Items 26-31 (barrier-driven concurrent cases, §18.C) and 39-41 (truthful outcomes, §18.E) are deferred to subsequent sub-waves.
+
+## 2026-08-11 — wave-1B-sub3 truthful outcomes fixtures
+- [test-gap] test/memory/writer-llm.test.ts extended with 3 failing-on-main fixtures (§18.E items 39-41); expected to go green in Wave 6.
+- [design-decision] Item 41 specifically asserts that the broad catch (-> 'heuristic-only') is replaced by an explicit 'error' outcome.
+- [design-decision] The remaining §18.E items 42-58 (write-failed, queue-failed, llm-failed, the lastOutcome alignment, etc.) are deferred to Wave 6 when the truthful outcome state machine is implemented.
+- [scope-deviation] Items 26-31 (barrier-driven concurrent cases, §18.C) are deferred to Wave 4 where the source-version queue key is implemented.
