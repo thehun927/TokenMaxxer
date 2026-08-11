@@ -130,3 +130,4 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [verification] `npx tsc --noEmit` passed after B1–B4 remediation.
 - [verification] `npx vitest run test/memory/writer-llm.test.ts test/memory/writer.test.ts test/memory/model-health.test.ts test/memory/extract-llm.test.ts test/memory/extract.test.ts test/tools/recall.test.ts` passed: 6 files, 197 tests.
 - [verification] `npm test` passed: 38 files, 578 tests; real B1–B4 adversarial regressions are included in `test/memory/writer-llm.test.ts`.
+- [doc-clarification] The initial B1–B4 test placeholders were replaced within this same remediation wave by real behavioral regressions covering stale-cache precedence, bounded source-window identity, gated-model identity, and malformed recall shapes.
