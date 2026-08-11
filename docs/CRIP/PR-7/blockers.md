@@ -290,3 +290,21 @@ decisions, and validation results; do not rewrite prior entries.
 - Scope is limited to B1 adversarial history regressions and B3 reuse of the
   existing bounded fallback reason in structured app-log metadata. No B2/B4,
   PR 8, or PR 9 changes are authorized.
+
+## 2026-08-11 — Final residual remediation validation
+
+- B1 added five pure extraction regressions: missing finish, false finish,
+  newer unfinished summary versus older finished summary, finished error, and
+  newest valid completed summary.
+- B3 computes one bounded fallback reason and reuses it in both
+  `client.app.log` structured metadata and `last_compaction_prompt.log`; the
+  800-character error fixture asserts both paths receive the same bounded
+  value.
+- Residual focused command:
+  `npx vitest run test/compaction/history.test.ts test/index.test.ts` — **2
+  files passed, 44 tests passed**.
+- Full compaction command: `npx vitest run test/compaction/` — **10 files
+  passed, 199 tests passed**.
+- Full local release chain: **46 files passed, 844 tests passed**;
+  TypeScript, build, host-contract, bundle, installer, and CLI smoke checks
+  all passed.
