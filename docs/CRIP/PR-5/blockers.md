@@ -100,3 +100,10 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [verification] `npx vitest run test/memory/writer-llm.test.ts test/memory/extract-llm.test.ts test/memory/source-processing.test.ts test/memory/transaction.test.ts test/memory/store.test.ts test/memory/extract.test.ts` passed: 6 files, 127 tests.
 - [verification] `npm test` passed: 38 files, 551 tests.
 - [doc-clarification] The Wave-4 STATE-unavailable mapping note above is retained as history; the Wave-5 implementation now maps preparation-time authoritative STATE unavailability to `write-failed`, satisfying the existing PR-1 regression. The complete Wave-6 public outcome state machine and centralized publication work remain out of scope and unimplemented.
+
+## 2026-08-11 — Waves 6–7 implementation evidence
+- [implementation] Wave 6 adds typed LLM run results, explicit stage-accurate idle outcome mapping, centralized queue outcome publication, and unexpected-error handling without broad `catch -> heuristic-only` fallback.
+- [implementation] Wave 7 replaces boolean recall recency with structured completed-tool-input replay through canonical `queryDecisions()` against the pre-merge authoritative base; `_recallDecision()` remains read-only.
+- [verification] `npx tsc --noEmit` passed after Waves 6–7.
+- [verification] `npx vitest run test/memory/writer.test.ts test/tools/recall.test.ts test/memory/writer-llm.test.ts test/memory/extract-llm.test.ts test/memory/transaction.test.ts test/memory/store.test.ts test/tools/status.test.ts` passed: 7 files, 215 tests.
+- [verification] `npm test` passed: 38 files, 570 tests.

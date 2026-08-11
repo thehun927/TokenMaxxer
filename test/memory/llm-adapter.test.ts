@@ -91,7 +91,7 @@ describe("host v1 structured-output adapter", () => {
       { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
     )
 
-    expect(result).toBeNull()
+    expect(result).toEqual({ status: "failed", reason: "structured-request" })
     expect(prompt).toHaveBeenCalledTimes(2)
     expect(diagnostics).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "structured-output-failed", reason: "response-shape-drift" }),

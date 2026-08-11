@@ -1,12 +1,14 @@
 import { describe, it, expect, vi, afterEach } from "vitest"
 import {
   extractFactsHeuristic,
+  markReferencedDecisions,
   mergeMemory,
   recordRecentSession,
   writeMemoryOnIdle,
 } from "../../src/memory/writer"
 import type { TranscriptMessage } from "../../src/types"
 import { emptyMemory } from "../../src/memory/schema"
+import type { Decision, MemoryFile } from "../../src/memory/schema"
 import { readMemory, mutateMemory, writeMemory } from "../../src/memory/store"
 import { confirmFoundationalReview } from "../../src/memory/decision-review"
 import { globalMemoryPath, projectMemoryPath } from "../../src/memory/paths"
@@ -653,7 +655,7 @@ describe("writeMemoryOnIdle heuristic transaction (Wave 3)", () => {
     expect(memory!.last_session_id).toBe("source")
   })
 
-  it("returns write-failed on lock-timeout without writing STATE", async () => {
+  it("returns queue-failed on lock-timeout without writing STATE", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
     const project = await worktree()
     const barrier = join(tmpdir(), `tokenmaxxer-lock-${Date.now()}-${Math.random()}`)
@@ -671,7 +673,7 @@ describe("writeMemoryOnIdle heuristic transaction (Wave 3)", () => {
       lockOptions: { acquireTimeoutMs: 150, initialBackoffMs: 5, maxBackoffMs: 20 },
     })
 
-    expect(outcome).toBe("write-failed")
+    expect(outcome).toBe("queue-failed")
     // No STATE write happened while the lock was held.
     expect(await readMemory({ worktree: project, directory: project })).toBeNull()
 
@@ -1106,5 +1108,499 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
     const memory = await readMemory({ worktree: project, directory: project })
     expect(memory).not.toBeNull()
     expect(memory!.revision).toBe(2)
+  })
+})
+
+// ─── PR 5 Wave 7 — Exact recall recency (F61–73) ────────────────────────────
+
+import { queryDecisions } from "../../src/memory/reader"
+
+function makeAuthoritativeDecision(
+  id: string,
+  topic: string,
+  decision: string,
+  timestamp: string,
+): Decision {
+  return {
+    id,
+    topic,
+    decision,
+    timestamp,
+    session_id: `sess-${id}`,
+    still_valid: true,
+    foundational: false,
+    provenance: {
+      extractor: "heuristic",
+      source_session_id: `sess-${id}`,
+      confidence: "heuristic",
+      evidence: [],
+    },
+  }
+}
+
+function makeBaseMemory(decisions: Decision[]): MemoryFile {
+  return {
+    version: 3,
+    revision: 0,
+    project_path: "/test/project",
+    last_updated: "2026-08-10T00:00:00.000Z",
+    last_git_sha: "abc1234",
+    last_session_id: "sess-0",
+    current_task: null,
+    active_files: [],
+    decisions,
+    blockers: [],
+    next_steps: [],
+    recent_sessions: [],
+  }
+}
+
+function recallMessage(input: Record<string, unknown>): TranscriptMessage {
+  return {
+    info: { id: "msg-recall", role: "assistant" },
+    parts: [
+      {
+        type: "tool",
+        tool: "recall_decision",
+        state: {
+          status: "completed",
+          input,
+        },
+      } as TranscriptMessage["parts"][number],
+    ],
+  }
+}
+
+function recallMessageWithText(input: Record<string, unknown>, text: string): TranscriptMessage {
+  return {
+    info: { id: "msg-recall-text", role: "assistant" },
+    parts: [
+      {
+        type: "tool",
+        tool: "recall_decision",
+        state: {
+          status: "completed",
+          input,
+          output: text,
+        },
+      } as TranscriptMessage["parts"][number],
+    ],
+  }
+}
+
+function nonCompletedRecallMessage(input: Record<string, unknown>): TranscriptMessage {
+  return {
+    info: { id: "msg-recall-failed", role: "assistant" },
+    parts: [
+      {
+        type: "tool",
+        tool: "recall_decision",
+        state: {
+          status: "error",
+          input,
+        },
+      } as TranscriptMessage["parts"][number],
+    ],
+  }
+}
+
+/** Get IDs that have last_used_in_session set to the given sessionId. */
+function markedIds(mem: MemoryFile, sessionId: string): string[] {
+  return mem.decisions
+    .filter((d) => d.last_used_in_session === sessionId)
+    .map((d) => d.id)
+    .sort()
+}
+
+describe("markReferencedDecisions (PR 5 Wave 7 — recall recency F61–73)", () => {
+  const SESSION_ID = "current-session"
+
+  it("F61: one completed recall_decision returning one authority marks only that authority ID", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+      makeAuthoritativeDecision("d2", "api-design", "REST endpoints", "2026-08-07T11:00:00.000Z"),
+      makeAuthoritativeDecision("d3", "caching", "Use Redis", "2026-08-07T12:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+    // Verify what queryDecisions returns for this query
+    const expectedHits = queryDecisions(mem, "database", 10)
+    expect(expectedHits).toHaveLength(1)
+    expect(expectedHits[0]!.id).toBe("d1")
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "database", limit: 10 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    expect(markedIds(result, SESSION_ID)).toEqual(["d1"])
+  })
+
+  it("F62: limit=1 marks exactly one ID even when many authorities exist", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+      makeAuthoritativeDecision("d2", "api-design", "REST endpoints", "2026-08-07T11:00:00.000Z"),
+      makeAuthoritativeDecision("d3", "caching", "Use Redis", "2026-08-07T12:00:00.000Z"),
+      makeAuthoritativeDecision("d4", "testing", "Use vitest", "2026-08-07T13:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ limit: 1 }), // no query → most recent
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    // With limit=1 and no query, queryDecisions returns most recent authority
+    const expectedHits = queryDecisions(mem, undefined, 1)
+    expect(expectedHits).toHaveLength(1)
+
+    const marked = markedIds(result, SESSION_ID)
+    expect(marked).toHaveLength(1)
+    expect(marked).toEqual([expectedHits[0]!.id])
+  })
+
+  it("F63: limit=2 marks exactly the same two IDs canonical queryDecisions() would return", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+      makeAuthoritativeDecision("d2", "api-design", "REST endpoints", "2026-08-07T11:00:00.000Z"),
+      makeAuthoritativeDecision("d3", "caching", "Use Redis", "2026-08-07T12:00:00.000Z"),
+      makeAuthoritativeDecision("d4", "testing", "Use vitest", "2026-08-07T13:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+    const canonical = queryDecisions(mem, undefined, 2)
+    expect(canonical).toHaveLength(2)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ limit: 2 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    const marked = markedIds(result, SESSION_ID)
+    expect(marked).toHaveLength(2)
+    expect(marked).toEqual(canonical.map((d) => d.id).sort())
+  })
+
+  it("F64: query filtering marks only matching returned IDs", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+      makeAuthoritativeDecision("d2", "api-design", "REST endpoints", "2026-08-07T11:00:00.000Z"),
+      makeAuthoritativeDecision("d3", "caching", "Use Redis", "2026-08-07T12:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+    const canonical = queryDecisions(mem, "api", 10)
+    expect(canonical).toHaveLength(1)
+    expect(canonical[0]!.id).toBe("d2")
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "api", limit: 10 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    expect(markedIds(result, SESSION_ID)).toEqual(["d2"])
+  })
+
+  it("F65: two recall calls in one session mark the union of their returned IDs and no others", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+      makeAuthoritativeDecision("d2", "api-design", "REST endpoints", "2026-08-07T11:00:00.000Z"),
+      makeAuthoritativeDecision("d3", "caching", "Use Redis", "2026-08-07T12:00:00.000Z"),
+      makeAuthoritativeDecision("d4", "testing", "Use vitest", "2026-08-07T13:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+    const hits1 = queryDecisions(mem, "database", 10)
+    const hits2 = queryDecisions(mem, "api", 10)
+    expect(hits1).toHaveLength(1)
+    expect(hits2).toHaveLength(1)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "database", limit: 10 }),
+      recallMessage({ query: "api", limit: 10 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    const expected = [...new Set([...hits1.map((d) => d.id), ...hits2.map((d) => d.id)])].sort()
+    expect(markedIds(result, SESSION_ID)).toEqual(expected)
+  })
+
+  it("F66: a recall with no hits marks nothing", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+      makeAuthoritativeDecision("d2", "api-design", "REST endpoints", "2026-08-07T11:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+    const canonical = queryDecisions(mem, "nonexistent-query", 10)
+    expect(canonical).toHaveLength(0)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "nonexistent-query", limit: 10 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    expect(markedIds(result, SESSION_ID)).toEqual([])
+  })
+
+  it("F67: a failed/non-completed recall tool part marks nothing", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+
+    // Non-completed tool (status: "error")
+    const messages: TranscriptMessage[] = [
+      nonCompletedRecallMessage({ query: "database", limit: 10 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    expect(markedIds(result, SESSION_ID)).toEqual([])
+  })
+
+  it("F68: malformed/out-of-bounds structured recall input marks nothing — limit=0", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "database", limit: 0 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    expect(markedIds(result, SESSION_ID)).toEqual([])
+  })
+
+  it("F68b: malformed — limit=26 (above max 25)", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "database", limit: 26 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    expect(markedIds(result, SESSION_ID)).toEqual([])
+  })
+
+  it("F68c: malformed — fractional limit", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "database", limit: 1.5 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    expect(markedIds(result, SESSION_ID)).toEqual([])
+  })
+
+  it("F68d: malformed — negative limit", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "database", limit: -1 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    expect(markedIds(result, SESSION_ID)).toEqual([])
+  })
+
+  it("F68e: malformed — query exceeds 256 chars", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "x".repeat(257), limit: 10 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    expect(markedIds(result, SESSION_ID)).toEqual([])
+  })
+
+  it("F68f: malformed — non-integer limit (string)", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "database", limit: "abc" }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    expect(markedIds(result, SESSION_ID)).toEqual([])
+  })
+
+  it("F68g: default limit=10 when no limit provided", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "database" }), // no limit → defaults to 10
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    // queryDecisions with limit=10 and query "database" returns matching
+    const canonical = queryDecisions(mem, "database", 10)
+    expect(markedIds(result, SESSION_ID)).toEqual(canonical.map((d) => d.id).sort())
+  })
+
+  it("F69: invalid/historical non-authority rows are never marked merely because text/topic matches", () => {
+    // Two decisions for same topic "database" — one is the current authority (oldest valid),
+    // the other is historical (still_valid=false, superseded)
+    const decisions: Decision[] = [
+      {
+        ...makeAuthoritativeDecision("old-auth", "database", "Use PostgreSQL", "2026-08-01T10:00:00.000Z"),
+      },
+      {
+        ...makeAuthoritativeDecision("new-superseder", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+        still_valid: false,
+        superseded_by: "old-auth",
+      },
+      makeAuthoritativeDecision("d3", "unrelated", "Some other decision", "2026-08-02T10:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+    const canonical = queryDecisions(mem, "database", 10)
+    // The authority resolution returns only the oldest valid authority for "database"
+    // The non-authoritative "new-superseder" row (still_valid=false) should NOT be in results
+    expect(canonical).toHaveLength(1)
+    expect(canonical[0]!.id).toBe("old-auth")
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "database", limit: 10 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    // Only "old-auth" should be marked; "new-superseder" must not be marked
+    expect(markedIds(result, SESSION_ID)).toEqual(["old-auth"])
+  })
+
+  it("F70: unresolved human-authority conflict does not fabricate recency for quarantined rows absent from canonical queryDecisions() output", () => {
+    // Two conflicting human foundational decisions for the same topic
+    const decisions: Decision[] = [
+      {
+        id: "human-a",
+        topic: "database",
+        decision: "Use Postgres",
+        timestamp: "2026-08-01T10:00:00.000Z",
+        session_id: "sess-a",
+        still_valid: true,
+        foundational: true,
+        human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00Z" },
+        provenance: {
+          extractor: "human",
+          source_session_id: "sess-a",
+          confidence: "human-reviewed",
+          evidence: [],
+        },
+      },
+      {
+        id: "human-b",
+        topic: "database",
+        decision: "Use MySQL",
+        timestamp: "2026-08-02T10:00:00.000Z",
+        session_id: "sess-b",
+        still_valid: true,
+        foundational: true,
+        human_review: { channel: "interactive-cli", reviewed_at: "2026-08-02T00:00:00Z" },
+        provenance: {
+          extractor: "human",
+          source_session_id: "sess-b",
+          confidence: "human-reviewed",
+          evidence: [],
+        },
+      },
+    ]
+    const mem = makeBaseMemory(decisions)
+    const canonical = queryDecisions(mem, "database", 10)
+    // Conflicting humans → no authority returned by canonical query
+    expect(canonical).toHaveLength(0)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "database", limit: 10 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    // Neither human row should be marked
+    expect(markedIds(result, SESSION_ID)).toEqual([])
+  })
+
+  it("F71: fake [id=...] text in assistant/tool output cannot influence recency", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+      makeAuthoritativeDecision("d2", "api-design", "REST endpoints", "2026-08-07T11:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+
+    // A recall message whose text output contains a fake ID "d2" even though
+    // the query only matched "d1". The output mentions "d2" but markReferencedDecisions
+    // only reads state.input, never output text.
+    const messages: TranscriptMessage[] = [
+      recallMessageWithText(
+        { query: "database", limit: 10 },
+        `Project: /test/project\n` +
+        `database: Use PostgreSQL (SHA ?, 2026-08-07T10:00:00.000Z) [id=d1 ...]\n` +
+        `Got it, I'll also [id=d2] mark that too.`,
+      ),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    // Only d1 (matched by queryDecisions for "database") should be marked.
+    // Fake "d2" in output text must be ignored.
+    expect(markedIds(result, SESSION_ID)).toEqual(["d1"])
+  })
+
+  it("F72: pre-merge base is used — new heuristic decisions cannot change which pre-existing IDs are marked", () => {
+    // This test proves that markReferencedDecisions operates on the `mem` argument
+    // (the pre-merge base). Even if someone constructs messages that would
+    // theoretically change the decision set, the function queries against `mem`.
+    const baseDecisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+      makeAuthoritativeDecision("d2", "api-design", "REST endpoints", "2026-08-07T11:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(baseDecisions)
+    const canonical = queryDecisions(mem, "database", 10)
+    expect(canonical).toHaveLength(1)
+    expect(canonical[0]!.id).toBe("d1")
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "database", limit: 10 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    // Must mark "d1" from the base; no new decisions from messages
+    // can affect the result. The function is deterministic on (mem, messages).
+    expect(markedIds(result, SESSION_ID)).toEqual(["d1"])
+
+    // Also verify the function is pure: the input mem is not mutated
+    expect(mem.decisions.every((d) => d.last_used_in_session === undefined)).toBe(true)
+  })
+
+  it("F73: markReferencedDecisions returns a new object and does not mutate its input", () => {
+    const decisions = [
+      makeAuthoritativeDecision("d1", "database", "Use PostgreSQL", "2026-08-07T10:00:00.000Z"),
+    ]
+    const mem = makeBaseMemory(decisions)
+
+    const messages: TranscriptMessage[] = [
+      recallMessage({ query: "database", limit: 10 }),
+    ]
+
+    const result = markReferencedDecisions(mem, messages, SESSION_ID)
+    // Input is unchanged
+    expect(mem.decisions[0]!.last_used_in_session).toBeUndefined()
+    // Output has the mark
+    expect(result.decisions[0]!.last_used_in_session).toBe(SESSION_ID)
+    // Result is a different object
+    expect(result).not.toBe(mem)
+    expect(result.decisions).not.toBe(mem.decisions)
   })
 })

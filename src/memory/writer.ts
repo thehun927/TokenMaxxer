@@ -15,6 +15,8 @@ import { MAX_PROCESSED_SOURCES, ProcessedSourceSchema } from "./schema"
 import { findProcessedSource, upsertProcessedSource } from "./source-processing"
 import type { ExtractedFacts, TranscriptMessage } from "../types"
 import { mergeDecisions } from "./merge"
+import { queryDecisions } from "./reader"
+import { TOOL_LIMITS } from "../tools/bounds"
 import { readMemoryState, emptyMemory, resolveProjectPath, mutateMemory } from "./store"
 import type { MemoryMutationResult } from "./store"
 import { enqueueProjectJob, setProjectQueueOutcome } from "./lock"
@@ -58,6 +60,18 @@ import * as writerModule from "./writer"
 
 const TRANSCRIPT_WINDOW = 50
 const MAX_DIAGNOSTIC_VALUE = 200
+
+/**
+ * Wave 6: Centralize final outcome publication.
+ * Every public terminal path, including pre-queue no-messages/error/write-failed and queue rejection,
+ * sets getProjectQueueStatus(project).lastOutcome to exactly the returned IdleWriteOutcome.
+ * Generic lock.ts internal `failed` must never leak as the final public value.
+ * A later success must replace an earlier failure.
+ */
+function finishIdleOutcome(project: string, outcome: IdleWriteOutcome): IdleWriteOutcome {
+  setProjectQueueOutcome(project, outcome)
+  return outcome
+}
 
 function boundedDiagnosticValue(value: string): string {
   return value.length <= MAX_DIAGNOSTIC_VALUE
@@ -372,7 +386,7 @@ async function processPreparedIdleSource(
 
   if (heuristicResult.status === "lock-timeout") {
     void log(client, "warn", "heuristic transaction lock-timeout", { project })
-    return "write-failed"
+    return "queue-failed"
   }
   if (heuristicResult.status === "unavailable") {
     void log(client, "warn", "heuristic transaction unavailable", { project })
@@ -485,7 +499,7 @@ async function processPreparedIdleSource(
   let extractionAuditSessionID: string | undefined
   const persistAudit: AuditCreatedCallback = async (audit) => {
     extractionAuditSessionID = audit.audit_session_id
-    return persistAuditGuard({ client, worktree, directory }, audit)
+    return persistAuditGuardResult({ client, worktree, directory }, audit)
   }
   const persistTerminal = async (
     auditSessionID: string,
@@ -495,7 +509,7 @@ async function processPreparedIdleSource(
   }
 
   void log(client, "debug", "llm extraction audit session requested")
-  const llmFacts = await extractFactsLLM(
+  const llmResult = await extractFactsLLM(
     canonicalInput,
     sessionId,
     projectName,
@@ -521,10 +535,33 @@ async function processPreparedIdleSource(
       },
     },
   )
-  if (!llmFacts) {
-    void log(client, "warn", "llm extraction returned no facts")
-    return "llm-failed"
+
+  // Wave 6: Map typed LLM run result to public outcome
+  switch (llmResult.status) {
+    case "success":
+      // Fall through to final merge
+      break
+    case "unavailable":
+      // Missing session endpoint -> heuristic-only (no model request attempted)
+      void log(client, "info", "llm extraction skipped: missing session endpoint", {
+        reason: llmResult.reason,
+      })
+      return "heuristic-only"
+    case "guard-failed":
+      // A required guard persistence lock timeout is a queue failure; other
+      // typed persistence failures are write failures.
+      void log(client, "warn", "llm extraction audit guard failed", { project })
+      return llmResult.reason === "lock-timeout" ? "queue-failed" : "write-failed"
+    case "failed":
+      // Retained session-create/prompt/retry/validation/evidence failure -> llm-failed
+      void log(client, "warn", "llm extraction failed", {
+        reason: (llmResult as { reason: string }).reason,
+        project,
+      })
+      return "llm-failed"
   }
+
+  const llmFacts = llmResult.facts
 
   const finalResult = await finalLLMMerge(
     { client, worktree, directory },
@@ -543,25 +580,31 @@ async function processPreparedIdleSource(
       digests,
     },
   )
+
+  // Wave 6: Map finalLLMMerge result to public outcome
   if (finalResult.status === "lock-timeout") {
+    // Wave 6: Lock timeout -> queue-failed (not llm-failed)
     void log(client, "warn", "final llm transaction lock-timeout", { project })
-    return "llm-failed"
+    return finishIdleOutcome(project, "queue-failed")
   }
   if (finalResult.status === "unavailable") {
+    // Wave 6: STATE unavailable -> write-failed (not llm-failed)
     void log(client, "warn", "final llm transaction unavailable", { project })
-    return "llm-failed"
+    return finishIdleOutcome(project, "write-failed")
   }
   if (finalResult.status === "commit-failed") {
+    // Wave 6: Commit failed -> write-failed (not llm-failed)
     void log(client, "warn", "final llm transaction commit-failed", { project })
-    return "llm-failed"
+    return finishIdleOutcome(project, "write-failed")
   }
   if (finalResult.status === "noop" && finalResult.value.outcome === "noop") {
-    return "cache-hit"
+    // Wave 6: Already completed by another actor -> cache-hit
+    return finishIdleOutcome(project, "cache-hit")
   }
   const finalMemory = finalResult.value.memory
   await writeHeaderBestEffort(client, worktree, directory, finalMemory)
   void log(client, "info", "llm extraction facts merged")
-  return "llm-success"
+  return finishIdleOutcome(project, "llm-success")
 }
 
 /**
@@ -578,32 +621,55 @@ export async function writeMemoryOnIdle(opts: IdleWriteOptions): Promise<IdleWri
   const stopActivity = beginMemoryActivity(project)
 
   // Wave 4: Prepare source BEFORE enqueueing to avoid holding locks across I/O
-  // Wrap preparation and pre-queue terminal handling in try/finally to ensure cleanup
+  // Wave 6: Wrap preparation and pre-queue terminal handling in try/finally to ensure cleanup
+  // All terminal outcomes use finishIdleOutcome to set queue status
   let outcome: IdleWriteOutcome
   try {
-    const prepared = await prepareIdleSource(opts)
+    let prepared: PreparedIdleSource
+    try {
+      prepared = await prepareIdleSource(opts)
+    } catch (error) {
+      // Preparation is outside the queue.  An unexpected source/preparation
+      // exception is an application error, not a queue rejection.
+      void log(opts.client, "error", "idle source preparation failed", {
+        error: String(error),
+      })
+      return finishIdleOutcome(project, "error")
+    }
+
     if (prepared.kind === "no-messages") {
-      setProjectQueueOutcome(project, "no-messages")
-      outcome = "no-messages"
+      outcome = finishIdleOutcome(project, "no-messages")
     } else if (prepared.kind === "error") {
-      setProjectQueueOutcome(project, "error")
-      outcome = "error"
+      outcome = finishIdleOutcome(project, "error")
     } else if (prepared.kind === "write-failed") {
-      setProjectQueueOutcome(project, "write-failed")
-      outcome = "write-failed"
+      outcome = finishIdleOutcome(project, "write-failed")
     } else {
       // Queue key is the source-version key, not just session ID
       const queueKey = `idle:${prepared.sourceVersionKey}`
-      outcome = await enqueueProjectJob(
-        project,
-        queueKey,
-        () => processPreparedIdleSource(opts, prepared),
-      )
-      setProjectQueueOutcome(project, outcome)
+      try {
+        outcome = await enqueueProjectJob(
+          project,
+          queueKey,
+          async () => {
+            try {
+              return await processPreparedIdleSource(opts, prepared)
+            } catch (error) {
+              // A queue job that reaches the writer but hits an unexpected
+              // application exception is an error, not a heuristic fallback.
+              void log(opts.client, "error", "idle memory pipeline failed", {
+                error: String(error),
+              })
+              return finishIdleOutcome(project, "error")
+            }
+          },
+        )
+      } catch {
+        // A rejection from the queue boundary itself is a queue failure.
+        outcome = finishIdleOutcome(project, "queue-failed")
+      }
+      // Wave 6: enqueueProjectJob already sets lastOutcome internally, but we ensure it's set here too
+      finishIdleOutcome(project, outcome)
     }
-  } catch {
-    setProjectQueueOutcome(project, "queue-failed")
-    outcome = "queue-failed"
   } finally {
     stopActivity()
   }
@@ -756,31 +822,56 @@ function upsertAuditMetadata(mem: MemoryFile, audit: LLMAuditMetadata): MemoryFi
  * without a durable guard (PR 2 §13). Exported as a test seam so the
  * Wave-4/6 cross-process and failure-injection tests can drive it directly.
  */
+export type AuditGuardPersistenceResult =
+  | { status: "committed" }
+  | {
+      status: "failed"
+      reason: "lock-timeout" | "unavailable" | "commit-failed" | "unexpected"
+    }
+
+export async function persistAuditGuardResult(
+  opts: { client: unknown; worktree: string; directory: string },
+  audit: LLMAuditMetadata,
+): Promise<AuditGuardPersistenceResult> {
+  const project = resolveProjectPath(opts.worktree, opts.directory)
+  let result: MemoryMutationResult<{ outcome: "committed" | "noop" }>
+  try {
+    result = await mutateMemory<{ outcome: "committed" | "noop" }>(
+      { worktree: opts.worktree, directory: opts.directory, client: opts.client },
+      (base) => {
+        const guarded = upsertAuditMetadata(base, audit)
+        return { kind: "commit", memory: pruneOld(guarded, opts.client), value: { outcome: "committed" } }
+      },
+    )
+  } catch (error) {
+    void log(opts.client, "warn", "audit guard transaction threw", {
+      project,
+      error: String(error),
+    })
+    return { status: "failed", reason: "unexpected" }
+  }
+  if (result.status === "lock-timeout") {
+    void log(opts.client, "warn", "audit guard transaction lock-timeout", { project })
+    return { status: "failed", reason: "lock-timeout" }
+  }
+  if (result.status === "unavailable") {
+    void log(opts.client, "warn", "audit guard transaction unavailable", { project })
+    return { status: "failed", reason: "unavailable" }
+  }
+  if (result.status === "commit-failed") {
+    void log(opts.client, "warn", "audit guard transaction commit-failed", { project })
+    return { status: "failed", reason: "commit-failed" }
+  }
+  return { status: "committed" }
+}
+
+/** Compatibility boolean seam for callers that only need persistence success. */
 export async function persistAuditGuard(
   opts: { client: unknown; worktree: string; directory: string },
   audit: LLMAuditMetadata,
 ): Promise<boolean> {
-  const project = resolveProjectPath(opts.worktree, opts.directory)
-  const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
-    { worktree: opts.worktree, directory: opts.directory, client: opts.client },
-    (base) => {
-      const guarded = upsertAuditMetadata(base, audit)
-      return { kind: "commit", memory: pruneOld(guarded, opts.client), value: { outcome: "committed" } }
-    },
-  )
-  if (result.status === "lock-timeout") {
-    void log(opts.client, "warn", "audit guard transaction lock-timeout", { project })
-    return false
-  }
-  if (result.status === "unavailable") {
-    void log(opts.client, "warn", "audit guard transaction unavailable", { project })
-    return false
-  }
-  if (result.status === "commit-failed") {
-    void log(opts.client, "warn", "audit guard transaction commit-failed", { project })
-    return false
-  }
-  return true
+  const result = await persistAuditGuardResult(opts, audit)
+  return result.status === "committed"
 }
 
 /**
@@ -1554,24 +1645,66 @@ export function markReferencedDecisions(
   messages: TranscriptMessage[],
   sessionId: string,
 ): MemoryFile {
-  let recalled = false
+  // Collect IDs of decisions referenced by valid recall_decision tool calls.
+  const referencedIds = new Set<string>()
+
+  // Helper to validate and extract query/limit.
+  const parseToolInput = (input: Record<string, unknown>) => {
+    // Apply bounds from tools/bounds
+    const rawQuery = input["query"] as unknown
+    const rawLimit = input["limit"] as unknown
+    // Validate query if provided
+    let query: string | undefined
+    if (rawQuery !== undefined) {
+      if (typeof rawQuery !== "string" || rawQuery.length > TOOL_LIMITS.recallQueryChars) {
+        return null // malformed query -> ignore this tool call
+      }
+      query = rawQuery
+    }
+    // Validate limit
+    let limit: number | undefined
+    if (rawLimit !== undefined) {
+      if (typeof rawLimit !== "number" || !Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > TOOL_LIMITS.recallLimitMax) {
+        return null // malformed limit -> ignore
+      }
+      limit = rawLimit
+    }
+    // Apply defaults: limit defaults to 10 per schema, query optional.
+    if (limit === undefined) limit = 10
+    return { query, limit }
+  }
 
   for (const msg of messages) {
     for (const part of msg.parts) {
-      if (part.type === "tool" && part.tool === "recall_decision") {
-        recalled = true
-        break
+      if (
+        part.type === "tool" &&
+        part.tool === "recall_decision" &&
+        (part as any).state?.status === "completed"
+      ) {
+        const input = ((part as any).state?.input ?? {}) as Record<string, unknown>
+        const parsed = parseToolInput(input)
+        if (!parsed) {
+          // malformed input – ignore this call
+          continue
+        }
+        const { query, limit } = parsed
+        // Use the authoritative query helper to get decisions.
+        const hits = queryDecisions(mem, query, limit)
+        for (const d of hits) {
+          if (d.id) referencedIds.add(d.id)
+        }
       }
     }
-    if (recalled) break
   }
 
-  if (!recalled) return mem
+  if (referencedIds.size === 0) return mem
 
   return {
     ...mem,
     decisions: mem.decisions.map((d) =>
-      d.still_valid ? { ...d, last_used_in_session: sessionId } : d,
+      d.still_valid && referencedIds.has(d.id)
+        ? { ...d, last_used_in_session: sessionId }
+        : d,
     ),
   }
 }

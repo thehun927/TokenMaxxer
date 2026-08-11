@@ -190,8 +190,8 @@ export function resetRetainedExtractionSessionIDs(): void {
   retainedExtractionSessionIDs.clear()
 }
 
-/** One extraction transaction per project/source, including direct callers. */
-const extractionInFlight = new Map<string, Promise<ExtractedFacts | null>>()
+/** One extraction transaction per project/source/model, including direct callers. */
+const extractionInFlight = new Map<string, Promise<LLMExtractionRunResult>>()
 
 let evidenceAcceptedCount = 0
 let evidenceRejectedCount = 0
@@ -572,7 +572,17 @@ function adapterFailureError(error: LLMAdapterError): SanitizedError | undefined
 
 export type AuditCreatedCallback = (
   audit: LLMAuditMetadata,
-) => boolean | void | Promise<boolean | void>
+) => AuditCreatedResult | Promise<AuditCreatedResult>
+
+/** The typed persistence result used by the writer's required audit guard. */
+export type AuditCreatedResult =
+  | boolean
+  | void
+  | { status: "committed" }
+  | {
+      status: "failed"
+      reason: "lock-timeout" | "unavailable" | "commit-failed" | "unexpected"
+    }
 
 export type AuditTerminalCallback = (
   auditSessionID: string,
@@ -815,9 +825,31 @@ async function notifyHealthOutcome(
 }
 
 /**
- * Extract facts through one retained audit session. Prompt errors and invalid
+ * Wave 6: Extract facts through one retained audit session. Prompt errors and invalid
  * structured values share exactly one retry budget.
+ *
+ * Returns typed LLMExtractionRunResult to distinguish:
+ * - unavailable session capability/no retained model attempt -> heuristic-only
+ * - audit guard required persistence failure -> write-failed or queue-failed
+ * - retained session-create/prompt/retry/validation/evidence failure -> llm-failed
  */
+export type LLMExtractionRunResult =
+  | { status: "success"; facts: ExtractedFacts }
+  | { status: "unavailable"; reason: "missing-session-endpoint" }
+  | {
+      status: "guard-failed"
+      reason?: "lock-timeout" | "unavailable" | "commit-failed" | "unexpected"
+    }
+  | {
+      status: "failed"
+      reason:
+        | "session-create"
+        | "structured-request"
+        | "timeout"
+        | "validation"
+        | "evidence"
+    }
+
 export async function extractFactsLLM(
   canonicalInput: CanonicalExtractionInput,
   sourceSessionID: string,
@@ -825,32 +857,50 @@ export async function extractFactsLLM(
   clientValue: unknown,
   config: LLMExtractionConfig,
   options?: ExtractFactsLLMOptions,
-): Promise<ExtractedFacts | null> {
-  if (!config.enabled || !config.model) return null
-  if (options?.cachedFacts) return options.cachedFacts
+): Promise<LLMExtractionRunResult> {
+  if (!config.enabled || !config.model) {
+    // Wave 6: No model available -> unavailable (no model request attempted)
+    return { status: "unavailable", reason: "missing-session-endpoint" }
+  }
+
+  // A validated cache hit is already a successful extraction result.  It must
+  // be returned before checking the optional session capability so cache hits
+  // never create or prompt an audit session.
+  if (options?.cachedFacts) {
+    return { status: "success", facts: options.cachedFacts }
+  }
+
+  const client = (clientValue ?? {}) as V1ClientLike
+  if (!client.session?.create || !client.session.prompt) {
+    // Wave 6: Missing session endpoints -> unavailable (no model request attempted)
+    emitDiagnostic(options?.onDiagnostic, {
+      kind: "unavailable-client",
+      reason: "missing-session-endpoint",
+    })
+    return { status: "unavailable", reason: "missing-session-endpoint" }
+  }
 
   const projectKey = options?.projectKey ?? options?.directory ?? projectName
-  const inFlightKey = `${projectKey}\u0000${options?.sourceVersionKey ?? sourceSessionID}`
+  const sourceKey = options?.sourceVersionKey ?? sourceSessionID
+  const modelKey = `${config.model.providerID}\u0000${config.model.modelID}\u0000${config.model.variant ?? ""}`
+  const inFlightKey = `${projectKey}\u0000${sourceKey}\u0000${modelKey}`
   const existing = extractionInFlight.get(inFlightKey)
   if (existing) return existing
 
-  let promise!: Promise<ExtractedFacts | null>
-  promise = (async () => {
-    try {
-      return await extractFactsLLMOnce(
-        canonicalInput,
-        sourceSessionID,
-        projectName,
-        clientValue,
-        config,
-        options,
-      )
-    } finally {
-      if (extractionInFlight.get(inFlightKey) === promise) {
-        extractionInFlight.delete(inFlightKey)
-      }
+  let promise!: Promise<LLMExtractionRunResult>
+  promise = extractFactsLLMOnce(
+    canonicalInput,
+    sourceSessionID,
+    projectName,
+    clientValue,
+    config,
+    options,
+  )
+  promise = promise.finally(() => {
+    if (extractionInFlight.get(inFlightKey) === promise) {
+      extractionInFlight.delete(inFlightKey)
     }
-  })()
+  })
   extractionInFlight.set(inFlightKey, promise)
   return promise
 }
@@ -862,17 +912,25 @@ async function extractFactsLLMOnce(
   clientValue: unknown,
   config: LLMExtractionConfig,
   options?: ExtractFactsLLMOptions,
-): Promise<ExtractedFacts | null> {
+): Promise<LLMExtractionRunResult> {
 
-  if (!config.enabled || !config.model) return null
+  if (!config.enabled || !config.model) {
+    // Wave 6: No model available -> unavailable (no model request attempted)
+    return { status: "unavailable", reason: "missing-session-endpoint" }
+  }
+
+  if (options?.cachedFacts) {
+    return { status: "success", facts: options.cachedFacts }
+  }
 
   const client = (clientValue ?? {}) as V1ClientLike
   if (!client.session?.create || !client.session.prompt) {
+    // Wave 6: Missing session endpoints -> unavailable (no model request attempted)
     emitDiagnostic(options?.onDiagnostic, {
       kind: "unavailable-client",
       reason: "missing-session-endpoint",
     })
-    return null
+    return { status: "unavailable", reason: "missing-session-endpoint" }
   }
 
   let extractionSessionID: string | undefined
@@ -886,6 +944,7 @@ async function extractFactsLLMOnce(
       options?.requestTimeoutMs ?? LLM_REQUEST_TIMEOUT_MS,
     )
     if (!created.ok) {
+      // Wave 6: Session create failed -> failed (not unavailable)
       const reason = adapterFailureReason(created.error, "session-create")
       emitDiagnostic(options?.onDiagnostic, {
         kind: "session-create-failed",
@@ -894,7 +953,7 @@ async function extractFactsLLMOnce(
           ? { error: adapterFailureError(created.error) }
           : {}),
       })
-      return null
+      return { status: "failed", reason: "session-create" }
     }
     extractionSessionID = created.value
     // Register before the first prompt so the audit session's idle event can
@@ -938,21 +997,28 @@ async function extractFactsLLMOnce(
       try {
         const persisted = await options.onAuditCreated(audit)
         if (persisted === false) {
+          // Wave 6: Audit guard failed to persist -> guard-failed
           emitDiagnostic(options.onDiagnostic, { kind: "audit-registration-failed" })
-          return null
+          return { status: "guard-failed" }
+        }
+        if (isAuditGuardFailure(persisted)) {
+          emitDiagnostic(options.onDiagnostic, { kind: "audit-registration-failed" })
+          return { status: "guard-failed", reason: persisted.reason }
         }
       } catch {
+        // Wave 6: Audit guard failed to persist -> guard-failed
         emitDiagnostic(options.onDiagnostic, { kind: "audit-registration-failed" })
-        return null
+        return { status: "guard-failed" }
       }
     }
   } catch (error) {
+    // Wave 6: Unexpected exception -> failed (not unavailable)
     emitDiagnostic(options?.onDiagnostic, {
       kind: "session-create-failed",
       reason: "request-error",
       error: sanitizeError(error),
     })
-    return null
+    return { status: "failed", reason: "session-create" }
   }
 
   let terminalOutcome: ModelHealthOutcome = "transport-auth-failure"
@@ -1002,7 +1068,8 @@ async function extractFactsLLMOnce(
             outcome: "success",
             reason: "accepted-extraction",
           })
-          return corroborated
+          // Wave 6: Return success with facts
+          return { status: "success", facts: corroborated }
         }
         terminalOutcome = "validation-failure"
         terminalReason = "evidence-rejection"
@@ -1045,7 +1112,22 @@ async function extractFactsLLMOnce(
     outcome: terminalOutcome,
     reason: terminalReason,
   })
-  return null
+  // Wave 6: Preserve the retained failure stage for the writer's truthful
+  // public outcome mapping.  All of these remain `llm-failed` publicly, but
+  // timeout, validation, and evidence failures are not interchangeable at
+  // this boundary.
+  const failureReason = terminalOutcome === "timeout"
+    ? "timeout"
+    : terminalOutcome === "validation-failure"
+      ? terminalReason === "evidence-rejection" ? "evidence" : "validation"
+      : "structured-request"
+  return { status: "failed", reason: failureReason }
+}
+
+function isAuditGuardFailure(
+  value: AuditCreatedResult,
+): value is Extract<AuditCreatedResult, { status: "failed" }> {
+  return isRecord(value) && value.status === "failed"
 }
 
 async function notifyAuditTerminal(

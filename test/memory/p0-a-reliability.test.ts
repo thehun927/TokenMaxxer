@@ -380,7 +380,7 @@ describe("P0-A idle reliability", () => {
       { directory: project, onAuditCreated: () => false },
     )
 
-    expect(result).toBeNull()
+    expect(result).toEqual({ status: "guard-failed" })
     expect(prompt).not.toHaveBeenCalled()
     expect((await readMemory({ worktree: project, directory: project }))?.current_task)
       .toBe("heuristic fallback")

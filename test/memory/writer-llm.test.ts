@@ -394,20 +394,20 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
       sessionId: "source-failure",
     })
 
-    const memory = await readMemory({ worktree, directory: worktree })
-    expect(prompt).toHaveBeenCalledTimes(2)
-    expect(memory?.current_task).toContain("Implement the extraction")
-    expect(memory?.llm_extraction_cache).toBeUndefined()
-    expect(memory?.llm_extraction_audits).toHaveLength(1)
-    expect(memory?.llm_extraction_audits?.[0]?.terminal_outcome).toBe("failed")
-    expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
-      body: expect.objectContaining({
-        level: "warn",
-        message: "llm extraction returned no facts",
-      }),
-    }))
-    expect(appLog.mock.calls.some(([call]) => call.body.message === "llm extraction diagnostic")).toBe(true)
-  })
+     const memory = await readMemory({ worktree, directory: worktree })
+     expect(prompt).toHaveBeenCalledTimes(2)
+     expect(memory?.current_task).toContain("Implement the extraction")
+     expect(memory?.llm_extraction_cache).toBeUndefined()
+     expect(memory?.llm_extraction_audits).toHaveLength(1)
+     expect(memory?.llm_extraction_audits?.[0]?.terminal_outcome).toBe("failed")
+     expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
+       body: expect.objectContaining({
+         level: "warn",
+         message: "llm extraction failed",
+       }),
+     }))
+     expect(appLog.mock.calls.some(([call]) => call.body.message === "llm extraction diagnostic")).toBe(true)
+   })
 
   it("rejects unknown evidence without merging or caching the LLM decision", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
@@ -556,7 +556,7 @@ describe("Wave 4 deferred — audit-guard transaction failure does not prompt", 
       },
     }
 
-    // Force ONLY the audit-guard transaction to fail with lock-timeout. The
+    // Force ONLY the audit-guard transaction to fail with commit-failed. The
     // heuristic transaction (first mutateMemory call) must succeed so the flow
     // reaches the audit-guard step.
     const spy = vi.spyOn(storeModule, "mutateMemory")
@@ -577,7 +577,7 @@ describe("Wave 4 deferred — audit-guard transaction failure does not prompt", 
         }
         return { status: "committed", value: action.value, revision: 1 }
       }
-      return { status: "lock-timeout" }
+      return { status: "commit-failed" }
     })
 
     const outcome = await writeMemoryOnIdle({
@@ -589,9 +589,9 @@ describe("Wave 4 deferred — audit-guard transaction failure does not prompt", 
 
     // The audit guard failed, so prompting must not continue.
     expect(prompt).not.toHaveBeenCalled()
-    // The outcome is a bounded failure, not "llm-success".
-    expect(outcome).not.toBe("llm-success")
-    expect(["llm-failed", "heuristic-only"]).toContain(outcome)
+    // Required guard persistence failure is a write failure, not an LLM
+    // failure or an intentional heuristic fallback.
+    expect(outcome).toBe("write-failed")
   })
 })
 

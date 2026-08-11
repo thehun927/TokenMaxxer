@@ -143,7 +143,7 @@ describe("v1 structured extraction", () => {
       client,
       { enabled: true, model: { providerID: "anthropic", modelID: "haiku" } },
       { directory: "/worktree", ...evidenceOptions },
-    )).resolves.toEqual(facts)
+    )).resolves.toEqual({ status: "success", facts })
     expect(isRetainedExtractionSession("audit-1")).toBe(true)
     resetRetainedExtractionSessionIDs()
     expect(isRetainedExtractionSession("audit-1")).toBe(false)
@@ -182,25 +182,25 @@ describe("v1 structured extraction", () => {
       for (let index = 0; index <= MAX_RETAINED_EXTRACTION_SESSION_IDS; index++) {
         await expect(extractFactsLLM(
           canonical(),
-          `source-${index}`,
-          "project",
-          client,
-          { enabled: true, model: { providerID: "provider", modelID: "model" } },
-          {
-            directory: project,
-            projectKey: project,
-            ...evidenceOptions,
-            onAuditCreated: async (audit) => {
-              if (audit.audit_session_id === "audit-0") {
-                await writeMemory(
-                  { worktree: project, directory: project },
-                  { ...emptyMemory(project), llm_extraction_audits: [audit] },
-                )
-              }
-              return true
-            },
-          },
-        )).resolves.toEqual(facts)
+           `source-${index}`,
+           "project",
+           client,
+           { enabled: true, model: { providerID: "provider", modelID: "model" } },
+           {
+             directory: project,
+             projectKey: project,
+             ...evidenceOptions,
+             onAuditCreated: async (audit) => {
+               if (audit.audit_session_id === "audit-0") {
+                 await writeMemory(
+                   { worktree: project, directory: project },
+                   { ...emptyMemory(project), llm_extraction_audits: [audit] },
+                 )
+               }
+               return true
+             },
+           },
+         )).resolves.toEqual({ status: "success", facts })
       }
 
       expect(create).toHaveBeenCalledTimes(MAX_RETAINED_EXTRACTION_SESSION_IDS + 1)
@@ -232,33 +232,33 @@ describe("v1 structured extraction", () => {
 
     await expect(extractFactsLLM(
       canonical(),
-      "source-bound",
-      "project",
-      { session },
-      { enabled: true, model: { providerID: "provider", modelID: "model" } },
-      { directory: "/worktree", ...evidenceOptions },
-    )).resolves.toEqual(facts)
-    expect(session.create).toHaveBeenCalledTimes(1)
-    expect(session.prompt).toHaveBeenCalledTimes(1)
-  })
+       "source-bound",
+       "project",
+       { session },
+       { enabled: true, model: { providerID: "provider", modelID: "model" } },
+       { directory: "/worktree", ...evidenceOptions },
+     )).resolves.toEqual({ status: "success", facts })
+     expect(session.create).toHaveBeenCalledTimes(1)
+     expect(session.prompt).toHaveBeenCalledTimes(1)
+   })
 
-  it("sends a selected variant as a top-level prompt body field", async () => {
-    const prompt = vi.fn(async () => ({ data: { info: { structured: facts } } }))
-    const client = {
-      session: {
-        create: vi.fn(async () => ({ data: { id: "audit-variant" } })),
-        prompt,
-      },
-    }
+   it("sends a selected variant as a top-level prompt body field", async () => {
+     const prompt = vi.fn(async () => ({ data: { info: { structured: facts } } }))
+     const client = {
+       session: {
+         create: vi.fn(async () => ({ data: { id: "audit-variant" } })),
+         prompt,
+       },
+     }
 
-    await expect(extractFactsLLM(
-      canonical(),
-      "source-variant",
-      "project",
-      client,
-      { enabled: true, model: { providerID: "provider", modelID: "model", variant: "none" } },
-      { directory: "/worktree", ...evidenceOptions },
-    )).resolves.toEqual(facts)
+     await expect(extractFactsLLM(
+       canonical(),
+       "source-variant",
+       "project",
+       client,
+       { enabled: true, model: { providerID: "provider", modelID: "model", variant: "none" } },
+       { directory: "/worktree", ...evidenceOptions },
+     )).resolves.toEqual({ status: "success", facts })
 
     expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
       body: expect.objectContaining({
@@ -287,76 +287,76 @@ describe("v1 structured extraction", () => {
     })
     const memory = { ...emptyMemory("/worktree"), llm_extraction_cache: [entry] }
 
-    const cached = readExtractionCache(memory, entry.cache_key)
-    await expect(extractFactsLLM(
-      input,
-      "source",
-      "project",
-      client,
-      { enabled: true, model },
-      { directory: "/worktree", cachedFacts: cached, ...evidenceOptions },
-    )).resolves.toEqual(facts)
-    expect(client.session.create).not.toHaveBeenCalled()
-    expect(client.session.prompt).not.toHaveBeenCalled()
-  })
+     const cached = readExtractionCache(memory, entry.cache_key)
+     await expect(extractFactsLLM(
+       input,
+       "source",
+       "project",
+       client,
+       { enabled: true, model },
+       { directory: "/worktree", cachedFacts: cached, ...evidenceOptions },
+     )).resolves.toEqual({ status: "success", facts })
+     expect(client.session.create).not.toHaveBeenCalled()
+     expect(client.session.prompt).not.toHaveBeenCalled()
+   })
 
-  it("retries exactly once for invalid structured output and request errors", async () => {
-    const invalidThenError = vi.fn()
-      .mockResolvedValueOnce({ data: { info: { structured: { nope: true } } } })
-      .mockRejectedValueOnce(new Error("request failed"))
-    const client = {
-      session: {
-        create: vi.fn(async () => ({ data: { id: "audit-2" } })),
-        prompt: invalidThenError,
-      },
-    }
+   it("retries exactly once for invalid structured output and request errors", async () => {
+     const invalidThenError = vi.fn()
+       .mockResolvedValueOnce({ data: { info: { structured: { nope: true } } } })
+       .mockRejectedValueOnce(new Error("request failed"))
+     const client = {
+       session: {
+         create: vi.fn(async () => ({ data: { id: "audit-2" } })),
+         prompt: invalidThenError,
+       },
+     }
 
-    await expect(extractFactsLLM(
-      canonical(),
-      "source",
-      "project",
-      client,
-      { enabled: true, model: { providerID: "p", modelID: "m" } },
-      { directory: "/worktree", ...evidenceOptions },
-    )).resolves.toBeNull()
-    expect(invalidThenError).toHaveBeenCalledTimes(2)
-  })
+     await expect(extractFactsLLM(
+       canonical(),
+       "source",
+       "project",
+       client,
+       { enabled: true, model: { providerID: "p", modelID: "m" } },
+       { directory: "/worktree", ...evidenceOptions },
+     )).resolves.toEqual({ status: "failed", reason: "structured-request" })
+     expect(invalidThenError).toHaveBeenCalledTimes(2)
+   })
 
-  it("reports bounded diagnostics for unavailable clients and session failures", async () => {
-    const diagnostics: unknown[] = []
-    await expect(extractFactsLLM(
-      canonical(),
-      "source",
-      "project",
-      undefined,
-      { enabled: true, model: { providerID: "p", modelID: "m" } },
-      { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
-    )).resolves.toBeNull()
-    expect(diagnostics).toEqual([{
-      kind: "unavailable-client",
-      reason: "missing-session-endpoint",
-    }])
+   it("reports bounded diagnostics for unavailable clients and session failures", async () => {
+     const diagnostics: unknown[] = []
+     await expect(extractFactsLLM(
+       canonical(),
+       "source",
+       "project",
+       undefined,
+       { enabled: true, model: { providerID: "p", modelID: "m" } },
+       { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
+     )).resolves.toEqual({ status: "unavailable", reason: "missing-session-endpoint" })
+     expect(diagnostics).toEqual([{
+       kind: "unavailable-client",
+       reason: "missing-session-endpoint",
+     }])
 
-    diagnostics.length = 0
-    await expect(extractFactsLLM(
-      canonical(),
-      "source",
-      "project",
-      {
-        session: {
-          create: vi.fn(async () => ({
-            error: { name: "RequestError", message: "bridge unavailable" },
-            secret: "must not be copied",
-          })),
-          prompt: vi.fn(),
-        },
-      },
-      { enabled: true, model: { providerID: "p", modelID: "m" } },
-      { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
-    )).resolves.toBeNull()
-    expect(diagnostics).toEqual([{
-      kind: "session-create-failed",
-      reason: "error-response",
+     diagnostics.length = 0
+     await expect(extractFactsLLM(
+       canonical(),
+       "source",
+       "project",
+       {
+         session: {
+           create: vi.fn(async () => ({
+             error: { name: "RequestError", message: "bridge unavailable" },
+             secret: "must not be copied",
+           })),
+           prompt: vi.fn(),
+         },
+       },
+       { enabled: true, model: { providerID: "p", modelID: "m" } },
+       { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
+     )).resolves.toEqual({ status: "failed", reason: "session-create" })
+     expect(diagnostics).toEqual([{
+       kind: "session-create-failed",
+       reason: "error-response",
       error: { name: "RequestError", message: "bridge unavailable" },
     }])
     expect(JSON.stringify(diagnostics)).not.toContain("must not be copied")
@@ -372,50 +372,50 @@ describe("v1 structured extraction", () => {
           prompt: vi.fn(),
         },
       },
-      { enabled: true, model: { providerID: "p", modelID: "m" } },
-      { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
-    )).resolves.toBeNull()
-    expect(diagnostics).toEqual([{
-      kind: "session-create-failed",
-      reason: "malformed-response",
-    }])
-  })
+       { enabled: true, model: { providerID: "p", modelID: "m" } },
+       { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
+     )).resolves.toEqual({ status: "failed", reason: "session-create" })
+     expect(diagnostics).toEqual([{
+       kind: "session-create-failed",
+       reason: "malformed-response",
+     }])
+   })
 
-  it("reports every failed output attempt and retry exhaustion", async () => {
-    const diagnostics: unknown[] = []
-    const prompt = vi.fn()
-      .mockResolvedValueOnce({ data: { info: { structured: { invalid: true } } } })
-      .mockRejectedValueOnce(new Error("provider unavailable"))
+   it("reports every failed output attempt and retry exhaustion", async () => {
+     const diagnostics: unknown[] = []
+     const prompt = vi.fn()
+       .mockResolvedValueOnce({ data: { info: { structured: { invalid: true } } } })
+       .mockRejectedValueOnce(new Error("provider unavailable"))
 
-    await expect(extractFactsLLM(
-      canonical(),
-      "source",
-      "project",
-      {
-        session: {
-          create: vi.fn(async () => ({ data: { id: "audit-diagnostics" } })),
-          prompt,
-        },
-      },
-      { enabled: true, model: { providerID: "p", modelID: "m" } },
-      { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
-    )).resolves.toBeNull()
+     await expect(extractFactsLLM(
+       canonical(),
+       "source",
+       "project",
+       {
+         session: {
+           create: vi.fn(async () => ({ data: { id: "audit-diagnostics" } })),
+           prompt,
+         },
+       },
+       { enabled: true, model: { providerID: "p", modelID: "m" } },
+       { onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) },
+     )).resolves.toEqual({ status: "failed", reason: "structured-request" })
 
-    expect(diagnostics).toEqual([
-      {
-        kind: "structured-output-failed",
-        attempt: 1,
-        reason: "invalid-structured-output",
-      },
-      {
-        kind: "structured-output-failed",
-        attempt: 2,
-        reason: "request-error",
-        error: { name: "Error", message: "provider unavailable" },
-      },
-      { kind: "retries-exhausted", attempts: 2 },
-    ])
-  })
+     expect(diagnostics).toEqual([
+       {
+         kind: "structured-output-failed",
+         attempt: 1,
+         reason: "invalid-structured-output",
+       },
+       {
+         kind: "structured-output-failed",
+         attempt: 2,
+         reason: "request-error",
+         error: { name: "Error", message: "provider unavailable" },
+       },
+       { kind: "retries-exhausted", attempts: 2 },
+     ])
+   })
 
   it("keeps cache entries capped at ten and upserts by identity", () => {
     let memory: MemoryFile = emptyMemory("/worktree")
