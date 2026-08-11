@@ -21,6 +21,7 @@ import {
 } from "../../src/memory/extract-prompt"
 import { emptyMemory } from "../../src/memory/schema"
 import type { TranscriptMessage } from "../../src/types"
+import * as prompt from "../../src/memory/extract-prompt"
 
 const validFacts = {
   current_task: "Build the API",
@@ -304,5 +305,236 @@ describe("extraction cache identity and prompt", () => {
     for (const field of ExtractedFactsJsonSchema.required) {
       expect(prompt).toContain(`- ${field}:`)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PR 5 §Wave 1 — source identity fixtures (§18.A items 1-10)
+//
+// These 10 fixtures are the spec for Wave 2's implementation of the planned
+// source-identity helpers in src/memory/extract-prompt.ts:
+//
+//   EXTRACTION_CONTRACT_VERSION (const)
+//   ExtractionSourceInput (interface)
+//   serializeExtractionSourceInput()
+//   buildExtractionSourceInput()
+//   makeSourceVersionKey()
+//   makeExtractionCacheKey()
+//
+// The exports above do not exist yet; they are referenced through a typed stub
+// (`prompt as any as { ... }`) so this file still compiles today. Calling them
+// at runtime throws, which is the intended Wave 1 failing behavior. Wave 2
+// implements the production exports and these fixtures go green.
+// ---------------------------------------------------------------------------
+describe("PR 5 §Wave 1 — source identity fixtures (§18.A items 1-10)", () => {
+  const {
+    EXTRACTION_CONTRACT_VERSION,
+    buildExtractionSourceInput,
+    serializeExtractionSourceInput,
+    makeSourceVersionKey,
+    makeExtractionCacheKey,
+  } = prompt as any as {
+    EXTRACTION_CONTRACT_VERSION: number
+    buildExtractionSourceInput: (messages: TranscriptMessage[]) => {
+      compressedTranscript: string
+      fileCandidates: string[]
+      extractionContractVersion: number
+      sourceInputSha256: string
+    }
+    serializeExtractionSourceInput: (input: {
+      compressedTranscript: string
+      fileCandidates: string[]
+      extractionContractVersion: number
+    }) => string
+    makeSourceVersionKey: (args: {
+      sourceSessionID: string
+      sourceInputSha256: string
+      extractionContractVersion: number
+    }) => string
+    makeExtractionCacheKey: (args: {
+      sourceVersionKey: string
+      extractionContractVersion: number
+      model: { providerID: string; modelID: string; variant?: string }
+    }) => string
+  }
+
+  /** A tool-only message whose input supplies one file candidate. */
+  function toolMessage(id: string, filePath: string): TranscriptMessage {
+    return {
+      info: { id, role: "assistant" },
+      parts: [{ type: "tool", tool: "read", state: { input: { filePath } } }],
+    }
+  }
+
+  /** A fixed bounded source: two eligible text messages + one file candidate. */
+  function sourceMessages(): TranscriptMessage[] {
+    return [
+      textMessage("m1", "Decided to use Postgres."),
+      textMessage("m2", "Let's adopt the stable API surface.", "assistant"),
+      toolMessage("tool-1", "./src/db.ts"),
+    ]
+  }
+
+  it("§18.A.1 — same bounded source produces the same sourceInputSha256 repeatedly", () => {
+    const first = buildExtractionSourceInput(sourceMessages())
+    const second = buildExtractionSourceInput(sourceMessages())
+    expect(first.sourceInputSha256).toBe(second.sourceInputSha256)
+    expect(first.sourceInputSha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(first.extractionContractVersion).toBe(EXTRACTION_CONTRACT_VERSION)
+  })
+
+  it("§18.A.2 — two different prior STATE snapshots produce the same sourceInputSha256", () => {
+    const source = sourceMessages()
+    // Parallel durable context: these differ between the two runs, but source
+    // identity (§3.1) is derived only from the bounded transcript, file
+    // candidates, and contract version. The builder never receives prior STATE.
+    const priorStateRun1: Record<string, unknown> = { ...emptyMemory("/worktree"), revision: 3 }
+    const priorStateRun2: Record<string, unknown> = {
+      ...emptyMemory("/worktree"),
+      revision: 4,
+      current_task: "Changed after run 1",
+      last_updated: "2026-08-11T12:00:00.000Z",
+      recent_sessions: ["session-9"],
+      last_session_id: "session-9",
+    }
+    void priorStateRun1
+    void priorStateRun2
+    const first = buildExtractionSourceInput(source)
+    const second = buildExtractionSourceInput(source)
+    expect(second.sourceInputSha256).toBe(first.sourceInputSha256)
+  })
+
+  it("§18.A.3 — the same case is allowed to produce different promptInputSha256 values", () => {
+    // Wave 2 (§5.4) renames CanonicalExtractionInput.sha256 to
+    // promptInputSha256. Prompt identity legitimately includes prior STATE, so
+    // two STATE snapshots may yield different prompt digests while the source
+    // digest above stays identical. The planned field does not exist today.
+    const first = (buildCanonicalInput(sourceMessages(), emptyMemory("/worktree")) as any).promptInputSha256
+    const second = (buildCanonicalInput(sourceMessages(), {
+      ...emptyMemory("/worktree"),
+      current_task: "Different prior task",
+    }) as any).promptInputSha256
+    expect(first).not.toBe(second)
+  })
+
+  it("§18.A.4 — cache/audit/model-health/revision-only STATE changes cannot alter source identity", () => {
+    const source = sourceMessages()
+    const baseline = buildExtractionSourceInput(source)
+    const mutatedPriorState: Record<string, unknown> = {
+      ...emptyMemory("/worktree"),
+      last_updated: "2026-08-11T12:00:00.000Z",
+      last_session_id: "session-99",
+      recent_sessions: ["session-1", "session-2"],
+      revision: 42,
+      llm_extraction_cache: [{ cache_key: "operational-cache" }],
+      llm_extraction_audits: [{ audit_session_id: "operational-audit" }],
+      model_health: [{
+        provider_id: "anthropic",
+        model_id: "claude",
+        last_outcome: "success",
+        failure_streak: 0,
+      }],
+    }
+    void mutatedPriorState
+    const rebuilt = buildExtractionSourceInput(source)
+    expect(rebuilt.sourceInputSha256).toBe(baseline.sourceInputSha256)
+  })
+
+  it("§18.A.5 — appending a new eligible message changes source identity", () => {
+    const baseline = buildExtractionSourceInput(sourceMessages())
+    const appended = buildExtractionSourceInput([
+      ...sourceMessages(),
+      textMessage("m3", "We chose Postgres 16 for the write path."),
+    ])
+    expect(appended.sourceInputSha256).not.toBe(baseline.sourceInputSha256)
+  })
+
+  it("§18.A.6 — changing a tool-derived file candidate changes source identity", () => {
+    const baseline = buildExtractionSourceInput(sourceMessages())
+    const changed = buildExtractionSourceInput([
+      ...sourceMessages(),
+      toolMessage("tool-2", "./src/cache.ts"),
+    ])
+    expect(changed.sourceInputSha256).not.toBe(baseline.sourceInputSha256)
+  })
+
+  it("§18.A.7 — reordering canonical file candidates cannot change source identity", () => {
+    // The planned builder normalizes and sorts tool-derived candidates before
+    // hashing (§5.2; the existing extractFileCandidates already sorts).
+    // Reordering the tool parts that introduce the same two candidates must
+    // not change the digest.
+    const forward: TranscriptMessage[] = [
+      textMessage("m1", "Decided to use Postgres."),
+      toolMessage("tool-1", "./src/db.ts"),
+      toolMessage("tool-2", "./src/cache.ts"),
+    ]
+    const reversed: TranscriptMessage[] = [
+      textMessage("m1", "Decided to use Postgres."),
+      toolMessage("tool-2", "./src/cache.ts"),
+      toolMessage("tool-1", "./src/db.ts"),
+    ]
+    const first = buildExtractionSourceInput(forward)
+    const second = buildExtractionSourceInput(reversed)
+    expect(second.fileCandidates).toEqual(first.fileCandidates)
+    expect(second.sourceInputSha256).toBe(first.sourceInputSha256)
+  })
+
+  it("§18.A.8 — changing the extraction contract version changes source identity", () => {
+    const viaBuilder = buildExtractionSourceInput(sourceMessages())
+    const current = serializeExtractionSourceInput({
+      compressedTranscript: viaBuilder.compressedTranscript,
+      fileCandidates: viaBuilder.fileCandidates,
+      extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
+    })
+    const bumped = serializeExtractionSourceInput({
+      compressedTranscript: viaBuilder.compressedTranscript,
+      fileCandidates: viaBuilder.fileCandidates,
+      extractionContractVersion: EXTRACTION_CONTRACT_VERSION + 1,
+    })
+    expect(bumped).not.toBe(current)
+    expect(viaBuilder.sourceInputSha256).toMatch(/^[a-f0-9]{64}$/)
+  })
+
+  it("§18.A.9 — source-version key changes when the source session ID changes", () => {
+    const source = buildExtractionSourceInput(sourceMessages())
+    const args = {
+      sourceInputSha256: source.sourceInputSha256,
+      extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
+    }
+    const keyA = makeSourceVersionKey({ ...args, sourceSessionID: "session-a" })
+    const keyB = makeSourceVersionKey({ ...args, sourceSessionID: "session-b" })
+    expect(keyB).not.toBe(keyA)
+    // §3.2: persist as an opaque bounded hash, not a concatenated string.
+    expect(keyA).toMatch(/^v2s:[a-f0-9]{64}$/)
+    expect(keyB).toMatch(/^v2s:[a-f0-9]{64}$/)
+  })
+
+  it("§18.A.10 — extraction key changes when provider, model, or variant changes", () => {
+    const source = buildExtractionSourceInput(sourceMessages())
+    const sourceVersionKey = makeSourceVersionKey({
+      sourceSessionID: "session-1",
+      sourceInputSha256: source.sourceInputSha256,
+      extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
+    })
+    const args = { sourceVersionKey, extractionContractVersion: EXTRACTION_CONTRACT_VERSION }
+    const baseline = makeExtractionCacheKey({
+      ...args,
+      model: { providerID: "anthropic", modelID: "claude" },
+    })
+    const otherProvider = makeExtractionCacheKey({
+      ...args,
+      model: { providerID: "openai", modelID: "claude" },
+    })
+    const otherModel = makeExtractionCacheKey({
+      ...args,
+      model: { providerID: "anthropic", modelID: "gpt-5" },
+    })
+    const otherVariant = makeExtractionCacheKey({
+      ...args,
+      model: { providerID: "anthropic", modelID: "claude", variant: "none" },
+    })
+    expect(new Set([baseline, otherProvider, otherModel, otherVariant]).size).toBe(4)
+    // §3.4: bounded opaque hash, never raw provider/model concatenation.
+    expect(baseline).toMatch(/^v2e:[a-f0-9]{64}$/)
   })
 })
