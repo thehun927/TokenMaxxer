@@ -12,6 +12,7 @@ import {
   persistModelHealth,
   mergeAsyncFacts,
   finalLLMMerge,
+  pruneOld,
 } from "../../src/memory/writer"
 import * as storeModule from "../../src/memory/store"
 import { readMemory, writeMemory } from "../../src/memory/store"
@@ -2044,5 +2045,72 @@ describe("PR 5 §Wave 1B — truthful outcomes", () => {
 
     // The outcome should be "error" (NOT "heuristic-only")
     expect(outcome).toBe("error")
+  })
+})
+
+// ─── PR 5 §Wave 3 — processed-source retention under size-cap pressure ────────
+
+describe("PR 5 §Wave 3 — processed-source retention under size-cap pressure", () => {
+  it("75. pruneOld preserves the new processed-source key under size-cap pressure", () => {
+    // Create a memory with many processed_sources entries
+    const memory = emptyMemory("/test")
+    memory.processed_sources = Array.from({ length: 10 }, (_, i) => ({
+      source_key: "v2s:" + "a".repeat(63) + i.toString().slice(-1),
+      extraction_key: "v2e:" + "b".repeat(64),
+      extraction_contract_version: 2,
+      completed_at: `2026-08-1${i}T00:00:00.000Z`,
+    }))
+
+    // Add a lot of decisions to push memory over 8KB
+    for (let i = 0; i < 100; i++) {
+      memory.decisions.push({
+        id: `d-${i}`,
+        topic: `topic-${i}`,
+        decision: `x`.repeat(500),
+        timestamp: new Date().toISOString(),
+        session_id: "session-0",
+        still_valid: true,
+        foundational: false,
+      })
+    }
+
+    const protectedKey = memory.processed_sources[0]!.source_key
+
+    // Prune with the protected key
+    const result = pruneOld(memory, undefined, Date.now(), { preserveProcessedSourceKey: protectedKey })
+
+    // The protected key should still be present
+    const hasProtectedKey = result.processed_sources.some(s => s.source_key === protectedKey)
+    expect(hasProtectedKey).toBe(true)
+  })
+
+  it("76. pruneOld removes processed_sources when no key is protected", () => {
+    // Create a memory with many processed_sources entries
+    const memory = emptyMemory("/test")
+    memory.processed_sources = Array.from({ length: 10 }, (_, i) => ({
+      source_key: "v2s:" + "a".repeat(63) + i.toString().slice(-1),
+      extraction_key: "v2e:" + "b".repeat(64),
+      extraction_contract_version: 2,
+      completed_at: `2026-08-1${i}T00:00:00.000Z`,
+    }))
+
+    // Add a lot of decisions to push memory over 8KB
+    for (let i = 0; i < 100; i++) {
+      memory.decisions.push({
+        id: `d-${i}`,
+        topic: `topic-${i}`,
+        decision: `x`.repeat(500),
+        timestamp: new Date().toISOString(),
+        session_id: "session-0",
+        still_valid: true,
+        foundational: false,
+      })
+    }
+
+    // Prune without any protected key
+    const result = pruneOld(memory, undefined, Date.now())
+
+    // Some processed_sources should have been removed
+    expect(result.processed_sources.length).toBeLessThan(10)
   })
 })

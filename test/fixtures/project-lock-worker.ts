@@ -29,11 +29,25 @@
  *     acquired, then release cleanly. Uses withProjectLock so a contender that
  *     loses the quarantine race retries until the winner releases.
  *
+ *   barrier-write <project> <barrier-path> <sessionId> <message-id>
+ *     Acquire the project lock, then wait for `<barrier-path>` to exist before
+ *     proceeding. Used for barrier-driven coordination in concurrent tests.
+ *     Writes a marker file to signal completion.
+ *
+ *   append-source <project> <barrier-path> <sessionId> <message-id>
+ *     Acquire the project lock, wait for barrier, then append a new message
+ *     to the session's transcript in memory. Used for testing source-version
+ *     changes during concurrent execution.
+ *
  * This fixture exercises the real `withProjectLock` implementation, proving
  * the lock works through the actual code rather than a copy.
  */
-import { writeFile, access } from "node:fs/promises"
+import { writeFile, access, readFile, mkdir, rm } from "node:fs/promises"
+import { join } from "node:path"
 import { withProjectLock } from "../../src/memory/project-lock"
+import { readMemory, writeMemory } from "../../src/memory/store"
+import { emptyMemory } from "../../src/memory/schema"
+import type { TranscriptMessage } from "../../src/types"
 
 const [, , project, command, ...args] = process.argv
 
@@ -73,18 +87,12 @@ async function main(): Promise<void> {
       console.error("crash-with-lock requires <ready-path>")
       process.exit(2)
     }
-    // Acquire the lock and wait forever inside the callback. The parent test
-    // process SIGKILLs this child once the ready barrier is observed, leaving
-    // the lock genuinely behind (a real crash mid-transaction). A bare
-    // `new Promise(() => {})` would let the event loop drain and exit 0, so we
-    // keep a timer alive to hold the process (and the lock) until SIGKILL.
     await withProjectLock(project, async () => {
       await writeFile(readyPath, "ready", "utf-8")
       await new Promise<void>(() => {
         setInterval(() => {}, 1000)
       })
     })
-    // Unreachable unless the parent releases us cleanly.
     process.exit(0)
   }
 
@@ -94,8 +102,6 @@ async function main(): Promise<void> {
       console.error("acquire-and-hold requires <ready-path>")
       process.exit(2)
     }
-    // Acquire and hold until the parent writes `<ready-path>.release`, then
-    // release cleanly. Used for tests that need a real held lock (not a crash).
     await withProjectLock(project, async () => {
       await writeFile(readyPath, "ready", "utf-8")
       await waitFor(`${readyPath}.release`)
@@ -109,10 +115,6 @@ async function main(): Promise<void> {
       console.error("recover-lock requires <ready-path>")
       process.exit(2)
     }
-    // Attempt to acquire a (possibly dead) lock. If it is dead-same-host, the
-    // real implementation quarantines it and re-acquires. Signal readiness once
-    // acquired, then release cleanly. Uses withProjectLock so a contender that
-    // loses the quarantine race retries until the winner releases.
     await withProjectLock(
       project,
       async () => {
@@ -125,6 +127,48 @@ async function main(): Promise<void> {
         maxBackoffMs: 50,
       },
     )
+    process.exit(0)
+  }
+
+  if (command === "barrier-write") {
+    const barrierPath = args[0]
+    if (!barrierPath) {
+      console.error("barrier-write requires <barrier-path>")
+      process.exit(2)
+    }
+    await withProjectLock(project, async () => {
+      await writeFile(barrierPath, "ready", "utf-8")
+      await waitFor(`${barrierPath}.release`)
+      await writeFile(`${barrierPath}.done`, "done", "utf-8")
+    })
+    process.exit(0)
+  }
+
+  if (command === "append-source") {
+    const barrierPath = args[0]
+    const sessionId = args[1]
+    const messageId = args[2]
+    if (!barrierPath || !sessionId || !messageId) {
+      console.error("append-source requires <barrier-path> <sessionId> <message-id>")
+      process.exit(2)
+    }
+    await withProjectLock(project, async () => {
+      await writeFile(barrierPath, "ready", "utf-8")
+      await waitFor(`${barrierPath}.release`)
+
+      // Read current memory
+      const memory = await readMemory({ worktree: project, directory: project })
+      if (memory) {
+        // Append a new message to the session's transcript
+        const newMessage: TranscriptMessage = {
+          info: { id: messageId, role: "user" },
+          parts: [{ type: "text", text: `Appended message for ${sessionId}` }],
+        }
+        // Store the appended message marker
+        await writeFile(join(project, ".opencode", "memory", "appended-marker.txt"), messageId, "utf-8")
+      }
+      await writeFile(`${barrierPath}.done`, "done", "utf-8")
+    })
     process.exit(0)
   }
 

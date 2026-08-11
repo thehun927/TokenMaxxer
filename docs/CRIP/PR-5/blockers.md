@@ -53,3 +53,13 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] CanonicalExtractionInput exposes promptInputSha256 as the new identity; old `sha256` field is kept for compatibility with callers that read it.
 - [test-gap] §18.A items 1-10 now green (10 tests in test/memory/extract.test.ts).
 - [scope-deviation] extract-llm.ts / writer.ts call sites are updated to populate the new identity fields but the schema/mutable STATE persistence lands in Wave 5.
+
+## 2026-08-11 — wave-3 processed-source schema + source-processing module + prune
+- [design-decision] ProcessedSourceSchema added to src/memory/schema.ts with fields: source_key, extraction_key, extraction_contract_version, completed_at.
+- [design-decision] processed_sources field added to MemoryFile schema (optional array, max 10 entries).
+- [design-decision] LLMExtractionCacheEntrySchema and LLMAuditMetadataSchema extended with optional fields for Wave 5 integration.
+- [design-decision] source-processing.ts module created with find/upsert/remove functions for processed_sources management.
+- [design-decision] pruneOld extended with PruneOptions.preserveProcessedSourceKey parameter to protect a specific processed-source key during eviction.
+- [test-gap] Tests 75-76 added to test/memory/writer-llm.test.ts for pruneOld processed-source preservation behavior.
+- [scope-deviation] Tests 11-17, 24-25 (processed_sources population) are Wave 5 tests; they fail until Wave 5 implements the upsert in finalLLMMerge.
+- [scope-deviation] Test 41 (truthful error outcome) is Wave 6; it fails until the error state machine is implemented.

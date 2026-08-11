@@ -13,6 +13,7 @@ export const MAX_IDENTIFIER = 256
 const MAX_REFERENCE = 128
 const MAX_CACHE_QUARANTINE_COUNT = 10_000
 export const MAX_MODEL_HEALTH_RECORDS = 10
+export const MAX_PROCESSED_SOURCES = 10
 
 /** The two kinds of source material an extractor may point at. */
 export const EvidenceKindSchema = z.enum(["transcript", "heuristic-candidate"])
@@ -148,6 +149,19 @@ export const CacheQuarantineMetadataSchema = z.object({
 })
 export type CacheQuarantineMetadata = z.infer<typeof CacheQuarantineMetadataSchema>
 
+/**
+ * Compact durable completion ledger entry for a processed source.
+ * Stores only the identity of a successfully extracted source, not the
+ * transcript, prompt, response, or any other content.
+ */
+export const ProcessedSourceSchema = z.object({
+  source_key: z.string().regex(/^v2s:[a-f0-9]{64}$/),
+  extraction_key: z.string().regex(/^v2e:[a-f0-9]{64}$/),
+  extraction_contract_version: z.number().int().positive().max(10_000),
+  completed_at: z.string().datetime({ offset: true }).or(z.string().max(128)),
+}).strict()
+export type ProcessedSource = z.infer<typeof ProcessedSourceSchema>
+
 /** A successful structured extraction that can be reused for the same input. */
 export const LLMExtractionCacheEntrySchema = z.object({
   cache_key: z.string(),
@@ -159,6 +173,12 @@ export const LLMExtractionCacheEntrySchema = z.object({
   /** Required for an evidence-backed v3 cache hit; optional for construction by the pre-v3 writer. */
   provenance: ProvenanceSchema.optional(),
   facts: ExtractedFactsSchema,
+  /** PR 5 Wave 3: optional source identity fields for backward compatibility. */
+  source_key: z.string().optional(),
+  source_input_sha256: z.string().optional(),
+  prompt_input_sha256: z.string().optional(),
+  extraction_contract_version: z.number().int().positive().max(10_000).optional(),
+  model_variant: z.string().optional(),
 })
 /**
  * Keep the exported construction type compatible with the pre-v3 extractor
@@ -189,6 +209,12 @@ export const LLMAuditMetadataSchema = z.object({
   model_id: z.string().max(256),
   created_at: z.string().datetime({ offset: true }).or(z.string().max(128)),
   terminal_outcome: AuditTerminalOutcomeSchema,
+  /** PR 5 Wave 3: optional source identity fields for backward compatibility. */
+  source_key: z.string().optional(),
+  source_input_sha256: z.string().optional(),
+  prompt_input_sha256: z.string().optional(),
+  extraction_contract_version: z.number().int().positive().max(10_000).optional(),
+  model_variant: z.string().optional(),
 })
 export type LLMAuditMetadata = z.infer<typeof LLMAuditMetadataSchema>
 
@@ -214,6 +240,8 @@ const MemoryFileBaseSchema = z.object({
   model_health: z.array(ModelHealthSchema).max(MAX_MODEL_HEALTH_RECORDS).optional(),
   /** Count/reason only; quarantined cache payloads are never retained. */
   llm_extraction_cache_quarantine: CacheQuarantineMetadataSchema.optional(),
+  /** PR 5 Wave 3: compact processed-source completion ledger; optional with default for backward compatibility. */
+  processed_sources: z.array(ProcessedSourceSchema).max(MAX_PROCESSED_SOURCES).default([]),
 })
 
 /**
@@ -345,6 +373,7 @@ export type MemoryFile = Omit<
   | "next_steps"
   | "recent_sessions"
   | "llm_extraction_cache"
+  | "processed_sources"
 > & {
   version: number
   revision: number
@@ -354,6 +383,7 @@ export type MemoryFile = Omit<
   next_steps: string[]
   recent_sessions: string[]
   llm_extraction_cache?: LLMExtractionCacheEntry[]
+  processed_sources: ProcessedSource[]
 }
 
 /**
@@ -370,5 +400,6 @@ export function emptyMemory(worktree: string): MemoryFile {
     blockers: [],
     next_steps: [],
     recent_sessions: [],
+    processed_sources: [],
   }
 }

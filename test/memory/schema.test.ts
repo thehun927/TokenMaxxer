@@ -9,6 +9,8 @@ import {
   ModelHealthSchema,
   MAX_IDENTIFIER,
   ProvenanceSchema,
+  ProcessedSourceSchema,
+  MAX_PROCESSED_SOURCES,
   emptyMemory,
 } from "../../src/memory/schema"
 import { loadAndMigrate } from "../../src/memory/migrate"
@@ -277,5 +279,157 @@ describe("PR 3 wave-9 — decision ID uniqueness", () => {
 
   it("rejects an empty decision ID", () => {
     expect(MemoryFileSchema.safeParse(memoryWith([{ ...validDecision, id: "" }])).success).toBe(false)
+  })
+})
+
+// ─── PR 5 Wave 3 — ProcessedSourceSchema bounds ────────────────────────────────
+describe("PR 5 Wave 3 — ProcessedSourceSchema bounds", () => {
+  const validSourceKey = "v2s:" + "a".repeat(64)
+  const validExtractionKey = "v2e:" + "b".repeat(64)
+
+  it("accepts a valid ProcessedSource record", () => {
+    const record = {
+      source_key: validSourceKey,
+      extraction_key: validExtractionKey,
+      extraction_contract_version: 2,
+      completed_at: "2026-08-11T00:00:00.000Z",
+    }
+    expect(ProcessedSourceSchema.safeParse(record).success).toBe(true)
+  })
+
+  it("rejects a source_key with wrong prefix", () => {
+    const record = {
+      source_key: "x2s:" + "a".repeat(64),
+      extraction_key: validExtractionKey,
+      extraction_contract_version: 2,
+      completed_at: "2026-08-11T00:00:00.000Z",
+    }
+    expect(ProcessedSourceSchema.safeParse(record).success).toBe(false)
+  })
+
+  it("rejects a source_key with non-hex characters", () => {
+    const record = {
+      source_key: "v2s:" + "g".repeat(64), // 'g' is not hex
+      extraction_key: validExtractionKey,
+      extraction_contract_version: 2,
+      completed_at: "2026-08-11T00:00:00.000Z",
+    }
+    expect(ProcessedSourceSchema.safeParse(record).success).toBe(false)
+  })
+
+  it("rejects a source_key with wrong length", () => {
+    const record = {
+      source_key: "v2s:" + "a".repeat(63), // too short
+      extraction_key: validExtractionKey,
+      extraction_contract_version: 2,
+      completed_at: "2026-08-11T00:00:00.000Z",
+    }
+    expect(ProcessedSourceSchema.safeParse(record).success).toBe(false)
+  })
+
+  it("rejects extraction_contract_version <= 0", () => {
+    const record = {
+      source_key: validSourceKey,
+      extraction_key: validExtractionKey,
+      extraction_contract_version: 0,
+      completed_at: "2026-08-11T00:00:00.000Z",
+    }
+    expect(ProcessedSourceSchema.safeParse(record).success).toBe(false)
+  })
+
+  it("rejects extraction_contract_version > 10_000", () => {
+    const record = {
+      source_key: validSourceKey,
+      extraction_key: validExtractionKey,
+      extraction_contract_version: 10_001,
+      completed_at: "2026-08-11T00:00:00.000Z",
+    }
+    expect(ProcessedSourceSchema.safeParse(record).success).toBe(false)
+  })
+
+  it("accepts extraction_contract_version at max value 10_000", () => {
+    const record = {
+      source_key: validSourceKey,
+      extraction_key: validExtractionKey,
+      extraction_contract_version: 10_000,
+      completed_at: "2026-08-11T00:00:00.000Z",
+    }
+    expect(ProcessedSourceSchema.safeParse(record).success).toBe(true)
+  })
+
+  it("rejects completed_at exceeding max length", () => {
+    const record = {
+      source_key: validSourceKey,
+      extraction_key: validExtractionKey,
+      extraction_contract_version: 2,
+      completed_at: "x".repeat(129),
+    }
+    expect(ProcessedSourceSchema.safeParse(record).success).toBe(false)
+  })
+
+  it("accepts completed_at at max length 128", () => {
+    const record = {
+      source_key: validSourceKey,
+      extraction_key: validExtractionKey,
+      extraction_contract_version: 2,
+      completed_at: "x".repeat(128),
+    }
+    expect(ProcessedSourceSchema.safeParse(record).success).toBe(true)
+  })
+})
+
+// ─── PR 5 Wave 3 — MemoryFile with processed_sources ───────────────────────────
+describe("PR 5 Wave 3 — MemoryFile with processed_sources", () => {
+  it("defaults processed_sources to empty array", () => {
+    const memory = emptyMemory("/project")
+    expect(memory.processed_sources).toEqual([])
+  })
+
+  it("accepts MemoryFile with processed_sources", () => {
+    const validSourceKey = "v2s:" + "a".repeat(64)
+    const validExtractionKey = "v2e:" + "b".repeat(64)
+    const record = {
+      source_key: validSourceKey,
+      extraction_key: validExtractionKey,
+      extraction_contract_version: 2,
+      completed_at: "2026-08-11T00:00:00.000Z",
+    }
+    const result = MemoryFileSchema.safeParse({
+      ...validV3(),
+      processed_sources: [record],
+    })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.processed_sources).toHaveLength(1)
+    }
+  })
+
+  it("rejects MemoryFile with invalid processed_sources entry", () => {
+    const result = MemoryFileSchema.safeParse({
+      ...validV3(),
+      processed_sources: [{
+        source_key: "invalid",
+        extraction_key: "v2e:" + "b".repeat(64),
+        extraction_contract_version: 2,
+        completed_at: "2026-08-11T00:00:00.000Z",
+      }],
+    })
+    expect(result.success).toBe(false)
+  })
+
+  it("bounds processed_sources at MAX_PROCESSED_SOURCES", () => {
+    const validSourceKey = "v2s:" + "a".repeat(64)
+    const validExtractionKey = "v2e:" + "b".repeat(64)
+    const records = Array.from({ length: MAX_PROCESSED_SOURCES + 1 }, (_, i) => ({
+      source_key: validSourceKey + i.toString().slice(0, 10),
+      extraction_key: validExtractionKey,
+      extraction_contract_version: 2,
+      completed_at: `2026-08-11T00:00:0${i}.000Z`,
+    }))
+    const result = MemoryFileSchema.safeParse({
+      ...validV3(),
+      processed_sources: records,
+    })
+    expect(result.success).toBe(false)
   })
 })

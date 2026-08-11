@@ -662,3 +662,68 @@ describe("PR 3 wave-10 — deterministic duplicate-ID repair", () => {
     expect(first.decisions[0]!.session_id).toBe("s1")
   })
 })
+
+// ─── PR 5 Wave 3 — pre-PR5 v3 STATE loads unchanged ───────────────────────────────
+describe("PR 5 Wave 3 — pre-PR5 v3 STATE loads unchanged", () => {
+  it("loads v3 STATE without processed_sources field and defaults to empty array", () => {
+    const v3WithoutProcessedSources = {
+      version: 3,
+      project_path: "/test/project",
+      last_updated: "2026-08-11T00:00:00.000Z",
+      active_files: [],
+      decisions: [],
+      blockers: [],
+      next_steps: [],
+      recent_sessions: [],
+      // Note: no processed_sources field
+    }
+
+    const result = loadAndMigrate(v3WithoutProcessedSources)
+    expect(result).not.toBeNull()
+    expect(result!.processed_sources).toEqual([])
+  })
+
+  it("loads v3 STATE with empty processed_sources array", () => {
+    const v3WithEmptyProcessedSources = {
+      version: 3,
+      project_path: "/test/project",
+      last_updated: "2026-08-11T00:00:00.000Z",
+      active_files: [],
+      decisions: [],
+      blockers: [],
+      next_steps: [],
+      recent_sessions: [],
+      processed_sources: [],
+    }
+
+    const result = loadAndMigrate(v3WithEmptyProcessedSources)
+    expect(result).not.toBeNull()
+    expect(result!.processed_sources).toEqual([])
+  })
+
+  it("loads v3 STATE with existing processed_sources unchanged", () => {
+    const v3WithProcessedSources = {
+      version: 3,
+      project_path: "/test/project",
+      last_updated: "2026-08-11T00:00:00.000Z",
+      active_files: [],
+      decisions: [],
+      blockers: [],
+      next_steps: [],
+      recent_sessions: [],
+      processed_sources: [
+        {
+          source_key: "v2s:" + "a".repeat(64),
+          extraction_key: "v2e:" + "b".repeat(64),
+          extraction_contract_version: 2,
+          completed_at: "2026-08-11T00:00:00.000Z",
+        },
+      ],
+    }
+
+    const result = loadAndMigrate(v3WithProcessedSources)
+    expect(result).not.toBeNull()
+    expect(result!.processed_sources).toHaveLength(1)
+    expect(result!.processed_sources[0]?.source_key).toBe("v2s:" + "a".repeat(64))
+  })
+})

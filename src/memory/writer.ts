@@ -9,7 +9,9 @@ import type {
   LLMAuditMetadata,
   Evidence,
   Provenance,
+  ProcessedSource,
 } from "./schema"
+import { MAX_PROCESSED_SOURCES, ProcessedSourceSchema } from "./schema"
 import type { ExtractedFacts, TranscriptMessage } from "../types"
 import { mergeDecisions } from "./merge"
 import { readMemoryState, emptyMemory, resolveProjectPath, mutateMemory } from "./store"
@@ -1656,6 +1658,27 @@ function removeOldestRecentSession(mem: MemoryFile): boolean {
   return true
 }
 
+function removeOldestProcessedSource(mem: MemoryFile): boolean {
+  const sources = mem.processed_sources
+  if (!sources?.length) return false
+
+  // Sort by completed_at ascending (oldest first), preserving original order for ties
+  const indexed = sources.map((s, i) => ({ s, originalIndex: i }))
+  indexed.sort((a, b) => {
+    const timeCompare = a.s.completed_at.localeCompare(b.s.completed_at)
+    if (timeCompare !== 0) return timeCompare
+    return a.originalIndex - b.originalIndex
+  })
+
+  // Remove the oldest entry
+  const oldest = indexed[0]
+  if (!oldest) return false
+
+  const remaining = indexed.slice(1).map(({ s }) => s)
+  mem.processed_sources = remaining
+  return true
+}
+
 function reclassifyStalePendingAudits(
   audits: LLMAuditMetadata[],
   now: number,
@@ -1669,10 +1692,35 @@ function reclassifyStalePendingAudits(
   })
 }
 
-function removeDisposableMetadata(mem: MemoryFile): boolean {
+function removeDisposableMetadata(mem: MemoryFile, preserveProcessedSourceKey?: string): boolean {
   if (removeOldestCompletedAudit(mem)) return true
   if (removeOldestCacheEntry(mem)) return true
   if (removeOldestModelHealth(mem)) return true
+
+  // PR 5 Wave 3: remove processed sources, but protect the specified key
+  if (mem.processed_sources && mem.processed_sources.length > 0) {
+    if (preserveProcessedSourceKey) {
+      // Only remove if there's a source other than the protected one
+      const otherSources = mem.processed_sources.filter(s => s.source_key !== preserveProcessedSourceKey)
+      if (otherSources.length > 0) {
+        // Sort by completed_at ascending (oldest first), preserving original order for ties
+        const indexed = otherSources.map((s, i) => ({ s, originalIndex: i }))
+        indexed.sort((a, b) => {
+          const timeCompare = a.s.completed_at.localeCompare(b.s.completed_at)
+          if (timeCompare !== 0) return timeCompare
+          return a.originalIndex - b.originalIndex
+        })
+        // Remove the oldest among the non-protected sources
+        const oldest = indexed[0]
+        mem.processed_sources = mem.processed_sources.filter(s => s.source_key !== oldest.s.source_key)
+        return true
+      }
+      // Cannot remove any processed source without losing the protected one
+    } else {
+      removeOldestProcessedSource(mem)
+      return true
+    }
+  }
 
   if (mem.llm_extraction_cache_quarantine) {
     delete mem.llm_extraction_cache_quarantine
@@ -1730,11 +1778,30 @@ function protectedFirstNewest(candidates: Decision[], target: number): Decision[
 }
 
 /**
+ * Options for pruneOld.
+ */
+export type PruneOptions = {
+  /** If provided, the processed_source with this source_key is protected from eviction. */
+  preserveProcessedSourceKey?: string
+}
+
+/**
  * Prune a MemoryFile toward the 8KB cap.
  * Returns a NEW object (deep clone) — does not mutate input.
  * Full algorithm in docs/IMPLEMENTATION.md Appendix A.3.
+ *
+ * @param mem - The memory file to prune
+ * @param client - Optional client for logging
+ * @param now - Current timestamp in ms
+ * @param options - Optional pruning options
+ * @returns The pruned memory file, or the original if no pruning needed
  */
-export function pruneOld(mem: MemoryFile, client?: unknown, now = Date.now()): MemoryFile {
+export function pruneOld(
+  mem: MemoryFile,
+  client?: unknown,
+  now = Date.now(),
+  options?: PruneOptions,
+): MemoryFile {
   // Deep clone (don't mutate input)
   const cloned: MemoryFile = {
     version: mem.version,
@@ -1780,12 +1847,13 @@ export function pruneOld(mem: MemoryFile, client?: unknown, now = Date.now()): M
     llm_extraction_cache_quarantine: mem.llm_extraction_cache_quarantine
       ? { ...mem.llm_extraction_cache_quarantine }
       : undefined,
+    processed_sources: mem.processed_sources?.map((s) => ({ ...s })) ?? [],
   }
 
   // Operational metadata is disposable before durable facts. Stale pending
   // audits were reclassified above, so they are eligible for this same audit
   // eviction pass while genuinely active guards remain protected.
-  while (jsonSize(cloned) > MEMORY_MAX_BYTES && removeDisposableMetadata(cloned)) {
+  while (jsonSize(cloned) > MEMORY_MAX_BYTES && removeDisposableMetadata(cloned, options?.preserveProcessedSourceKey)) {
     // Re-check after each deterministic removal.
   }
 
@@ -1854,6 +1922,35 @@ export function pruneOld(mem: MemoryFile, client?: unknown, now = Date.now()): M
   }
 
   return cloned
+}
+
+/**
+ * Prune a MemoryFile for the final LLM commit with processed-source protection.
+ * This is a wrapper around pruneOld that ensures the newly created processed-source
+ * key is protected from eviction during the pruning process.
+ *
+ * If the state cannot fit even after pruning all allowed disposables while
+ * preserving the newly created completion marker, the transaction must fail
+ * rather than return llm-success without its completion proof.
+ *
+ * @param mem - The memory file to prune
+ * @param client - Optional client for logging
+ * @param now - Current timestamp in ms
+ * @param preserveProcessedSourceKey - The source_key to protect from eviction
+ * @returns The pruned memory file, or the original if size cannot be reduced
+ */
+export function pruneOldForCommit(
+  mem: MemoryFile,
+  client: unknown,
+  now: number,
+  preserveProcessedSourceKey: string,
+): MemoryFile {
+  // First, try pruning with the processed-source key protected
+  const result = pruneOld(mem, client, now, { preserveProcessedSourceKey })
+
+  // If the result is still over cap, we cannot commit
+  // The caller should fail the transaction rather than silently losing the marker
+  return result
 }
 
 /** Measure serialized JSON size in bytes. */
