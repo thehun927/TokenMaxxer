@@ -220,3 +220,19 @@ decisions, and validation results; do not rewrite prior entries.
   passed**.
 - Wave 7 exit: **complete**. Proceed to Wave 8 audit and release-chain
   handoff only.
+
+## 2026-08-11 — Wave 8 audit and release-chain evidence
+
+- Final implementation SHA audited: `c61e16e44f04ca7b2e1f665accf52c1f3c3c1691`.
+- Working-tree source is clean at the audited SHA before handoff-document
+  creation; generated `dist` outputs from the build were reverted and are not
+  implementation changes.
+- Full release chain passed on that exact SHA:
+  `npm test -- --reporter=dot` — **46 test files, 833 tests passed**;
+  `npx tsc --noEmit` — **passed**;
+  `npm run build` — **passed**;
+  `npm run verify:host-contract` — **passed**;
+  `npm run verify-cli-bundle` — **passed**;
+  `npm run smoke:cli` — **passed (checks 46–49)**.
+- Wave 8 is implementation audit and handoff only. No Oracle findings or Ship
+  verdict are recorded here; the independent Oracle owns release-gate review.
