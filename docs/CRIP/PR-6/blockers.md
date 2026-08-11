@@ -84,3 +84,16 @@ Append-only implementation log for PR 6. Do not delete or rewrite prior entries.
 - [gated] The five skipped schema tests are the Wave 6 provenance pairing and
   audit/evidence-gate cases. They remain explicit skips pending Wave 6 and are
   not counted as green contract coverage.
+
+## 2026-08-11 — Wave 6 durable provenance invariants
+
+- [implementation] Provenance schema now enforces extractor/confidence pairing
+  and requires non-empty audit identity plus 1–3 evidence entries for LLM trust.
+- [implementation] Migration repairs incomplete LLM provenance to legacy while
+  preserving semantic decisions/evidence; merge skips LLM decisions without an
+  audit session.
+- [verification] `npx tsc --noEmit` passed; provenance-focused validation passed:
+  206 tests.
+- [verification] `npm test` passed: 38 files, 632 tests.
+- [scope] All five previously gated provenance tests are re-enabled and green;
+  no Wave 7 cleanup has started.

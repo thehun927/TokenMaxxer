@@ -32,7 +32,7 @@ const llmProv = {
   source_session_id: "s-l",
   source_audit_session_id: "audit-l",
   confidence: "llm-corroborated" as const,
-  evidence: [] as never[],
+  evidence: [{ kind: "transcript" as const, ref: "tr-1", digest: "a".repeat(64) }],
 }
 const humanProv = {
   extractor: "human" as const,

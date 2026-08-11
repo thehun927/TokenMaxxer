@@ -369,6 +369,57 @@ function repairIncompleteLLMClaims(decisions: unknown[]): unknown[] {
 }
 
 /**
+ * PR 6 Wave 5 — repair incomplete LLM provenance in active_files and current_task.
+ * Active files and current_task with incomplete LLM provenance are downgraded
+ * to legacy to maintain the v3 trust invariant.
+ */
+function repairIncompleteLLMProvenanceInState(data: RawRecord): RawRecord {
+  // Repair active_files
+  if (Array.isArray(data.active_files)) {
+    data.active_files = data.active_files.map((file) => {
+      if (!isRecord(file)) return file
+      const provenance = isRecord(file.provenance) ? file.provenance : undefined
+      const isLLMClaim = provenance?.extractor === "llm" && provenance?.confidence === "llm-corroborated"
+      if (!isLLMClaim) return file
+
+      const hasAuditSession = typeof provenance.source_audit_session_id === "string" && provenance.source_audit_session_id.length > 0
+      const hasEvidence = Array.isArray(provenance.evidence) && provenance.evidence.length > 0
+
+      if (hasAuditSession && hasEvidence) return file
+
+      return {
+        ...file,
+        provenance: {
+          ...provenance,
+          extractor: "legacy",
+          confidence: "legacy",
+        },
+      }
+    })
+  }
+
+  // Repair current_task_provenance
+  if (isRecord(data.current_task_provenance)) {
+    const provenance = data.current_task_provenance
+    const isLLMClaim = provenance.extractor === "llm" && provenance.confidence === "llm-corroborated"
+    if (isLLMClaim) {
+      const hasAuditSession = typeof provenance.source_audit_session_id === "string" && provenance.source_audit_session_id.length > 0
+      const hasEvidence = Array.isArray(provenance.evidence) && provenance.evidence.length > 0
+
+      if (!hasAuditSession || !hasEvidence) {
+        data.current_task_provenance = {
+          ...provenance,
+          extractor: "legacy",
+          confidence: "legacy",
+        }
+      }
+    }
+  }
+
+  return data
+}
+
+/**
  * Load a raw parsed JSON value and migrate it to the current MemoryFile schema.
  * Returns null for invalid/corrupt data, unknown versions, or missing version.
  * No filesystem operation is performed on either success or failure.
@@ -419,6 +470,9 @@ export function loadAndMigrate(raw: unknown): MemoryFile | null {
       decisions: repairIncompleteLLMClaims(data.decisions),
     }
   }
+
+  // PR 6 Wave 5 — repair incomplete LLM provenance in active_files and current_task
+  data = repairIncompleteLLMProvenanceInState(data)
 
   const parsed = MemoryFileSchema.safeParse(data)
   if (!parsed.success) {

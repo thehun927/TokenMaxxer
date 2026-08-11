@@ -740,6 +740,8 @@ describe("writeMemoryOnIdle rebases on concurrent decision mutations (PR 3 §7 a
     const project = await worktree()
 
     // Seed one review-requested authority at revision 5.
+    // Use legacy provenance since this is a pre-existing decision that
+    // will be promoted to human-reviewed by the concurrent promotion operation.
     const seeded = emptyMemory(project)
     seeded.revision = 5
     seeded.decisions = [{
@@ -752,10 +754,9 @@ describe("writeMemoryOnIdle rebases on concurrent decision mutations (PR 3 §7 a
       foundational: false,
       foundational_requested: true,
       provenance: {
-        extractor: "llm",
-        source_session_id: "s-llm",
-        source_audit_session_id: "a-llm",
-        confidence: "llm-corroborated",
+        extractor: "legacy",
+        source_session_id: "s-legacy",
+        confidence: "legacy",
         evidence: [],
       },
     }]

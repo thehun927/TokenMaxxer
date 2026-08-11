@@ -64,6 +64,63 @@ export const ProvenanceSchema = z
     evidence: z.array(EvidenceSchema).max(3).default([]),
   })
   .strict()
+  .superRefine((provenance, ctx) => {
+    // PR-6 Wave 6: Enforce extractor/confidence pairing contract
+    // extractor=llm must pair with confidence=llm-corroborated
+    // extractor=heuristic must pair with confidence=heuristic
+    // extractor=human must pair with confidence=human-reviewed
+    // extractor=legacy has no pairing requirement
+    const { extractor, confidence } = provenance
+
+    if (extractor === "llm" && confidence !== "llm-corroborated") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["confidence"],
+        message: "extractor=llm must pair with confidence=llm-corroborated",
+      })
+    }
+
+    if (extractor === "heuristic" && confidence !== "heuristic") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["confidence"],
+        message: "extractor=heuristic must pair with confidence=heuristic",
+      })
+    }
+
+    if (extractor === "human" && confidence !== "human-reviewed") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["confidence"],
+        message: "extractor=human must pair with confidence=human-reviewed",
+      })
+    }
+
+    // PR-6 Wave 6: LLM provenance requires source_audit_session_id and 1-3 evidence entries
+    if (extractor === "llm" && confidence === "llm-corroborated") {
+      if (!provenance.source_audit_session_id || provenance.source_audit_session_id.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["source_audit_session_id"],
+          message: "LLM provenance requires non-empty source_audit_session_id",
+        })
+      }
+      if (!provenance.evidence || provenance.evidence.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["evidence"],
+          message: "LLM provenance requires at least 1 evidence entry",
+        })
+      }
+      if (provenance.evidence.length > 3) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["evidence"],
+          message: "LLM provenance evidence must have at most 3 entries",
+        })
+      }
+    }
+  })
 export type Provenance = z.infer<typeof ProvenanceSchema>
 
 export const DecisionSchema = z.object({

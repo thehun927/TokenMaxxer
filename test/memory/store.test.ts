@@ -547,6 +547,9 @@ describe("PR 3 wave-10 — deterministic duplicate-ID repair across transactions
     const path = projectMemoryPath(project)
     // A raw duplicate-ID legacy state: two rows share "dup"; the canonical
     // (oldest) row is the authority and is marked for foundational review.
+    // Note: LLM provenance with empty evidence is invalid per PR-6 Wave 6,
+    // but this test uses writeState to bypass validation and relies on
+    // loadAndMigrate to repair the provenance.
     const rawState = {
       version: 3,
       project_path: project,

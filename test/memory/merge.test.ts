@@ -577,7 +577,7 @@ describe("PR 3 wave-9 — durable human conflict quarantine", () => {
     source_session_id: "session-llm",
     source_audit_session_id: "audit-llm",
     confidence: "llm-corroborated" as const,
-    evidence: [] as never[],
+    evidence: [{ kind: "transcript" as const, ref: "tr-llm", digest: "b".repeat(64) }],
   }
   const humanProvenance = {
     extractor: "human" as const,

@@ -446,7 +446,7 @@ describe("PR 5 Wave 3 — MemoryFile with processed_sources", () => {
 // These tests document the schema-level contract. Tests that fail reveal
 // gaps where the current schema accepts inconsistent pairings.
 describe("PR 6 Wave 1 — extractor/confidence pairing contract", () => {
-  it.skip("rejects llm extractor paired with non-llm-corroborated confidence", () => {
+  it("rejects llm extractor paired with non-llm-corroborated confidence", () => {
     const result = ProvenanceSchema.safeParse({
       extractor: "llm",
       source_session_id: "sess-1",
@@ -460,7 +460,7 @@ describe("PR 6 Wave 1 — extractor/confidence pairing contract", () => {
     expect(result.success).toBe(false)
   })
 
-  it.skip("rejects heuristic extractor paired with non-heuristic confidence", () => {
+  it("rejects heuristic extractor paired with non-heuristic confidence", () => {
     const result = ProvenanceSchema.safeParse({
       extractor: "heuristic",
       source_session_id: "sess-1",
@@ -471,7 +471,7 @@ describe("PR 6 Wave 1 — extractor/confidence pairing contract", () => {
     expect(result.success).toBe(false)
   })
 
-  it.skip("rejects human extractor paired with non-human-reviewed confidence", () => {
+  it("rejects human extractor paired with non-human-reviewed confidence", () => {
     const result = ProvenanceSchema.safeParse({
       extractor: "human",
       source_session_id: "sess-1",
@@ -488,7 +488,7 @@ describe("PR 6 Wave 1 — extractor/confidence pairing contract", () => {
 // and (b) at least 1 transcript evidence entry (max 3).
 // These tests document the schema-level contract gaps.
 describe("PR 6 Wave 1 — LLM provenance audit + evidence gate", () => {
-  it.skip("rejects llm provenance without source_audit_session_id", () => {
+  it("rejects llm provenance without source_audit_session_id", () => {
     const result = ProvenanceSchema.safeParse({
       extractor: "llm",
       source_session_id: "sess-1",
@@ -501,7 +501,7 @@ describe("PR 6 Wave 1 — LLM provenance audit + evidence gate", () => {
     expect(result.success).toBe(false)
   })
 
-  it.skip("rejects llm provenance with zero evidence entries", () => {
+  it("rejects llm provenance with zero evidence entries", () => {
     const result = ProvenanceSchema.safeParse({
       extractor: "llm",
       source_session_id: "sess-1",

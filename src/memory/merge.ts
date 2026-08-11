@@ -291,6 +291,10 @@ export function mergeDecisions(
     // does not enter decision merging.
     if (origin === "llm" && !incEvidence) continue
 
+    // PR-6 Wave 6: LLM provenance requires source_audit_session_id.
+    // If missing, skip the decision (it would fail schema validation anyway).
+    if (origin === "llm" && !meta.auditSessionID) continue
+
     const provenance = makeProvenance(meta, incEvidence ?? [])
 
     // Unresolved conflicting-human-foundational state: extraction must not
