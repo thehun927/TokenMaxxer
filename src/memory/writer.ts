@@ -458,16 +458,12 @@ async function processPreparedIdleSource(
     modelVariant: selectedModel.variant,
   })
   if (cachedEntry) {
-    void log(client, "debug", "llm extraction cache hit")
-    const merged = await mergeAsyncFacts(opts, cachedEntry.facts, gitSha, sessionId, {
-      origin: "llm",
-      auditSessionID: cachedEntry.provenance?.source_audit_session_id,
-      evidenceCandidates: candidates,
-      provenanceEvidence: cachedEntry.provenance?.evidence,
-    })
-    if (!merged) return "llm-failed"
-    void log(client, "info", "llm extraction facts merged")
-    return "cache-hit"
+    // A result-cache row is not completion proof.  Only the processed-source
+    // ledger can authorize the durable no-op above; replaying this payload
+    // would re-apply facts from a source that may never have committed its
+    // completion marker.  Treat the row as a cache miss and continue through
+    // the normal gated extraction path.
+    void log(client, "debug", "llm extraction cache entry ignored without completion marker")
   }
 
   // Use gated config before starting a new LLM extraction (PR4 host/cooldown gate).
@@ -798,8 +794,16 @@ export async function finalLLMMerge(
       const withProcessedSource = upsertProcessedSource(withCache, processedSourceRecord)
 
       // Wave 5 §10.6: Prune while preserving newly written source key
-      // The newly created source key is temporarily protected from eviction
-      const finalMemory = pruneOld(withProcessedSource, client)
+      // The newly created source key is temporarily protected from eviction.
+      // If the durable facts plus this proof still cannot fit, leave the
+      // irreducible over-cap state for commitMemoryExact to reject.  That
+      // produces commit-failed rather than an llm-success without proof.
+      const finalMemory = pruneOldForCommit(
+        withProcessedSource,
+        client,
+        Date.now(),
+        args.sourceVersionKey,
+      )
 
       // Wave 5 §10.7: Commit exactly once
       return { kind: "commit", memory: finalMemory, value: { outcome: "committed", memory: finalMemory } }

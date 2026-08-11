@@ -107,3 +107,10 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [verification] `npx tsc --noEmit` passed after Waves 6–7.
 - [verification] `npx vitest run test/memory/writer.test.ts test/tools/recall.test.ts test/memory/writer-llm.test.ts test/memory/extract-llm.test.ts test/memory/transaction.test.ts test/memory/store.test.ts test/tools/status.test.ts` passed: 7 files, 215 tests.
 - [verification] `npm test` passed: 38 files, 570 tests.
+
+## 2026-08-11 — Wave 8 audit remediation evidence
+- [audit-blocker-resolved] Final LLM pruning now protects the newly written `processed_sources` key; an irreducible over-cap state remains a commit failure rather than an unproven `llm-success`.
+- [audit-blocker-resolved] A bulky result-cache row without a durable completion marker is no longer replayed through `mergeAsyncFacts`; only the processed-source ledger authorizes a no-op cache hit.
+- [verification] `npx tsc --noEmit` passed after remediation.
+- [verification] `npx vitest run test/memory/writer.test.ts test/memory/writer-llm.test.ts test/memory/model-health.test.ts test/memory/source-processing.test.ts test/memory/transaction.test.ts test/memory/store.test.ts test/tools/recall.test.ts` passed: 7 files, 203 tests.
+- [verification] `npm test` passed: 38 files, 572 tests.

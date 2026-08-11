@@ -136,7 +136,7 @@ describe("local model health circuit breaker", () => {
     expect(list).toHaveBeenCalledTimes(1)
   })
 
-  it("uses an accepted cache hit even while the selected model is cooling down", async () => {
+  it("does not accept a cache payload without a completion marker while cooling down", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
     const worktree = await mkdtemp(join(tmpdir(), "tokenmaxxer-health-cache-"))
     directories.push(worktree)
@@ -186,8 +186,11 @@ describe("local model health circuit breaker", () => {
       worktree,
       directory: worktree,
       sessionId: "source-health-cache",
-    })).resolves.toBe("cache-hit")
+    })).resolves.toBe("heuristic-only")
     expect(create).not.toHaveBeenCalled()
     expect(prompt).not.toHaveBeenCalled()
+    const memory = await readMemory({ worktree, directory: worktree })
+    expect(memory?.current_task).not.toBe("Cached health result")
+    expect(memory?.revision).toBe(1)
   })
 })

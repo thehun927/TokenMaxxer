@@ -353,20 +353,27 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
       session: { messages: vi.fn(async () => ({ data: messages })), create, prompt },
     }
 
-    await writeMemoryOnIdle({
+    const outcome = await writeMemoryOnIdle({
       client: v1,
       worktree,
       directory: worktree,
       sessionId: "source-cache",
     })
 
+    // A cache payload without the durable completion marker is a miss, not a
+    // cache-hit.  It must not replay the cached facts or perform a second
+    // cache transaction/revision; this deliberately reaches the failed LLM
+    // path because the prompt fixture is not configured.
+    expect(outcome).toBe("llm-failed")
     const memory = await readMemory({ worktree, directory: worktree })
-    expect(create).not.toHaveBeenCalled()
+    expect(create).toHaveBeenCalledTimes(1)
     expect(prompt).not.toHaveBeenCalled()
     expect(memory?.current_task).toContain("Implement the extraction")
+    expect(memory?.current_task).not.toBe("Cached task")
+    expect(memory?.revision).toBe(1)
     expect(memory?.current_task_provenance?.confidence).toBe("heuristic")
     expect(appLog).toHaveBeenCalledWith(expect.objectContaining({
-      body: expect.objectContaining({ message: "llm extraction cache hit" }),
+      body: expect.objectContaining({ message: "llm extraction cache entry ignored without completion marker" }),
     }))
   })
 
@@ -1059,6 +1066,108 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
       expect(result.value.memory.current_task).toBe("LLM task")
       expect(result.value.memory.processed_sources).toHaveLength(1)
     }
+  })
+
+  it("protects the current completion marker when pruning near the size cap", async () => {
+    const worktree = await makeWorktree()
+    const messages = idempotentMessages()
+    const prior = emptyMemory(worktree)
+    prior.processed_sources = Array.from({ length: 10 }, (_, index) => ({
+      source_key: `v2s:${"a".repeat(63)}${index}`,
+      extraction_key: `v2e:${"b".repeat(64)}`,
+      extraction_contract_version: 2,
+      completed_at: "2026-08-10T00:00:00.000Z",
+    }))
+    for (let index = 0; index < 4; index++) {
+      prior.decisions.push({
+        id: `foundational-${index}`,
+        topic: `topic-${index}`,
+        decision: "x".repeat(600),
+        timestamp: "2026-08-11T00:00:00.000Z",
+        session_id: "prior-session",
+        still_valid: true,
+        foundational: true,
+        provenance: {
+          extractor: "heuristic",
+          source_session_id: "prior-session",
+          confidence: "heuristic",
+          evidence: [],
+        },
+      })
+    }
+    await expect(writeMemory({ worktree, directory: worktree }, prior)).resolves.toBe(true)
+
+    const sourceVersionKey = `v2s:${"c".repeat(64)}`
+    const result = await finalLLMMerge(
+      { client: {}, worktree, directory: worktree },
+      {
+        sessionId: "source-pressure",
+        gitSha: null,
+        canonicalInput: buildCanonicalInput(messages, prior),
+        selectedModel: { providerID: "provider", modelID: "model" },
+        selectedCacheKey: `v2e:${"d".repeat(64)}`,
+        sourceVersionKey,
+        sourceInputSha256: "e".repeat(64),
+        promptInputSha256: "f".repeat(64),
+        llmFacts: llmFacts({ current_task: "pressure merge" }) as never,
+        extractionAuditSessionID: "audit-pressure",
+        candidates: {},
+        digests: {},
+      },
+    )
+
+    expect(result.status).toBe("committed")
+    if (result.status === "committed") {
+      expect(result.value.memory.processed_sources.some((source) => source.source_key === sourceVersionKey)).toBe(true)
+    }
+    const onDisk = await readMemory({ worktree, directory: worktree })
+    expect(onDisk?.processed_sources.some((source) => source.source_key === sourceVersionKey)).toBe(true)
+  })
+
+  it("fails the final transaction when protected durable state remains over cap", async () => {
+    const worktree = await makeWorktree()
+    const prior = emptyMemory(worktree)
+    for (let index = 0; index < 5; index++) {
+      prior.decisions.push({
+        id: `irreducible-${index}`,
+        topic: `topic-${index}`,
+        decision: "x".repeat(1100),
+        timestamp: "2026-08-11T00:00:00.000Z",
+        session_id: "prior-session",
+        still_valid: true,
+        foundational: true,
+        provenance: {
+          extractor: "heuristic",
+          source_session_id: "prior-session",
+          confidence: "heuristic",
+          evidence: [],
+        },
+      })
+    }
+    await expect(writeMemory({ worktree, directory: worktree }, prior)).resolves.toBe(true)
+
+    const sourceVersionKey = `v2s:${"e".repeat(64)}`
+    const result = await finalLLMMerge(
+      { client: {}, worktree, directory: worktree },
+      {
+        sessionId: "source-over-cap",
+        gitSha: null,
+        canonicalInput: buildCanonicalInput([], prior),
+        selectedModel: { providerID: "provider", modelID: "model" },
+        selectedCacheKey: `v2e:${"f".repeat(64)}`,
+        sourceVersionKey,
+        sourceInputSha256: "1".repeat(64),
+        promptInputSha256: "2".repeat(64),
+        llmFacts: llmFacts({ current_task: "over-cap merge" }) as never,
+        extractionAuditSessionID: "audit-over-cap",
+        candidates: {},
+        digests: {},
+      },
+    )
+
+    expect(result.status).toBe("commit-failed")
+    const onDisk = await readMemory({ worktree, directory: worktree })
+    expect(onDisk?.processed_sources.some((source) => source.source_key === sourceVersionKey)).toBe(false)
   })
 
   it("13. same source delivered twice returns outcome cache-hit", async () => {
