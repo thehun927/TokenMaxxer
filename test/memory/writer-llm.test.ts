@@ -1074,8 +1074,8 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
           next_steps: [],
         } as never,
         extractionAuditSessionID: "audit-final-12",
-        candidates: prepared.candidates,
-        digests: prepared.digests,
+        candidates: prepared.transcriptCandidates,
+        digests: prepared.transcriptDigests,
       },
     )
 
@@ -2399,7 +2399,7 @@ describe("PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation", () => {
         model,
       })
       const evidenceRef = makeTranscriptEvidenceRef("m1")
-      const evidence = prepared.candidates[evidenceRef]
+      const evidence = prepared.transcriptCandidates[evidenceRef]
       if (!evidence) throw new Error("transcript evidence candidate missing")
 
       const prior = emptyMemory(worktree)
@@ -2447,8 +2447,8 @@ describe("PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation", () => {
           promptInputSha256: prepared.promptInputSha256,
           llmFacts: freshFacts,
           extractionAuditSessionID: "audit-fresh",
-          candidates: prepared.candidates,
-          digests: prepared.digests,
+          candidates: prepared.transcriptCandidates,
+          digests: prepared.transcriptDigests,
         },
       )
 

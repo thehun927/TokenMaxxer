@@ -41,3 +41,17 @@ Append-only implementation log for PR 6. Do not delete or rewrite prior entries.
   downstream failures for cache replay/capping and heuristic-candidate evidence;
   those are reserved for Waves 3 and 5.
 - [verification] `npx tsc --noEmit` passed after the temporary integration bridge.
+
+## 2026-08-11 — Wave 3 transcript-only evidence boundary
+
+- [implementation] Prepared sources now expose separate transcript candidate/
+  digest maps for LLM trust and heuristic candidate/digest maps for heuristic
+  provenance. LLM extraction, cache validation, and final merge receive only
+  transcript evidence.
+- [implementation] LLM evidence resolution rejects `heuristic-candidate` refs;
+  heuristic provenance retains its own merged candidate universe.
+- [verification] `npx tsc --noEmit` passed. Owned extraction tests remained green
+  and the transcript-only rejection case turned green.
+- [expected-downstream] The Wave 3 focused run reported 93 passed and 17 failed;
+  remaining failures are full-facts writer/cache behavior reserved for Waves 4–6
+  plus two legacy cache tests reserved for Wave 5.

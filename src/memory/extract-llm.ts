@@ -697,7 +697,7 @@ export function resolveEvidenceReferences(
       return { evidence: [], reason: "unknown-reference" }
     }
     if (
-      (candidate.kind !== "transcript" && candidate.kind !== "heuristic-candidate") ||
+      candidate.kind !== "transcript" ||
       !isSha256(candidate.digest)
     ) {
       return { evidence: [], reason: "invalid-candidate" }

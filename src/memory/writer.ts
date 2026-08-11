@@ -238,8 +238,12 @@ export type PreparedIdleSource =
       sourceVersionKey: string
       promptInputSha256: string
       sourceInputSha256: string
-      candidates: EvidenceCandidateMap
-      digests: Readonly<Record<string, string>>
+      /** Source-transcript candidates/digests cross the LLM evidence boundary. */
+      transcriptCandidates: EvidenceCandidateMap
+      transcriptDigests: Readonly<Record<string, string>>
+      /** Heuristic candidates/digests are owned by the heuristic provenance path. */
+      heuristicCandidates: EvidenceCandidateMap
+      heuristicDigests: Readonly<Record<string, string>>
     }
   | { kind: "no-messages" }
   | { kind: "error"; reason: string }
@@ -309,11 +313,13 @@ export async function prepareIdleSource(
   const canonicalPrior = { ...existing, llm_extraction_audits: undefined, revision: 0 }
   const canonicalInput = buildCanonicalInput(windowMessages, canonicalPrior)
 
-  const candidates = mergeEvidenceCandidateMaps(
-    transcriptCandidateMap(windowMessages),
-    buildHeuristicEvidenceCandidateMap(extractFactsHeuristic(windowMessages)),
-  )
-  const digests = evidenceDigestMap(candidates)
+  // Wave 3: Split transcript and heuristic candidate maps. Only
+  // transcriptCandidates/transcriptDigests cross the LLM evidence boundary;
+  // heuristic candidates are owned by the heuristic provenance path.
+  const transcriptCandidates = transcriptCandidateMap(windowMessages)
+  const transcriptDigests = evidenceDigestMap(transcriptCandidates)
+  const heuristicCandidates = buildHeuristicEvidenceCandidateMap(extractFactsHeuristic(windowMessages))
+  const heuristicDigests = evidenceDigestMap(heuristicCandidates)
 
   return {
     kind: "success",
@@ -323,8 +329,10 @@ export async function prepareIdleSource(
     sourceVersionKey,
     promptInputSha256: canonicalInput.promptInputSha256,
     sourceInputSha256,
-    candidates,
-    digests,
+    transcriptCandidates,
+    transcriptDigests,
+    heuristicCandidates,
+    heuristicDigests,
   }
 }
 
@@ -343,7 +351,19 @@ async function processPreparedIdleSource(
   const { client, worktree, directory, sessionId } = opts
   const project = resolveProjectPath(worktree, directory)
   const gitSha = await getCurrentGitSha(worktree)
-  const { allMessages, windowMessages, canonicalInput, sourceVersionKey, candidates, digests } = prepared
+  const {
+    allMessages,
+    windowMessages,
+    canonicalInput,
+    sourceVersionKey,
+    transcriptCandidates,
+    transcriptDigests,
+    heuristicCandidates,
+    heuristicDigests,
+  } = prepared
+  // Heuristic merge may use the merged candidate map (transcript + heuristic).
+  const mergedCandidates = mergeEvidenceCandidateMaps(transcriptCandidates, heuristicCandidates)
+  const mergedDigests = evidenceDigestMap(mergedCandidates)
 
   // Read authoritative state under lock for the heuristic transaction
   const existingState = await readMemoryState({ worktree, directory })
@@ -374,7 +394,7 @@ async function processPreparedIdleSource(
         gitSha,
         timestamp: new Date().toISOString(),
         origin: "heuristic",
-        evidenceCandidates: candidates,
+        evidenceCandidates: mergedCandidates,
       })
       const heuristicMemory = pruneOld(recordRecentSession(merged, sessionId), client)
       return {
@@ -461,10 +481,11 @@ async function processPreparedIdleSource(
     model: selectedModel,
   })
 
-  // Check cache before prompting with full identity validation
+  // Check cache before prompting with full identity validation.
+  // Wave 3: LLM evidence boundary uses only transcript candidates.
   const cachedEntry = readExtractionCacheEntry(afterHeuristic, selectedCacheKey, {
-    evidenceCandidateMap: candidates,
-    evidenceDigestMap: digests,
+    evidenceCandidateMap: transcriptCandidates,
+    evidenceDigestMap: transcriptDigests,
     sourceVersionKey,
     sourceInputSha256: prepared.sourceInputSha256,
     promptInputSha256: prepared.promptInputSha256,
@@ -526,8 +547,9 @@ async function processPreparedIdleSource(
       providerID: gatedConfig.model.providerID,
       modelID: gatedConfig.model.modelID,
       modelVariant: gatedConfig.model.variant,
-      evidenceCandidateMap: candidates,
-      evidenceDigestMap: digests,
+      // Wave 3: LLM evidence boundary uses only transcript candidates.
+      evidenceCandidateMap: transcriptCandidates,
+      evidenceDigestMap: transcriptDigests,
       onDiagnostic: (diagnostic) => logLLMDiagnostic(client, diagnostic),
       onAuditCreated: persistAudit,
       onAuditTerminal: persistTerminal,
@@ -579,8 +601,9 @@ async function processPreparedIdleSource(
       // merge seam with a decisions-only merge and removes this assertion.
       llmFacts: llmFacts as unknown as ExtractedFacts,
       extractionAuditSessionID,
-      candidates,
-      digests,
+      // Wave 3: LLM evidence boundary uses only transcript candidates.
+      candidates: transcriptCandidates,
+      digests: transcriptDigests,
     },
   )
 
