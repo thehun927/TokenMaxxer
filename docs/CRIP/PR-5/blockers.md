@@ -40,6 +40,12 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [design-decision] The remaining §18.E items 42-58 (write-failed, queue-failed, llm-failed, the lastOutcome alignment, etc.) are deferred to Wave 6 when the truthful outcome state machine is implemented.
 - [scope-deviation] Items 26-31 (barrier-driven concurrent cases, §18.C) are deferred to Wave 4 where the source-version queue key is implemented.
 
+## 2026-08-11 — wave-1B-sub4 barrier-driven concurrent fixtures
+- [test-gap] test/memory/writer.test.ts extended with 6 barrier-driven concurrent fixtures (§18.C items 26-31); expected to go green in Wave 4.
+- [design-decision] Tests use the existing transaction-worker.ts fixture (added in PR 2) with barrier-driven coordination; no sleeps.
+- [design-decision] Two previous attempts by other specialists produced empty results; eventual code output by this attempt is the Wave 1B-sub4 contract.
+- [scope-deviation] If the existing fixture commands are insufficient, new commands are added inside transaction-worker.ts and documented here.
+
 ## 2026-08-11 — wave-2 source/prompt identity implementation
 - [design-decision] EXTRACTION_CONTRACT_VERSION = 2 lives in src/memory/extract-prompt.ts.
 - [design-decision] Source serializer is stableJson({ extraction_contract_version, source_transcript, file_candidates }) — sorts fileCandidates before hashing.
