@@ -3,6 +3,10 @@
  *
  * This is intentionally process-local.  It is not a distributed lock and it
  * never records request payloads or source text.
+ *
+ * Wave 4: The queue key is the source-version key (idle:<sourceVersionKey>),
+ * not just the session ID. This coalesces same-source requests while allowing
+ * different sources from the same session to proceed independently.
  */
 
 export interface ProjectQueueStatus {
@@ -65,14 +69,18 @@ function boundedOutcome(outcome: string): string {
 /**
  * Queue one source-session job.  A second call for the same project/source
  * receives the exact promise already owned by the first call.
+ *
+ * Wave 4: The queueKey is the source-version key (e.g., "idle:v2s:<sha256>")
+ * which coalesces same-source requests while allowing different sources
+ * from the same session to proceed independently.
  */
 export function enqueueProjectJob<T>(
   project: string,
-  sourceSessionID: string,
+  queueKey: string,
   job: () => Promise<T>,
 ): Promise<T> {
   const state = stateFor(project)
-  const existing = state.inFlight.get(sourceSessionID)
+  const existing = state.inFlight.get(queueKey)
   if (existing) return existing as Promise<T>
 
   state.queued += 1
@@ -86,7 +94,7 @@ export function enqueueProjectJob<T>(
       throw error
     } finally {
       state.active = Math.max(0, state.active - 1)
-      state.inFlight.delete(sourceSessionID)
+      state.inFlight.delete(queueKey)
       state.touchedAt = Date.now()
       pruneIdleStates()
     }
@@ -94,7 +102,7 @@ export function enqueueProjectJob<T>(
 
   // A rejected job must not poison the serial tail for later source sessions.
   state.tail = run.then(() => undefined, () => undefined)
-  state.inFlight.set(sourceSessionID, run)
+  state.inFlight.set(queueKey, run)
   pruneIdleStates()
   return run
 }

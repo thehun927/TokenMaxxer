@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { spawn } from "node:child_process"
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
 
 import {
   writeMemoryOnIdle,
+  prepareIdleSource,
   persistAuditGuard,
   persistTerminalTransaction,
   persistModelHealth,
@@ -90,6 +91,27 @@ function sourceMessages(): TranscriptMessage[] {
       parts: [{ type: "text", text: "We will use SDK v2 for structured output." }],
     },
   ]
+}
+
+/** Build the durable completion record expected by the Wave 4 fast path. */
+async function completedSourceRecord(
+  worktree: string,
+  sessionId: string,
+  messages: TranscriptMessage[],
+) {
+  const prepared = await prepareIdleSource({
+    client: { session: { messages: vi.fn(async () => ({ data: messages })) } },
+    worktree,
+    directory: worktree,
+    sessionId,
+  })
+  if (prepared.kind !== "success") throw new Error("source preparation failed")
+  return {
+    source_key: prepared.sourceVersionKey,
+    extraction_key: `v2e:${"b".repeat(64)}`,
+    extraction_contract_version: 2,
+    completed_at: "2026-08-10T00:00:00.000Z",
+  }
 }
 
 async function makeWorktree() {
@@ -968,53 +990,46 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
     expect(processedSources[0]).toMatch(/^v2s:[a-f0-9]{64}$/)
   })
 
-  it("12. revision advances exactly once during that success", async () => {
-    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+  it("12. accepted facts and completion commit share one final revision", async () => {
     const worktree = await makeWorktree()
     const sessionId = "source-idempotent-12"
     const messages = idempotentMessages()
-    const evidenceRef = makeTranscriptEvidenceRef("m2")
-
-    const create = vi.fn(async () => ({ data: { id: `audit-${sessionId}` } }))
-    const prompt = vi.fn(async () => ({
-      data: {
-        info: {
-          structured: {
-            current_task: "LLM task",
-            active_files: [],
-            decisions: [{
-              topic: "transport",
-              decision: "Use SDK v2",
-              evidence_refs: [evidenceRef],
-            }],
-            blockers: [],
-            next_steps: [],
-          },
-        },
-      },
-    }))
-    const v1 = {
-      app: { log: vi.fn() },
-      config: { get: vi.fn(async () => ({ data: { small_model: "provider/model" } })) },
-      session: {
-        messages: vi.fn(async () => ({ data: messages })),
-        create,
-        prompt,
-      },
-    }
-
-    const outcome = await writeMemoryOnIdle({
-      client: v1,
+    const prepared = await prepareIdleSource({
+      client: { session: { messages: vi.fn(async () => ({ data: messages })) } },
       worktree,
       directory: worktree,
       sessionId,
     })
+    expect(prepared.kind).toBe("success")
+    if (prepared.kind !== "success") throw new Error("source preparation failed")
 
-    expect(outcome).toBe("llm-success")
+    const result = await finalLLMMerge(
+      { client: {}, worktree, directory: worktree },
+      {
+        sessionId,
+        gitSha: null,
+        canonicalInput: prepared.canonicalInput,
+        selectedModel: { providerID: "provider", modelID: "model" },
+        selectedCacheKey: `v2e:${"c".repeat(64)}`,
+        llmFacts: {
+          current_task: "LLM task",
+          active_files: [],
+          decisions: [],
+          blockers: [],
+          next_steps: [],
+        } as never,
+        extractionAuditSessionID: "audit-final-12",
+        candidates: prepared.candidates,
+        digests: prepared.digests,
+      },
+    )
 
-    const memory = await readMemory({ worktree, directory: worktree })
-    // revision should be 1 after a successful write (started at 0, advanced once)
-    expect(memory?.revision).toBe(1)
+    expect(result.status).toBe("committed")
+    if (result.status === "committed") {
+      expect(result.revision).toBe(1)
+      expect(result.value.memory.current_task).toBe("LLM task")
+      expect(result.value.memory.processed_sources).toHaveLength(1)
+    }
   })
 
   it("13. same source delivered twice returns outcome cache-hit", async () => {
@@ -1051,6 +1066,7 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
         digest: cachedEvidence.digest,
       }],
     })]
+    prior.processed_sources = [await completedSourceRecord(worktree, sessionId, messages)]
     await writeMemory({ worktree, directory: worktree }, prior)
 
     const create = vi.fn()
@@ -1118,6 +1134,7 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
         digest: cachedEvidence.digest,
       }],
     })]
+    prior.processed_sources = [await completedSourceRecord(worktree, sessionId, messages)]
     await writeMemory({ worktree, directory: worktree }, prior)
 
     const create = vi.fn()
@@ -1186,6 +1203,7 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
         digest: cachedEvidence.digest,
       }],
     })]
+    prior.processed_sources = [await completedSourceRecord(worktree, sessionId, messages)]
     await writeMemory({ worktree, directory: worktree }, prior)
 
     const create = vi.fn()
@@ -1254,6 +1272,7 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
         digest: cachedEvidence.digest,
       }],
     })]
+    prior.processed_sources = [await completedSourceRecord(worktree, sessionId, messages)]
     await writeMemory({ worktree, directory: worktree }, prior)
 
     const create = vi.fn()
@@ -1325,6 +1344,7 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
         digest: cachedEvidence.digest,
       }],
     })]
+    prior.processed_sources = [await completedSourceRecord(worktree, sessionId, messages)]
     await writeMemory({ worktree, directory: worktree }, prior)
 
     const create = vi.fn()
@@ -1368,6 +1388,88 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
     // Revision should be unchanged
     expect(revisionAfterSecond).toBe(revisionAfterFirst)
   })
+
+  it("Wave 4: an exact completed-source delivery is a durable no-op", async () => {
+    vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
+    const worktree = await makeWorktree()
+    const sessionId = "source-wave4-no-op"
+    const messages = idempotentMessages()
+    const preparation = await prepareIdleSource({
+      client: { session: { messages: vi.fn(async () => ({ data: messages })) } },
+      worktree,
+      directory: worktree,
+      sessionId,
+    })
+    expect(preparation.kind).toBe("success")
+    if (preparation.kind !== "success") throw new Error("source preparation failed")
+
+    const prior = emptyMemory(worktree)
+    prior.revision = 17
+    prior.last_updated = "2026-08-11T00:00:00.000Z"
+    prior.last_session_id = "prior-session"
+    prior.current_task = "Durable task that must not be replayed"
+    prior.recent_sessions = ["prior-session"]
+    prior.processed_sources = [{
+      source_key: preparation.sourceVersionKey,
+      extraction_key: `v2e:${"b".repeat(64)}`,
+      extraction_contract_version: 2,
+      completed_at: "2026-08-10T00:00:00.000Z",
+    }]
+    const cachedEvidenceRef = makeTranscriptEvidenceRef("m1")
+    const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[cachedEvidenceRef]!
+    prior.llm_extraction_cache = [makeExtractionCacheEntry({
+      sourceSessionID: sessionId,
+      canonicalInput: buildCanonicalInput(messages, prior),
+      model: { providerID: "provider", modelID: "model" },
+      facts: {
+        current_task: "REPLAYED CACHE FACT",
+        active_files: [],
+        decisions: [],
+        blockers: [],
+        next_steps: [],
+      },
+      auditSessionID: "audit-replay",
+      evidence: [{ kind: "transcript", ref: cachedEvidenceRef, digest: cachedEvidence.digest }],
+    })]
+    await writeMemory({ worktree, directory: worktree }, prior)
+
+    const statePath = join(worktree, ".opencode", "memory", "STATE.json")
+    const before = await readFile(statePath, "utf8")
+    const configGet = vi.fn(async () => ({ data: { small_model: "provider/model" } }))
+    const create = vi.fn()
+    const prompt = vi.fn()
+    const v1 = {
+      app: { log: vi.fn() },
+      config: { get: configGet },
+      session: {
+        messages: vi.fn(async () => ({ data: messages })),
+        create,
+        prompt,
+      },
+    }
+
+    await expect(writeMemoryOnIdle({
+      client: v1,
+      worktree,
+      directory: worktree,
+      sessionId,
+    })).resolves.toBe("cache-hit")
+
+    // The completed-source path must not run heuristic merge or replay any
+    // cache facts, and must not discover a model, create an audit, prompt, or
+    // commit a byte (including revision/last_updated/recent_sessions).
+    expect(configGet).not.toHaveBeenCalled()
+    expect(create).not.toHaveBeenCalled()
+    expect(prompt).not.toHaveBeenCalled()
+    const after = await readFile(statePath, "utf8")
+    expect(after).toBe(before)
+    const memory = await readMemory({ worktree, directory: worktree })
+    expect(memory?.revision).toBe(17)
+    expect(memory?.last_updated).toBe("2026-08-11T00:00:00.000Z")
+    expect(memory?.last_session_id).toBe("prior-session")
+    expect(memory?.current_task).toBe("Durable task that must not be replayed")
+    expect(memory?.recent_sessions).toEqual(["prior-session"])
+  })
 })
 
 // ─── PR 5 §Wave 1B — advanced idempotency (§18.B items 18-25) ────────────────────
@@ -1403,7 +1505,7 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
     sessionId: string,
     messages: TranscriptMessage[],
   ): Promise<{ model: { providerID: string; modelID: string }; evidenceRef: string }> {
-    const prior = emptyMemory(worktree)
+    const prior = (await readMemory({ worktree, directory: worktree })) ?? emptyMemory(worktree)
     const model = { providerID: "provider", modelID: "model" }
     const evidenceRef = makeTranscriptEvidenceRef("m2")
     const cachedFacts = {
@@ -1717,13 +1819,7 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
     const messages = advancedMessages()
     const evidenceRef = makeTranscriptEvidenceRef("m2")
 
-    // First prompt fails twice
-    const prompt1 = vi.fn()
-      .mockResolvedValueOnce({ data: { info: { structured: { invalid: true } } } })
-      .mockRejectedValueOnce(new Error("provider unavailable"))
-
-    // Second prompt succeeds
-    const prompt2 = vi.fn(async () => ({
+    const successfulResponse = {
       data: {
         info: {
           structured: {
@@ -1739,14 +1835,14 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
           },
         },
       },
-    }))
+    }
 
-    let promptIndex = 0
-    const prompt = vi.fn(async () => {
-      promptIndex++
-      if (promptIndex === 1) return prompt1()
-      return prompt2()
-    })
+    // The first delivery exhausts both retries. The next response is reserved
+    // for the second delivery, proving a failed source remains retryable.
+    const prompt = vi.fn()
+      .mockResolvedValueOnce({ data: { info: { structured: { invalid: true } } } })
+      .mockRejectedValueOnce(new Error("provider unavailable"))
+      .mockResolvedValueOnce(successfulResponse)
 
     const v1 = {
       app: { log: vi.fn() },
@@ -1768,7 +1864,6 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
     expect(outcome1).toBe("llm-failed")
 
     // Reset for second call
-    promptIndex = 0
     prompt.mockClear()
 
     // Second call - should succeed (no cache-hit short-circuit)
@@ -1866,7 +1961,7 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
     expect(processedSources).toHaveLength(2)
   })
 
-  it("25. size-cap-edge marker preservation: either llm-success+marker or write-failed+unchanged", async () => {
+  it("25. exact duplicate preserves the completed-source marker", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
     const worktree = await makeWorktree()
     const sessionId = "source-advanced-25"
@@ -1909,35 +2004,23 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
     })
     expect(outcome1).toBe("llm-success")
 
-    // Read the memory and read the file size
+    // The successful completion must leave its marker durably present.
     const memory1 = await readMemory({ worktree, directory: worktree })
     const processedSources1 = (memory1 as any).processed_sources
     expect(processedSources1).toHaveLength(1)
 
-    // Second call - this tests the size-cap-edge behavior
+    // An exact duplicate is a no-op, not a second successful extraction.
     const outcome2 = await writeMemoryOnIdle({
       client: v1,
       worktree,
       directory: worktree,
       sessionId,
     })
-
-    if (outcome2 === "llm-success") {
-      // If successful, the new processed_sources record must survive
-      const memory2 = await readMemory({ worktree, directory: worktree })
-      const processedSources2 = (memory2 as any).processed_sources
-      expect(processedSources2).toBeDefined()
-      expect(processedSources2).toHaveLength(2)
-    } else if (outcome2 === "write-failed") {
-      // If refused, the prior STATE must be byte-for-byte unchanged
-      const memory2 = await readMemory({ worktree, directory: worktree })
-      const processedSources2 = (memory2 as any).processed_sources
-      expect(processedSources2).toBeDefined()
-      expect(processedSources2).toHaveLength(1)
-    } else {
-      // Any other outcome is a bug
-      throw new Error(`Unexpected outcome: ${outcome2}`)
-    }
+    expect(outcome2).toBe("cache-hit")
+    const memory2 = await readMemory({ worktree, directory: worktree })
+    expect((memory2 as any).processed_sources).toHaveLength(1)
+    expect(create).toHaveBeenCalledTimes(1)
+    expect(prompt).toHaveBeenCalledTimes(1)
   })
 })
 

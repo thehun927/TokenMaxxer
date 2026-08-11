@@ -17,7 +17,8 @@ import { tmpdir } from "node:os"
 import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { atomicWrite } from "../../src/util/fs"
-import { resetProjectQueues } from "../../src/memory/lock"
+import * as lockModule from "../../src/memory/lock"
+import { getProjectQueueStatus, resetProjectQueues } from "../../src/memory/lock"
 
 const fixturesDir = join(__dirname, "..", "fixtures", "transcripts")
 
@@ -613,6 +614,14 @@ async function waitFor(path: string, timeoutMs = 5000): Promise<void> {
   }
 }
 
+async function waitForCondition(condition: () => boolean, timeoutMs = 5000): Promise<void> {
+  const start = Date.now()
+  while (!condition()) {
+    if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition")
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
+}
+
 function runLockWorker(args: string[]): Promise<{ code: number }> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["--import", "tsx", LOCK_WORKER, ...args], {
@@ -826,32 +835,53 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
     const project = await worktree()
     const barrier = join(tmpdir(), `tokenmaxxer-barrier-${Date.now()}-${Math.random()}`)
     const client = clientFor({ source: messages() })
+    const enqueue = vi.spyOn(lockModule, "enqueueProjectJob")
 
-    // First call starts and holds the lock behind a barrier
+    // Hold the real project lock before either idle call can enter its
+    // transaction. This keeps the first queued job in flight while the second
+    // call prepares the identical source version.
     const child1 = runLockWorker([project, "barrier-write", barrier])
     await waitFor(barrier)
 
-    // Second call runs concurrently (should wait for the lock)
+    const firstCall = writeMemoryOnIdle({
+      client,
+      worktree: project,
+      directory: project,
+      sessionId: "source",
+    })
+    await waitForCondition(() => enqueue.mock.calls.length === 1)
+
     const secondCall = writeMemoryOnIdle({
       client,
       worktree: project,
       directory: project,
       sessionId: "source",
     })
+    await waitForCondition(() => enqueue.mock.calls.length === 2)
+    expect(enqueue.mock.calls[0]?.[1]).toBe(enqueue.mock.calls[1]?.[1])
+    expect(enqueue.mock.results[0]?.value).toBe(enqueue.mock.results[1]?.value)
 
     // Release the first call
     await writeFile(`${barrier}.release`, "go", "utf-8")
-    await child1
+    expect((await child1).code).toBe(0)
 
-    // Both calls should complete, but only one prompt should be sent
-    const outcome = await secondCall
-    expect(outcome).toBe("heuristic-only")
+    const [outcome1, outcome2] = await Promise.all([firstCall, secondCall])
+    expect(outcome1).toBe("heuristic-only")
+    expect(outcome2).toBe("heuristic-only")
+    const memory = await readMemory({ worktree: project, directory: project })
+    expect(memory?.revision).toBe(1)
   })
 
   it("27. two concurrent same-session different-source versions become two serialized jobs", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
     const project = await worktree()
     const barrier = join(tmpdir(), `tokenmaxxer-barrier-${Date.now()}`)
+    const enqueue = vi.spyOn(lockModule, "enqueueProjectJob")
+
+    // Hold the lock before the first queued job starts so the second prepared
+    // source is guaranteed to contend with, rather than follow, the first.
+    const child1 = runLockWorker([project, "barrier-write", barrier])
+    await waitFor(barrier)
 
     // First call with original source
     const client1 = clientFor({ source: messages() })
@@ -862,12 +892,7 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
       sessionId: "source",
     })
 
-    // Hold the lock for the first call
-    const child1 = runLockWorker([project, "barrier-write", barrier])
-    await waitFor(barrier)
-
     // Second call with appended source (different source version, same session)
-    // This call will wait for the lock
     const client2 = clientFor({ source: [...messages(), {
       info: { id: "m3", role: "user" },
       parts: [{ type: "text", text: "Appended message." }],
@@ -878,10 +903,13 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
       directory: project,
       sessionId: "source",
     })
+    await waitForCondition(() => enqueue.mock.calls.length === 2)
+    expect(enqueue.mock.calls[0]?.[1]).not.toBe(enqueue.mock.calls[1]?.[1])
+    expect(enqueue.mock.results[0]?.value).not.toBe(enqueue.mock.results[1]?.value)
 
     // Release the first call - this allows the second call to proceed
     await writeFile(`${barrier}.release`, "go", "utf-8")
-    await child1
+    expect((await child1).code).toBe(0)
 
     // Now wait for the second call to complete
     const [outcome1, outcome2] = await Promise.all([call1, call2])
@@ -900,6 +928,10 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
     const project = await worktree()
     const barrier = join(tmpdir(), `tokenmaxxer-barrier-${Date.now()}`)
+    const enqueue = vi.spyOn(lockModule, "enqueueProjectJob")
+
+    const child = runLockWorker([project, "barrier-write", barrier])
+    await waitFor(barrier)
 
     // First call with original source
     const client1 = clientFor({ source: messages() })
@@ -910,14 +942,10 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
       sessionId: "source",
     })
 
-    // Hold the lock
-    const child = runLockWorker([project, "barrier-write", barrier])
-    await waitFor(barrier)
-
     // Second call with appended source
     const client2 = clientFor({ source: [...messages(), {
-      info: { id: "m3", role: "user" },
-      parts: [{ type: "text", text: "Appended message for version 2." }],
+      info: { id: "m3", role: "assistant" },
+      parts: [{ type: "text", text: "Decision use Redis for version 2." }],
     }]})
     const call2 = writeMemoryOnIdle({
       client: client2,
@@ -925,10 +953,12 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
       directory: project,
       sessionId: "source",
     })
+    await waitForCondition(() => enqueue.mock.calls.length === 2)
+    expect(enqueue.mock.calls[0]?.[1]).not.toBe(enqueue.mock.calls[1]?.[1])
 
     // Release and complete
     await writeFile(`${barrier}.release`, "go", "utf-8")
-    await child
+    expect((await child).code).toBe(0)
 
     const [outcome1, outcome2] = await Promise.all([call1, call2])
 
@@ -939,12 +969,17 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
     const memory = await readMemory({ worktree: project, directory: project })
     expect(memory).not.toBeNull()
     expect(memory!.revision).toBe(2)
+    expect(memory!.decisions.some((decision) => /Redis/.test(decision.decision))).toBe(true)
   })
 
   it("29. different source sessions in one project remain serialized by project queue", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
     const project = await worktree()
     const barrier = join(tmpdir(), `tokenmaxxer-barrier-${Date.now()}`)
+    const enqueue = vi.spyOn(lockModule, "enqueueProjectJob")
+
+    const child = runLockWorker([project, "barrier-write", barrier])
+    await waitFor(barrier)
 
     // First call with session "source-a"
     const client1 = clientFor({ "source-a": messages() })
@@ -955,10 +990,6 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
       sessionId: "source-a",
     })
 
-    // Hold the lock
-    const child = runLockWorker([project, "barrier-write", barrier])
-    await waitFor(barrier)
-
     // Second call with session "source-b" (different session, same project)
     const client2 = clientFor({ "source-b": messages() })
     const call2 = writeMemoryOnIdle({
@@ -967,10 +998,14 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
       directory: project,
       sessionId: "source-b",
     })
+    await waitForCondition(() => enqueue.mock.calls.length === 2)
+    expect(enqueue.mock.calls[0]?.[0]).toBe(project)
+    expect(enqueue.mock.calls[1]?.[0]).toBe(project)
+    expect(enqueue.mock.calls[0]?.[1]).not.toBe(enqueue.mock.calls[1]?.[1])
 
     // Release and complete
     await writeFile(`${barrier}.release`, "go", "utf-8")
-    await child
+    expect((await child).code).toBe(0)
 
     const [outcome1, outcome2] = await Promise.all([call1, call2])
 
@@ -988,6 +1023,7 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
     const project1 = await worktree()
     const project2 = await worktree()
+    const enqueue = vi.spyOn(lockModule, "enqueueProjectJob")
 
     // First call in project 1
     const client1 = clientFor({ "source-1": messages() })
@@ -1020,12 +1056,19 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
     expect(memory2).not.toBeNull()
     expect(memory1!.last_session_id).toBe("source-1")
     expect(memory2!.last_session_id).toBe("source-2")
+    expect(enqueue.mock.calls.map(([queuedProject]) => queuedProject)).toEqual(
+      expect.arrayContaining([project1, project2]),
+    )
   })
 
   it("31. queue diagnostics return to depth/in-flight zero after jobs finish", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "0")
     const project = await worktree()
     const barrier = join(tmpdir(), `tokenmaxxer-barrier-${Date.now()}`)
+    const enqueue = vi.spyOn(lockModule, "enqueueProjectJob")
+
+    const child = runLockWorker([project, "barrier-write", barrier])
+    await waitFor(barrier)
 
     // First call
     const client1 = clientFor({ "source-1": messages() })
@@ -1036,10 +1079,6 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
       sessionId: "source-1",
     })
 
-    // Hold the lock
-    const child = runLockWorker([project, "barrier-write", barrier])
-    await waitFor(barrier)
-
     // Second call
     const client2 = clientFor({ "source-2": messages() })
     const call2 = writeMemoryOnIdle({
@@ -1048,18 +1087,22 @@ describe("PR 5 §Wave 1B-sub4 — concurrent source-version queue", () => {
       directory: project,
       sessionId: "source-2",
     })
+    await waitForCondition(() => enqueue.mock.calls.length === 2)
 
     // Release and complete
     await writeFile(`${barrier}.release`, "go", "utf-8")
-    await child
+    expect((await child).code).toBe(0)
 
     const [outcome1, outcome2] = await Promise.all([call1, call2])
 
     expect(outcome1).toBe("heuristic-only")
     expect(outcome2).toBe("heuristic-only")
 
-    // After both jobs finish, queue diagnostics should be clean
-    // (This is verified by the test completing without hanging)
+    // After both jobs finish, queue diagnostics must be clean.
+    const status = getProjectQueueStatus(project)
+    expect(status.queueDepth).toBe(0)
+    expect(status.inFlight).toBe(0)
+    expect(status.active).toBe(0)
     const memory = await readMemory({ worktree: project, directory: project })
     expect(memory).not.toBeNull()
     expect(memory!.revision).toBe(2)

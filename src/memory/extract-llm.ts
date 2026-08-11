@@ -577,6 +577,8 @@ export type AuditTerminalCallback = (
 ) => void | Promise<void>
 
 export interface ExtractFactsLLMOptions {
+  /** Optional bounded source version identity for in-flight coalescing. */
+  sourceVersionKey?: string;
   /** Project directory required by every v1 request. */
   directory?: string
   /** Stable resolved project key for process-local in-flight coalescing. */
@@ -818,7 +820,7 @@ export async function extractFactsLLM(
   if (options?.cachedFacts) return options.cachedFacts
 
   const projectKey = options?.projectKey ?? options?.directory ?? projectName
-  const inFlightKey = `${projectKey}\u0000${sourceSessionID}`
+  const inFlightKey = `${projectKey}\u0000${options?.sourceVersionKey ?? sourceSessionID}`
   const existing = extractionInFlight.get(inFlightKey)
   if (existing) return existing
 

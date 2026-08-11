@@ -12,6 +12,7 @@ import type {
   ProcessedSource,
 } from "./schema"
 import { MAX_PROCESSED_SOURCES, ProcessedSourceSchema } from "./schema"
+import { findProcessedSource } from "./source-processing"
 import type { ExtractedFacts, TranscriptMessage } from "../types"
 import { mergeDecisions } from "./merge"
 import { readMemoryState, emptyMemory, resolveProjectPath, mutateMemory } from "./store"
@@ -24,8 +25,11 @@ import { basename, join } from "node:path"
 import {
   buildCanonicalInput,
   buildTranscriptEvidenceCandidateMap,
+  buildExtractionSourceInput,
   stableJson,
   sha256Hex,
+  makeSourceVersionKey,
+  EXTRACTION_CONTRACT_VERSION,
 } from "./extract-prompt"
 import {
   extractFactsLLM,
@@ -201,12 +205,29 @@ function firstCandidateEvidence(candidates: EvidenceCandidateMap): Evidence[] {
 
 export type IdleWriteOutcome =
   | "no-messages"
+  | "error"
   | "heuristic-only"
   | "cache-hit"
   | "llm-success"
   | "llm-failed"
   | "write-failed"
   | "queue-failed"
+
+/** Result of preparing an idle source (before queue serialization). */
+export type PreparedIdleSource =
+  | {
+      kind: "success"
+      allMessages: TranscriptMessage[]
+      windowMessages: TranscriptMessage[]
+      canonicalInput: CanonicalExtractionInput
+      sourceVersionKey: string
+      promptInputSha256: string
+      sourceInputSha256: string
+      candidates: EvidenceCandidateMap
+      digests: Readonly<Record<string, string>>
+    }
+  | { kind: "no-messages" }
+  | { kind: "error"; reason: string }
 
 type IdleWriteOptions = {
   client: unknown
@@ -218,283 +239,336 @@ type IdleWriteOptions = {
 }
 
 /**
+ * Prepare source data for idle processing without mutating STATE.
+ * Returns a prepared source object or a typed failure.
+ * This runs BEFORE enqueueing to avoid holding locks across I/O.
+ */
+export async function prepareIdleSource(
+  opts: IdleWriteOptions,
+): Promise<PreparedIdleSource> {
+  const { client, worktree, directory, sessionId } = opts
+  const c = client as {
+    session?: {
+      messages: (args: { path: { id: string } }) => Promise<{ data?: TranscriptMessage[] }>
+    }
+  }
+  if (!c.session?.messages) {
+    // Missing session.messages endpoint → no-messages (Wave 1B test 39)
+    return { kind: "no-messages" }
+  }
+
+  let result
+  try {
+    result = await c.session.messages({ path: { id: sessionId } })
+  } catch {
+    // session.messages throws → error (Wave 1B test 41)
+    return { kind: "error", reason: "session.messages threw" }
+  }
+  const allMessages = result.data
+  if (!allMessages || allMessages.length === 0) {
+    return { kind: "no-messages" }
+  }
+
+  // Derive window messages for heuristic extraction (bounded window)
+  const windowMessages = allMessages.slice(-TRANSCRIPT_WINDOW)
+
+  // Build source identity fields using the contractually correct helper (§3.1-3.2)
+  const sourceInput = buildExtractionSourceInput(allMessages)
+  const sourceInputSha256 = sourceInput.sourceInputSha256
+
+  const sourceVersionKey = makeSourceVersionKey({
+    sourceSessionID: sessionId,
+    sourceInputSha256,
+    extractionContractVersion: EXTRACTION_CONTRACT_VERSION,
+  })
+
+  // Build canonical input for the LLM prompt
+  const existingState = await readMemoryState({ worktree, directory })
+  if (existingState.status === "unavailable") {
+    // Preparation-time readMemoryState unavailable → typed write-failed (not error)
+    return { kind: "error", reason: "memory read failed" }
+  }
+  const existing = existingState.memory ?? emptyMemory(worktree)
+  const canonicalPrior = { ...existing, llm_extraction_audits: undefined, revision: 0 }
+  const canonicalInput = buildCanonicalInput(windowMessages, canonicalPrior)
+
+  const candidates = mergeEvidenceCandidateMaps(
+    transcriptCandidateMap(windowMessages),
+    buildHeuristicEvidenceCandidateMap(extractFactsHeuristic(windowMessages)),
+  )
+  const digests = evidenceDigestMap(candidates)
+
+  return {
+    kind: "success",
+    allMessages,
+    windowMessages,
+    canonicalInput,
+    sourceVersionKey,
+    promptInputSha256: canonicalInput.promptInputSha256,
+    sourceInputSha256,
+    candidates,
+    digests,
+  }
+}
+
+/**
+ * Process a prepared idle source through the heuristic/optional-LLM lifecycle.
+ * This runs INSIDE the queue serialization.
+ */
+async function processPreparedIdleSource(
+  opts: IdleWriteOptions,
+  prepared: Awaited<ReturnType<typeof prepareIdleSource>>,
+): Promise<IdleWriteOutcome> {
+  if (prepared.kind === "no-messages" || prepared.kind === "error") {
+    return prepared.kind
+  }
+
+  const { client, worktree, directory, sessionId } = opts
+  const project = resolveProjectPath(worktree, directory)
+  const gitSha = await getCurrentGitSha(worktree)
+  const { allMessages, windowMessages, canonicalInput, sourceVersionKey, candidates, digests } = prepared
+
+  // Read authoritative state under lock for the heuristic transaction
+  const existingState = await readMemoryState({ worktree, directory })
+  if (existingState.status === "unavailable") {
+    void log(client, "warn", "memory read failed; refusing to mutate", { project })
+    return "write-failed"
+  }
+  const existing = existingState.memory ?? emptyMemory(project)
+
+  // Wave 4: Check for completed source BEFORE heuristic mutation (§9.1)
+  const completed = findProcessedSource(existing, sourceVersionKey)
+  if (completed) {
+    // Wave 4: Completed-source fast path
+    // Source was already processed by another concurrent request.
+    // Return "cache-hit" with no heuristic merge, no audit, no prompt, no cache re-merge,
+    // no STATE commit, no revision bump.
+    return "cache-hit"
+  }
+
+  // Heuristic transaction (PR 2 §11.A): one short lock-protected mutation.
+  const extracted = extractFactsHeuristic(windowMessages)
+  const heuristicResult = await mutateMemory<{ outcome: IdleWriteOutcome; memory: MemoryFile }>(
+    { worktree, directory, client, lockOptions: opts.lockOptions },
+    (base) => {
+      const referenced = markReferencedDecisions(base, windowMessages, sessionId)
+      const merged = mergeMemory(referenced, extracted, {
+        sessionId,
+        gitSha,
+        timestamp: new Date().toISOString(),
+        origin: "heuristic",
+        evidenceCandidates: candidates,
+      })
+      const heuristicMemory = pruneOld(recordRecentSession(merged, sessionId), client)
+      return {
+        kind: "commit",
+        memory: heuristicMemory,
+        value: { outcome: "heuristic-only", memory: heuristicMemory },
+      }
+    },
+  )
+
+  if (heuristicResult.status === "lock-timeout") {
+    void log(client, "warn", "heuristic transaction lock-timeout", { project })
+    return "write-failed"
+  }
+  if (heuristicResult.status === "unavailable") {
+    void log(client, "warn", "heuristic transaction unavailable", { project })
+    return "write-failed"
+  }
+  if (heuristicResult.status === "commit-failed") {
+    void log(client, "warn", "heuristic transaction commit-failed", { project })
+    return "write-failed"
+  }
+
+  const heuristicMemory = heuristicResult.value.memory
+  await writeHeaderBestEffort(client, worktree, directory, heuristicMemory)
+
+  // Wave 4: Second completion check after heuristic transaction (§9.3)
+  // Re-read authoritative state and check if source was already completed
+  const afterHeuristicState = await readMemoryState({ worktree, directory })
+  if (afterHeuristicState.status === "unavailable") {
+    void log(client, "warn", "memory read failed after heuristic", { project })
+    return "write-failed"
+  }
+  const afterHeuristic = afterHeuristicState.memory ?? heuristicMemory
+  const completedAfterHeuristic = findProcessedSource(afterHeuristic, sourceVersionKey)
+  if (completedAfterHeuristic) {
+    // Wave 4: Completed-source fast path
+    // Source was already processed by another concurrent request.
+    // Return "cache-hit" with no heuristic merge, no audit, no prompt, no cache re-merge,
+    // no STATE commit, no revision bump.
+    return "cache-hit"
+  }
+
+  // Continue with optional LLM path...
+  if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
+    void log(client, "debug", "llm extraction skipped: TOKENMAXXER_LLM_EXTRACT is disabled", {
+      reason: "TOKENMAXXER_LLM_EXTRACT is disabled",
+    })
+    return "heuristic-only"
+  }
+
+  // Use gated config for current-contract cache lookup (ignoreHealth: true)
+  const cacheConfig = await getLLMConfig(client, directory, { ignoreHealth: true })
+  if (!cacheConfig.model) {
+    void log(client, "info", "llm extraction skipped: model unavailable", {
+      reason: boundedDiagnosticValue(cacheConfig.reason ?? "model resolution returned no model"),
+    })
+    return "heuristic-only"
+  }
+  void log(client, "info", "llm extraction model resolved", {
+    provider: boundedDiagnosticValue(cacheConfig.model.providerID),
+    model: boundedDiagnosticValue(cacheConfig.model.modelID),
+  })
+
+  const selectedModel = cacheConfig.model
+  const selectedCacheKey = extractionCacheKey(sessionId, canonicalInput, selectedModel)
+
+  // Check cache before prompting
+  const cachedEntry = readExtractionCacheEntry(afterHeuristic, selectedCacheKey, {
+    evidenceCandidateMap: candidates,
+    evidenceDigestMap: digests,
+  })
+  if (cachedEntry) {
+    void log(client, "debug", "llm extraction cache hit")
+    const merged = await mergeAsyncFacts(opts, cachedEntry.facts, gitSha, sessionId, {
+      origin: "llm",
+      auditSessionID: cachedEntry.provenance?.source_audit_session_id,
+      evidenceCandidates: candidates,
+      provenanceEvidence: cachedEntry.provenance?.evidence,
+    })
+    if (!merged) return "llm-failed"
+    void log(client, "info", "llm extraction facts merged")
+    return "cache-hit"
+  }
+
+  // Use gated config before starting a new LLM extraction (PR4 host/cooldown gate)
+  const gatedConfig = await getLLMConfig(client, directory, { memory: afterHeuristic })
+  if (!gatedConfig.model) {
+    void log(client, "info", "llm extraction skipped: gated model unavailable", {
+      reason: boundedDiagnosticValue(gatedConfig.reason ?? "gated model resolution returned no model"),
+    })
+    return "heuristic-only"
+  }
+  void log(client, "info", "llm extraction gated model resolved", {
+    provider: boundedDiagnosticValue(gatedConfig.model.providerID),
+    model: boundedDiagnosticValue(gatedConfig.model.modelID),
+  })
+
+  // Continue with LLM extraction...
+  const projectName = basename(project) || project
+  let extractionAuditSessionID: string | undefined
+  const persistAudit: AuditCreatedCallback = async (audit) => {
+    extractionAuditSessionID = audit.audit_session_id
+    return persistAuditGuard({ client, worktree, directory }, audit)
+  }
+  const persistTerminal = async (
+    auditSessionID: string,
+    outcome: Exclude<AuditTerminalOutcome, "pending">,
+  ): Promise<void> => {
+    await persistTerminalTransaction({ client, worktree, directory }, auditSessionID, outcome)
+  }
+
+  void log(client, "debug", "llm extraction audit session requested")
+  const llmFacts = await extractFactsLLM(
+    canonicalInput,
+    sessionId,
+    projectName,
+    client,
+    gatedConfig,
+    {
+      directory,
+      projectKey: project,
+      sourceVersionKey,
+      evidenceCandidateMap: candidates,
+      evidenceDigestMap: digests,
+      onDiagnostic: (diagnostic) => logLLMDiagnostic(client, diagnostic),
+      onAuditCreated: persistAudit,
+      onAuditTerminal: persistTerminal,
+      onHealthOutcome: async (report) => {
+        await persistModelHealth({ client, worktree, directory }, report)
+      },
+    },
+  )
+  if (!llmFacts) {
+    void log(client, "warn", "llm extraction returned no facts")
+    return "llm-failed"
+  }
+
+  const finalResult = await finalLLMMerge(
+    { client, worktree, directory },
+    {
+      sessionId,
+      gitSha,
+      canonicalInput,
+      selectedModel,
+      selectedCacheKey,
+      llmFacts,
+      extractionAuditSessionID,
+      candidates,
+      digests,
+    },
+  )
+  if (finalResult.status === "lock-timeout") {
+    void log(client, "warn", "final llm transaction lock-timeout", { project })
+    return "llm-failed"
+  }
+  if (finalResult.status === "unavailable") {
+    void log(client, "warn", "final llm transaction unavailable", { project })
+    return "llm-failed"
+  }
+  if (finalResult.status === "commit-failed") {
+    void log(client, "warn", "final llm transaction commit-failed", { project })
+    return "llm-failed"
+  }
+  const finalMemory = finalResult.value.memory
+  await writeHeaderBestEffort(client, worktree, directory, finalMemory)
+  void log(client, "info", "llm extraction facts merged")
+  return "llm-success"
+}
+
+/**
  * Main entry point called from session.idle.  The queue is deliberately at
  * this public boundary so direct callers cannot accidentally bypass the
  * project/source serialization contract.
+ *
+ * Wave 4: The queue key is the source-version key (idle:<sourceVersionKey>),
+ * not just the session ID. This coalesces same-source requests while allowing
+ * different sources from the same session to proceed independently.
  */
 export async function writeMemoryOnIdle(opts: IdleWriteOptions): Promise<IdleWriteOutcome> {
   const project = resolveProjectPath(opts.worktree, opts.directory)
   const stopActivity = beginMemoryActivity(project)
+
+  // Wave 4: Prepare source BEFORE enqueueing to avoid holding locks across I/O
+  // Wrap preparation and pre-queue terminal handling in try/finally to ensure cleanup
+  let outcome: IdleWriteOutcome
   try {
-    const outcome = await enqueueProjectJob(
-      project,
-      opts.sessionId,
-      () => writeMemoryOnIdleSerialized(opts),
-    )
-    setProjectQueueOutcome(project, outcome)
-    return outcome
+    const prepared = await prepareIdleSource(opts)
+    if (prepared.kind === "no-messages") {
+      setProjectQueueOutcome(project, "no-messages")
+      outcome = "no-messages"
+    } else if (prepared.kind === "error") {
+      setProjectQueueOutcome(project, "error")
+      outcome = "error"
+    } else {
+      // Queue key is the source-version key, not just session ID
+      const queueKey = `idle:${prepared.sourceVersionKey}`
+      outcome = await enqueueProjectJob(
+        project,
+        queueKey,
+        () => processPreparedIdleSource(opts, prepared),
+      )
+      setProjectQueueOutcome(project, outcome)
+    }
   } catch {
     setProjectQueueOutcome(project, "queue-failed")
-    return "queue-failed"
+    outcome = "queue-failed"
   } finally {
     stopActivity()
   }
-}
-
-/** The serialized transaction; heuristic persistence always precedes LLM work. */
-async function writeMemoryOnIdleSerialized(opts: IdleWriteOptions): Promise<IdleWriteOutcome> {
-  try {
-    const { client, worktree, directory, sessionId } = opts
-    const project = resolveProjectPath(worktree, directory)
-
-    const c = client as {
-      session?: {
-        messages: (args: { path: { id: string } }) => Promise<{ data?: TranscriptMessage[] }>
-      }
-    }
-    if (!c.session?.messages) return "no-messages"
-
-    const result = await c.session.messages({ path: { id: sessionId } })
-    const allMessages = result.data
-    if (!allMessages || allMessages.length === 0) return "no-messages"
-
-    const messages = allMessages.slice(-TRANSCRIPT_WINDOW)
-    // Fail closed on an unreadable STATE: an "unavailable" base must never be
-    // treated as permission to initialize empty memory (that would silently
-    // destroy durable facts on the next atomic rename).
-    const existingState = await readMemoryState({ worktree, directory })
-    if (existingState.status === "unavailable") {
-      void log(client, "warn", "memory read failed; refusing to mutate", { project })
-      return "write-failed"
-    }
-    const existing = existingState.memory ?? emptyMemory(project)
-    // Operational audit guards, like the result cache itself, must not change
-    // the identity of the same source transcript on a later idle/reload.
-    // `revision` is storage-freshness metadata, not semantic state: it bumps
-    // on every heuristic write, so normalizing it out of the fingerprint keeps
-    // the LLM cache stable across mutations that did not change the meaning of
-    // the prior state.
-    //
-    // This pre-lock snapshot feeds ONLY the LLM cache fingerprint below (the
-    // LLM lifecycle is Wave 4). It is never the merge authority: the heuristic
-    // transaction re-reads the authoritative STATE under the lock (PR 2 §11.A).
-    const canonicalPrior = { ...existing, llm_extraction_audits: undefined, revision: 0 }
-    const canonicalInput = buildCanonicalInput(messages, canonicalPrior)
-    const gitSha = await getCurrentGitSha(worktree)
-    const extracted = extractFactsHeuristic(messages)
-    const candidates = mergeEvidenceCandidateMaps(
-      transcriptCandidateMap(messages),
-      buildHeuristicEvidenceCandidateMap(extracted),
-    )
-    const digests = evidenceDigestMap(candidates)
-
-    // Heuristic transaction (PR 2 §11.A): one short lock-protected mutation.
-    // The authoritative base is read under the lock; the pre-lock `existing`
-    // snapshot above feeds only the LLM cache fingerprint, never the merge.
-    const heuristicResult = await mutateMemory<{ outcome: IdleWriteOutcome; memory: MemoryFile }>(
-      { worktree, directory, client, lockOptions: opts.lockOptions },
-      (base) => {
-        const referenced = markReferencedDecisions(base, allMessages, sessionId)
-        const merged = mergeMemory(referenced, extracted, {
-          sessionId,
-          gitSha,
-          timestamp: new Date().toISOString(),
-          origin: "heuristic",
-          evidenceCandidates: candidates,
-        })
-        const heuristicMemory = pruneOld(recordRecentSession(merged, sessionId), client)
-        return {
-          kind: "commit",
-          memory: heuristicMemory,
-          value: { outcome: "heuristic-only", memory: heuristicMemory },
-        }
-      },
-    )
-
-    // Map the transaction result to the existing IdleWriteOutcome taxonomy
-    // (PR 2 §13). A no-op mutation (not produced by the heuristic path today)
-    // must not change the observable outcome, so it maps to "heuristic-only".
-    if (heuristicResult.status === "lock-timeout") {
-      void log(client, "warn", "heuristic transaction lock-timeout", { project: resolveProjectPath(worktree, directory) })
-      return "write-failed"
-    }
-    if (heuristicResult.status === "unavailable") {
-      void log(client, "warn", "heuristic transaction unavailable", { project: resolveProjectPath(worktree, directory) })
-      return "write-failed"
-    }
-    if (heuristicResult.status === "commit-failed") {
-      void log(client, "warn", "heuristic transaction commit-failed", { project: resolveProjectPath(worktree, directory) })
-      return "write-failed"
-    }
-    // heuristicResult.status === "committed" | "noop"
-    const heuristicMemory = heuristicResult.value.memory
-    await writeHeaderBestEffort(client, worktree, directory, heuristicMemory)
-
-    if (process.env.TOKENMAXXER_LLM_EXTRACT !== "1") {
-      void log(client, "debug", "llm extraction skipped: TOKENMAXXER_LLM_EXTRACT is disabled", {
-        reason: "TOKENMAXXER_LLM_EXTRACT is disabled",
-      })
-      return "heuristic-only"
-    }
-
-    // Resolve once without the health gate so an already accepted cache row can
-    // still be used for a model whose last real attempt failed.  No prompt or
-    // audit session is created by this lookup.
-    const cacheConfig = await getLLMConfig(client, directory, { ignoreHealth: true })
-    if (!cacheConfig.model) {
-      void log(client, "info", "llm extraction skipped: model unavailable", {
-        reason: boundedDiagnosticValue(cacheConfig.reason ?? "model resolution returned no model"),
-      })
-      return "heuristic-only"
-    }
-    void log(client, "info", "llm extraction model resolved", {
-      provider: boundedDiagnosticValue(cacheConfig.model.providerID),
-      model: boundedDiagnosticValue(cacheConfig.model.modelID),
-    })
-
-    // This is the first cache check under the project queue, immediately
-    // before any retained audit session or prompt can be created.
-    const cacheKey = extractionCacheKey(sessionId, canonicalInput, cacheConfig.model)
-    // Heuristic facts were already persisted above, but the authoritative
-    // state is now unreadable, so no cache check or LLM step may build on it.
-    // Stop at the heuristic-only boundary (matching the catch-all outcome).
-    const afterHeuristicState = await readMemoryState({ worktree, directory })
-    if (afterHeuristicState.status === "unavailable") {
-      void log(client, "warn", "memory read failed; refusing cache/LLM merge", { project })
-      return "heuristic-only"
-    }
-    const afterHeuristic = afterHeuristicState.memory ?? heuristicMemory
-    const cachedEntry = readExtractionCacheEntry(afterHeuristic, cacheKey, {
-      evidenceCandidateMap: candidates,
-      evidenceDigestMap: digests,
-    })
-    if (cachedEntry) {
-      void log(client, "debug", "llm extraction cache hit")
-      const merged = await mergeAsyncFacts(opts, cachedEntry.facts, gitSha, sessionId, {
-        origin: "llm",
-        auditSessionID: cachedEntry.provenance?.source_audit_session_id,
-        evidenceCandidates: candidates,
-        provenanceEvidence: cachedEntry.provenance?.evidence,
-      })
-      if (!merged) return "llm-failed"
-      void log(client, "info", "llm extraction facts merged")
-      return "cache-hit"
-    }
-
-    // A cache miss must honor the circuit breaker.  Explicit models remain
-    // terminal here: the health gate never substitutes an automatic model.
-    const llmConfig = await getLLMConfig(client, directory, { memory: afterHeuristic })
-    if (!llmConfig.enabled || !llmConfig.model) {
-      void log(client, "info", "llm extraction skipped: model unavailable", {
-        reason: boundedDiagnosticValue(llmConfig.reason ?? "model resolution returned no model"),
-      })
-      return "heuristic-only"
-    }
-    // Narrowed reference so the final-merge transaction closure can use the
-    // resolved model without re-narrowing a mutable binding.
-    const selectedModel = llmConfig.model
-    const selectedCacheKey = extractionCacheKey(sessionId, canonicalInput, selectedModel)
-    if (selectedCacheKey !== cacheKey) {
-      const selectedCachedEntry = readExtractionCacheEntry(afterHeuristic, selectedCacheKey, {
-        evidenceCandidateMap: candidates,
-        evidenceDigestMap: digests,
-      })
-      if (selectedCachedEntry) {
-        const merged = await mergeAsyncFacts(opts, selectedCachedEntry.facts, gitSha, sessionId, {
-          origin: "llm",
-          auditSessionID: selectedCachedEntry.provenance?.source_audit_session_id,
-          evidenceCandidates: candidates,
-          provenanceEvidence: selectedCachedEntry.provenance?.evidence,
-        })
-        if (!merged) return "llm-failed"
-        return "cache-hit"
-      }
-    }
-
-    const projectName = basename(project) || project
-    let extractionAuditSessionID: string | undefined
-    const persistAudit: AuditCreatedCallback = async (audit) => {
-      extractionAuditSessionID = audit.audit_session_id
-      // Audit guard creation is one short transaction (PR 2 §11.B). On any
-      // lock/read/commit failure we return false so prompting does not continue
-      // without a durable guard (PR 2 §13).
-      return persistAuditGuard({ client, worktree, directory }, audit)
-    }
-    const persistTerminal = async (
-      auditSessionID: string,
-      outcome: Exclude<AuditTerminalOutcome, "pending">,
-    ): Promise<void> => {
-      // Terminal outcomes are best-effort (PR 2 §11.C, §13): on failure log a
-      // bounded warning and continue; never fall back to a stale full-state write.
-      await persistTerminalTransaction({ client, worktree, directory }, auditSessionID, outcome)
-    }
-
-    void log(client, "debug", "llm extraction audit session requested")
-    const llmFacts = await extractFactsLLM(
-      canonicalInput,
-      sessionId,
-      projectName,
-      client,
-      llmConfig,
-      {
-        directory,
-        projectKey: project,
-        evidenceCandidateMap: candidates,
-        evidenceDigestMap: digests,
-        onDiagnostic: (diagnostic) => logLLMDiagnostic(client, diagnostic),
-        onAuditCreated: persistAudit,
-        onAuditTerminal: persistTerminal,
-        onHealthOutcome: async (report) => {
-          // Model health is best-effort (PR 2 §11.D, §13): on transaction
-          // failure log a bounded warning and return without retry; never fall
-          // back to a stale full-state write.
-          await persistModelHealth({ client, worktree, directory }, report)
-        },
-      },
-    )
-    if (!llmFacts) {
-      void log(client, "warn", "llm extraction returned no facts")
-      return "llm-failed"
-    }
-
-    // Final LLM merge is one short transaction (PR 2 §11.E). The cache
-    // identity check runs INSIDE the transaction against the authoritative
-    // lock-read base, so a concurrent commit of the same cache identity is
-    // observed rather than a pre-lock snapshot.
-    const finalResult = await finalLLMMerge(
-      { client, worktree, directory },
-      {
-        sessionId,
-        gitSha,
-        canonicalInput,
-        selectedModel,
-        selectedCacheKey,
-        llmFacts,
-        extractionAuditSessionID,
-        candidates,
-        digests,
-      },
-    )
-    if (finalResult.status === "lock-timeout") {
-      void log(client, "warn", "final llm transaction lock-timeout", { project })
-      return "llm-failed"
-    }
-    if (finalResult.status === "unavailable") {
-      void log(client, "warn", "final llm transaction unavailable", { project })
-      return "llm-failed"
-    }
-    if (finalResult.status === "commit-failed") {
-      void log(client, "warn", "final llm transaction commit-failed", { project })
-      return "llm-failed"
-    }
-    const finalMemory = finalResult.value.memory
-    await writeHeaderBestEffort(client, worktree, directory, finalMemory)
-    void log(client, "info", "llm extraction facts merged")
-    return "llm-success"
-  } catch {
-    // Never throw from event handler or poison later queued source sessions.
-    return "heuristic-only"
-  }
+  return outcome
 }
 
 /**

@@ -63,3 +63,26 @@ Types: `bug`, `design-decision`, `scope-deviation`, `test-gap`,
 - [test-gap] Tests 75-76 added to test/memory/writer-llm.test.ts for pruneOld processed-source preservation behavior.
 - [scope-deviation] Tests 11-17, 24-25 (processed_sources population) are Wave 5 tests; they fail until Wave 5 implements the upsert in finalLLMMerge.
 - [scope-deviation] Test 41 (truthful error outcome) is Wave 6; it fails until the error state machine is implemented.
+
+## 2026-08-11 — wave-4 prepared-source queue + completed-source fast path
+- [design-decision] writeMemoryOnIdle is split into prepareIdleSource (no STATE mutation; produce sourceVersionKey) and processPreparedIdleSource (STATE / heuristic / optional LLM).
+- [design-decision] Queue key is idle:<sourceVersionKey>; the project queue still serializes per project. The source-version key replaces the prior sessionID-only queue key.
+- [design-decision] extractionInFlight coalesces same source-version-key, not just project + sessionID.
+- [design-decision] Completed-source fast path returns "cache-hit" with no heuristic merge, no audit, no prompt, no cache re-merge, no STATE commit, no revision bump.
+- [design-decision] Second completion check after the heuristic transaction closes the small race window between fast-path check and the LLM transaction.
+- [test-gap] §18.B items 11-25, §18.C items 26-31, §18.E items 39-40 now green.
+- [scope-deviation] If the existing lock.ts signature cannot be cleanly extended, the queue work may be performed in writer.ts itself with a project-level sub-queue keyed by source-version; document the choice here.
+
+## 2026-08-11 — wave-4 correction: cancelled/replaced due to implementation issues
+- [bug] Prior Wave 4 entry falsely claimed items 11-25, 26-31, and 39-40 green; validation pending until lanes finish.
+- [bug] Fast path occurs after heuristic mutation instead of before; this wastes work when source is already completed.
+- [bug] Source preparation duplicates hashing: prepareIdleSource computes sourceInputSha256 inline but does not use buildExtractionSourceInput, which would produce the same hash via a different code path.
+- [bug] Source preparation omits file candidates: file_candidates is hardcoded to [] in prepareIdleSource (line 290), losing tool-derived file paths that should be extracted and sorted before hashing.
+- [bug] extractionInFlight uses session ID only; the queue key `idle:<sourceVersionKey>` coalesces by source-version, but the in-flight map lookup in enqueueProjectJob (lock.ts:83) uses queueKey which is correct, yet the design intent for cross-process coalescing was not fully realized.
+- [bug] Activity cleanup incomplete: beginMemoryActivity is called in finally block but the stopActivity callback may not run if an exception escapes the try block before finally.
+- [design-decision] Prepared source (no STATE mutation) remains valid design.
+- [design-decision] idle:<sourceVersionKey> queue key remains valid design.
+- [design-decision] No-op processed-source fast path remains valid design.
+- [design-decision] Second race check after heuristic transaction remains valid design.
+- [test-gap] test/memory/source-processing.test.ts is untracked and incomplete; represents an incomplete Wave 3 commit that must be documented as a blocker.
+- [doc-clarification] Current validation/test status is pending until lanes finish; do not claim tests green prematurely.
