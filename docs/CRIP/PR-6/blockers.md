@@ -55,3 +55,18 @@ Append-only implementation log for PR 6. Do not delete or rewrite prior entries.
 - [expected-downstream] The Wave 3 focused run reported 93 passed and 17 failed;
   remaining failures are full-facts writer/cache behavior reserved for Waves 4–6
   plus two legacy cache tests reserved for Wave 5.
+
+## 2026-08-11 — Wave 4 decisions-only merge
+
+- [implementation] Added explicit decisions-only LLM merge semantics. LLM
+  extraction cannot mutate current_task, active_files, blockers, next_steps, or
+  foundational authority fields; heuristic merge remains the only full-facts
+  path.
+- [implementation] Removed the temporary Wave-2 type bridge from the active
+  final merge seam; decisions-only facts now reach the explicit LLM merge
+  boundary.
+- [verification] `npx tsc --noEmit` passed; merge tests 33/33 and transaction
+  tests 13/13 passed.
+- [expected-downstream] `writer-llm.test.ts` had 44 passed and 3 failed; all
+  remaining failures are Wave 5 cache/provenance behavior (cache persistence,
+  v2 legacy cache identity expectation, and model-gating/cache integration).

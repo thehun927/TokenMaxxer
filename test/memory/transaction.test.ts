@@ -442,11 +442,7 @@ function healthReport(overrides: Partial<Record<string, unknown>> = {}) {
 
 function llmFacts(overrides: Partial<Record<string, unknown>> = {}) {
   return {
-    current_task: "LLM task",
-    active_files: [],
     decisions: [],
-    blockers: [],
-    next_steps: [],
     ...overrides,
   }
 }
@@ -542,7 +538,11 @@ describe("final LLM merge cannot overwrite a mutation committed while the prompt
         canonicalInput: buildCanonicalInput(messages, prior),
         selectedModel: model,
         selectedCacheKey: "cache-key-18",
-        llmFacts: llmFacts({ current_task: "task-final18" }) as never,
+        llmFacts: llmFacts({ decisions: [{
+          topic: "runtime",
+          decision: "Use Node",
+          evidence_refs: [makeTranscriptEvidenceRef("m2")],
+        }] }) as never,
         extractionAuditSessionID: "audit-18",
         candidates: transcriptCandidates,
         digests,
@@ -558,7 +558,7 @@ describe("final LLM merge cannot overwrite a mutation committed while the prompt
     expect(ids).toContain("fact-child18")
     const raw = await readFile(statePath, "utf-8")
     const parsed = JSON.parse(raw) as { current_task?: string }
-    expect(parsed.current_task).toBe("task-final18")
+    expect(parsed.current_task).toBeUndefined()
   })
 })
 

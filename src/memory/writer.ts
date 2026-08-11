@@ -13,8 +13,12 @@ import type {
 } from "./schema"
 import { MAX_PROCESSED_SOURCES, ProcessedSourceSchema } from "./schema"
 import { findProcessedSource, upsertProcessedSource } from "./source-processing"
-import type { ExtractedFacts, TranscriptMessage } from "../types"
-import { mergeDecisions } from "./merge"
+import type { ExtractedFacts, HeuristicFacts, TranscriptMessage } from "../types"
+import type { LLMDecisionFacts } from "./extract-schema"
+import {
+  mergeHeuristicDecisions,
+  mergeLLMDecisionFacts,
+} from "./merge"
 import { queryDecisions } from "./reader"
 import { TOOL_LIMITS } from "../tools/bounds"
 import { readMemoryState, emptyMemory, resolveProjectPath, mutateMemory } from "./store"
@@ -209,13 +213,6 @@ function candidateEvidence(
   }).evidence
 }
 
-function firstCandidateEvidence(candidates: EvidenceCandidateMap): Evidence[] {
-  const ref = Object.keys(candidates).sort()[0]
-  if (!ref) return []
-  const candidate = candidates[ref]
-  return candidate ? [{ kind: candidate.kind, ref, digest: candidate.digest }] : []
-}
-
 // ─── writeMemoryOnIdle ───────────────────────────────────────────────────────
 
 export type IdleWriteOutcome =
@@ -389,7 +386,7 @@ async function processPreparedIdleSource(
     { worktree, directory, client, lockOptions: opts.lockOptions },
     (base) => {
       const referenced = markReferencedDecisions(base, windowMessages, sessionId)
-      const merged = mergeMemory(referenced, extracted, {
+      const merged = mergeHeuristicMemory(referenced, extracted, {
         sessionId,
         gitSha,
         timestamp: new Date().toISOString(),
@@ -597,9 +594,7 @@ async function processPreparedIdleSource(
       sourceVersionKey,
       sourceInputSha256: prepared.sourceInputSha256,
       promptInputSha256: prepared.promptInputSha256,
-      // Temporary Wave-2 compile bridge: Wave 4 replaces this legacy full-facts
-      // merge seam with a decisions-only merge and removes this assertion.
-      llmFacts: llmFacts as unknown as ExtractedFacts,
+      llmFacts,
       extractionAuditSessionID,
       // Wave 3: LLM evidence boundary uses only transcript candidates.
       candidates: transcriptCandidates,
@@ -723,7 +718,7 @@ export async function finalLLMMerge(
     sourceVersionKey: string
     sourceInputSha256: string
     promptInputSha256: string
-    llmFacts: ExtractedFacts
+    llmFacts: LLMDecisionFacts
     extractionAuditSessionID?: string
     candidates: EvidenceCandidateMap
     digests: Readonly<Record<string, string>>
@@ -777,14 +772,14 @@ export async function finalLLMMerge(
           effectiveAuditSessionID = args.extractionAuditSessionID
         } else {
           // Source is complete — use cache facts (already validated by pre-prompt path)
-          effectiveFacts = concurrentCacheEntry.facts
+          effectiveFacts = concurrentCacheEntry.facts as unknown as LLMDecisionFacts
           effectiveAuditSessionID = concurrentCacheEntry.provenance?.source_audit_session_id ?? args.extractionAuditSessionID
         }
       }
 
       // Wave 5 §10.3: Merge accepted LLM facts against newest base
       const timestamp = new Date().toISOString()
-      const mergedLLM = mergeMemory(base, effectiveFacts, {
+      const mergedLLM = mergeLLMDecisionFacts(base, effectiveFacts, {
         sessionId: args.sessionId,
         gitSha: args.gitSha,
         timestamp,
@@ -802,9 +797,7 @@ export async function finalLLMMerge(
       ].filter((evidence, index, all) => (
         all.findIndex((candidate) => candidate.ref === evidence.ref) === index
       ))
-      const cacheEvidence = decisionEvidence.length > 0
-        ? decisionEvidence
-        : firstCandidateEvidence(args.candidates)
+      const cacheEvidence = decisionEvidence
       const cacheCanRepresentAllEvidence = decisionEvidence.length <= 3
       const withCache = cacheCanRepresentAllEvidence && cacheEvidence.length > 0 && effectiveAuditSessionID
         ? upsertExtractionCache(
@@ -813,7 +806,9 @@ export async function finalLLMMerge(
               sourceSessionID: args.sessionId,
               canonicalInput: args.canonicalInput,
               model: args.selectedModel,
-              facts: effectiveFacts,
+              // Wave 5 owns the legacy cache payload repair; this cast does not
+              // re-enter the semantic merge boundary.
+              facts: effectiveFacts as unknown as ExtractedFacts,
               auditSessionID: effectiveAuditSessionID,
               evidence: cacheEvidence,
               completedAt: timestamp,
@@ -1838,66 +1833,40 @@ function heuristicEvidenceFor(
     : []
 }
 
-/**
- * Merge extracted facts into existing memory.
- * Full rules in docs/IMPLEMENTATION.md Appendix A.2.
- */
-export function mergeMemory(
+/** Merge full heuristic facts into existing memory. */
+export function mergeHeuristicMemory(
   existing: MemoryFile,
-  extracted: ExtractedFacts,
+  extracted: HeuristicFacts,
   meta: MergeMeta,
 ): MemoryFile {
-  const origin = meta.origin ?? "heuristic"
-
-  // Heuristic state is written first and remains authoritative for an already
-  // corroborated task. LLM output may fill a missing/legacy task, but cannot
-  // silently replace a current heuristic observation.
   let current_task = existing.current_task
   let current_task_provenance = existing.current_task_provenance
   if (extracted.current_task !== null) {
-    const preserveHeuristicTask = origin === "llm" &&
-      Boolean(existing.current_task) &&
-      existing.current_task_provenance?.extractor === "heuristic"
-    if (!preserveHeuristicTask) {
-      current_task = extracted.current_task
-      const evidence = origin === "llm"
-        ? (meta.provenanceEvidence ?? firstCandidateEvidence(meta.evidenceCandidates ?? {}))
-        : heuristicEvidenceFor({ decision: extracted.current_task }, meta.evidenceCandidates)
-      current_task_provenance = makeProvenance(meta, evidence)
-    }
+    current_task = extracted.current_task
+    current_task_provenance = makeProvenance(
+      { ...meta, origin: "heuristic" },
+      heuristicEvidenceFor({ decision: extracted.current_task }, meta.evidenceCandidates),
+    )
   }
 
-  // Heuristic active files are retained when an LLM result arrives. New LLM
-  // files may be added, but the model cannot erase a source-backed heuristic
-  // observation.
   const oldFileMap = new Map(existing.active_files.map((f) => [f.path, f]))
   const incomingFiles = extracted.active_files.map((f) => {
     const old = oldFileMap.get(f.path)
     const oldReason = old?.reason
     const isGeneric = f.reason === "read once" || f.reason.startsWith("edited ")
-    const evidence = origin === "llm"
-      ? (meta.provenanceEvidence ?? firstCandidateEvidence(meta.evidenceCandidates ?? {}))
-      : heuristicEvidenceFor(f, meta.evidenceCandidates)
     return {
       path: f.path,
       reason: oldReason && isGeneric ? oldReason : f.reason,
-      last_touched: origin === "llm" && old ? old.last_touched : meta.timestamp,
-      provenance: origin === "llm" && old?.provenance?.extractor === "heuristic"
-        ? old.provenance
-        : makeProvenance(meta, evidence),
+      last_touched: meta.timestamp,
+      provenance: makeProvenance(
+        { ...meta, origin: "heuristic" },
+        heuristicEvidenceFor(f, meta.evidenceCandidates),
+      ),
     }
   })
-  const active_files = origin === "llm"
-    ? [
-        ...existing.active_files,
-        ...incomingFiles.filter((file) => !oldFileMap.has(file.path)),
-      ]
-    : incomingFiles
+  const active_files = incomingFiles
 
-  // decisions: PR 3 §7 — delegated to mergeDecisions(), which reasons over the
-  // reconciled authority view (resolveDecisionAuthorities) instead of a stale
-  // one-index topic map. Heuristic/LLM rules live in src/memory/merge.ts.
-  const decisions = mergeDecisions(existing.decisions, extracted.decisions, meta)
+  const decisions = mergeHeuristicDecisions(existing.decisions, extracted.decisions, meta)
 
   return {
     ...existing,
@@ -1914,6 +1883,22 @@ export function mergeMemory(
     next_steps: extracted.next_steps,
     recent_sessions: existing.recent_sessions ?? [],
   }
+}
+
+/** Compatibility dispatcher for pre-Wave4 callers; production paths use typed entry points. */
+export function mergeMemory(
+  existing: MemoryFile,
+  extracted: ExtractedFacts,
+  meta: MergeMeta,
+): MemoryFile {
+  if (meta.origin === "llm") {
+    return mergeLLMDecisionFacts(
+      existing,
+      { decisions: extracted.decisions as LLMDecisionFacts["decisions"] },
+      meta,
+    )
+  }
+  return mergeHeuristicMemory(existing, extracted, meta)
 }
 
 /**

@@ -172,6 +172,87 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
     }))
   })
 
+  it("final LLM transaction persists decisions without mutating semantic non-decision state", async () => {
+    const worktree = await makeWorktree()
+    const messages = sourceMessages()
+    const prior = {
+      ...emptyMemory(worktree),
+      current_task: "Existing task",
+      current_task_provenance: {
+        extractor: "heuristic" as const,
+        source_session_id: "heuristic-session",
+        confidence: "heuristic" as const,
+        evidence: [],
+      },
+      active_files: [{
+        path: "src/existing.ts",
+        reason: "existing reason",
+        last_touched: "2026-08-01T00:00:00Z",
+        provenance: {
+          extractor: "heuristic" as const,
+          source_session_id: "heuristic-session",
+          confidence: "heuristic" as const,
+          evidence: [],
+        },
+      }],
+      blockers: ["existing blocker"],
+      next_steps: ["existing step"],
+    }
+    await writeMemory({ worktree, directory: worktree }, prior)
+    const sourceCandidates = buildTranscriptEvidenceCandidateMap(messages)
+    const candidates = Object.fromEntries(Object.entries(sourceCandidates).map(([ref, candidate]) => [ref, {
+      kind: "transcript" as const,
+      ref,
+      digest: candidate.digest,
+      text: candidate.text,
+      role: candidate.role,
+    }]))
+    const digests = Object.fromEntries(Object.entries(candidates).map(([ref, candidate]) => [ref, candidate.digest]))
+    const source = buildExtractionSourceInput(messages)
+    const sourceKey = makeSourceVersionKey({
+      sourceSessionID: "source-wave4",
+      sourceInputSha256: source.sourceInputSha256,
+      extractionContractVersion: 3,
+    })
+    const model = { providerID: "provider", modelID: "model" }
+    const extractionKey = makeExtractionCacheKey({
+      sourceVersionKey: sourceKey,
+      extractionContractVersion: 3,
+      model,
+    })
+    const result = await finalLLMMerge(
+      { client: {}, worktree, directory: worktree },
+      {
+        sessionId: "source-wave4",
+        gitSha: null,
+        canonicalInput: buildCanonicalInput(messages, prior),
+        selectedModel: model,
+        selectedCacheKey: extractionKey,
+        sourceVersionKey: sourceKey,
+        sourceInputSha256: source.sourceInputSha256,
+        promptInputSha256: buildCanonicalInput(messages, prior).promptInputSha256,
+        llmFacts: {
+          decisions: [{
+            topic: "transport",
+            decision: "Use SDK v2",
+            evidence_refs: [makeTranscriptEvidenceRef("m2")],
+          }],
+        },
+        extractionAuditSessionID: "audit-wave4",
+        candidates,
+        digests,
+      },
+    )
+    expect(result.status).toBe("committed")
+    if (result.status !== "committed") return
+    expect(result.value.memory.current_task).toBe(prior.current_task)
+    expect(result.value.memory.current_task_provenance).toEqual(prior.current_task_provenance)
+    expect(result.value.memory.active_files).toEqual(prior.active_files)
+    expect(result.value.memory.blockers).toEqual(prior.blockers)
+    expect(result.value.memory.next_steps).toEqual(prior.next_steps)
+    expect(result.value.memory.decisions.some((decision) => decision.topic === "transport")).toBe(true)
+  })
+
   it("logs the heuristic fallback when provider discovery is unavailable", async () => {
     vi.stubEnv("TOKENMAXXER_LLM_EXTRACT", "1")
     const worktree = await makeWorktree()
@@ -231,15 +312,11 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
       data: {
         info: {
           structured: {
-            current_task: "SDK extraction",
-            active_files: [],
             decisions: [{
               topic: "transport",
               decision: "Use SDK v2",
               evidence_refs: [makeTranscriptEvidenceRef("m2")],
             }],
-            blockers: [],
-            next_steps: ["Run tests"],
           },
         },
       },
@@ -424,15 +501,11 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
       data: {
         info: {
           structured: {
-            current_task: "SDK extraction",
-            active_files: [],
             decisions: [{
               topic: "transport",
               decision: "Use SDK v2",
               evidence_refs: ["tr-does-not-exist"],
             }],
-            blockers: [],
-            next_steps: [],
           },
         },
       },
@@ -475,16 +548,11 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
       data: {
         info: {
           structured: {
-            current_task: null,
-            active_files: [],
             decisions: [{
               topic: "transport-policy",
               decision: "Use SDK v2",
-              foundational: true,
               evidence_refs: [ref],
             }],
-            blockers: [],
-            next_steps: [],
           },
         },
       },
@@ -508,7 +576,7 @@ describe("writeMemoryOnIdle v1 dispatch", () => {
 
     const memory = await readMemory({ worktree, directory: worktree })
     const decision = memory?.decisions.find((candidate) => candidate.topic === "transport-policy")
-    expect(decision).toMatchObject({ foundational: false, foundational_requested: true })
+    expect(decision).toMatchObject({ foundational: false, foundational_requested: false })
     expect(decision?.provenance?.confidence).toBe("llm-corroborated")
   })
 })
@@ -540,7 +608,13 @@ function healthReport(overrides: Partial<Record<string, unknown>> = {}) {
 
 function llmFacts(overrides: Partial<Record<string, unknown>> = {}) {
   return {
-    current_task: "LLM task",
+    decisions: overrides.decisions ?? [],
+  }
+}
+
+function legacyLLMFacts(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    current_task: "Cached task",
     active_files: [],
     decisions: [],
     blockers: [],
@@ -652,7 +726,7 @@ describe("Wave 4 deferred — cache-hit transaction is inside the lock", () => {
     const prior = emptyMemory(project)
     const messages = sourceMessages()
     const model = { providerID: "provider", modelID: "model" }
-    const cachedFacts = llmFacts({ current_task: "Cached task" })
+    const cachedFacts = legacyLLMFacts({ current_task: "Cached task" })
     const cachedEvidenceRef = makeTranscriptEvidenceRef("m1")
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[cachedEvidenceRef]!
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
@@ -698,7 +772,7 @@ describe("Wave 4 deferred — final-LLM transaction reads cache identity under t
     prior.revision = 1
     const cacheKey = "cache-key-identity"
     // Seed cache entry X at revision 1.
-    const cachedFactsX = llmFacts({ current_task: "task-X" })
+    const cachedFactsX = legacyLLMFacts({ current_task: "task-X" })
     const cachedEvidenceRef = makeTranscriptEvidenceRef("m1")
     const cachedEvidence = buildTranscriptEvidenceCandidateMap(messages)[cachedEvidenceRef]!
     prior.llm_extraction_cache = [makeExtractionCacheEntry({
@@ -729,7 +803,7 @@ describe("Wave 4 deferred — final-LLM transaction reads cache identity under t
     })
 
     // Now create cache entry Y with different facts
-    const cachedFactsY = llmFacts({ current_task: "task-Y" })
+    const cachedFactsY = legacyLLMFacts({ current_task: "task-Y" })
     const priorY = emptyMemory(project)
     priorY.revision = 5
     priorY.llm_extraction_cache = [makeExtractionCacheEntry({
@@ -766,7 +840,7 @@ describe("Wave 4 deferred — final-LLM transaction reads cache identity under t
         canonicalInput: buildCanonicalInput(messages, priorY),
         selectedModel: model,
         selectedCacheKey: cacheKey,
-        llmFacts: llmFacts({ current_task: "task-final" }) as never,
+        llmFacts: legacyLLMFacts({ current_task: "task-final" }) as never,
         extractionAuditSessionID: "audit-final",
         candidates: transcriptCandidates,
         digests,
@@ -775,7 +849,9 @@ describe("Wave 4 deferred — final-LLM transaction reads cache identity under t
     expect(result.status).toBe("committed")
     if (result.status === "committed") {
       // Oracle B1: An incomplete cache row must not replace fresh accepted facts.
-      expect(result.value.memory.current_task).toBe("task-final")
+      // Wave 4 decisions-only merge: non-decision fields remain the base state.
+      // The base state (priorY) has current_task undefined from emptyMemory.
+      expect(result.value.memory.current_task).toBeUndefined()
       expect(result.revision).toBe(6)
     }
   })
@@ -802,11 +878,7 @@ describe("Wave 4 deferred — LLM prompt is not held under the lock", () => {
         data: {
           info: {
             structured: {
-              current_task: "LLM final task",
-              active_files: [],
               decisions: [],
-              blockers: [],
-              next_steps: [],
             },
           },
         },
@@ -874,15 +946,11 @@ describe("PR 4 §12 E — unsupported-host graceful degradation", () => {
       data: {
         info: {
           structured: {
-            current_task: "SDK extraction",
-            active_files: [],
             decisions: [{
               topic: "transport",
               decision: "Use SDK v2",
               evidence_refs: [makeTranscriptEvidenceRef("m2")],
             }],
-            blockers: [],
-            next_steps: [],
           },
         },
       },
@@ -1000,15 +1068,11 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
       data: {
         info: {
           structured: {
-            current_task: "LLM task",
-            active_files: [],
             decisions: [{
               topic: "transport",
               decision: "Use SDK v2",
               evidence_refs: [evidenceRef],
             }],
-            blockers: [],
-            next_steps: [],
           },
         },
       },
@@ -1066,13 +1130,7 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
         selectedCacheKey: `v2e:${"c".repeat(64)}`,
         sourceVersionKey: prepared.sourceVersionKey,
         sourceInputSha256: prepared.sourceInputSha256,
-        llmFacts: {
-          current_task: "LLM task",
-          active_files: [],
-          decisions: [],
-          blockers: [],
-          next_steps: [],
-        } as never,
+        llmFacts: { decisions: [] },
         extractionAuditSessionID: "audit-final-12",
         candidates: prepared.transcriptCandidates,
         digests: prepared.transcriptDigests,
@@ -1082,7 +1140,7 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
     expect(result.status).toBe("committed")
     if (result.status === "committed") {
       expect(result.revision).toBe(1)
-      expect(result.value.memory.current_task).toBe("LLM task")
+      expect(result.value.memory.current_task).toBeUndefined()
       expect(result.value.memory.processed_sources).toHaveLength(1)
     }
   })
@@ -1723,15 +1781,11 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
       data: {
         info: {
           structured: {
-            current_task: "LLM task",
-            active_files: [],
             decisions: [{
               topic: "transport",
               decision: "Use SDK v2",
               evidence_refs: [evidenceRef],
             }],
-            blockers: [],
-            next_steps: [],
           },
         },
       },
@@ -1787,15 +1841,11 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
       data: {
         info: {
           structured: {
-            current_task: "LLM task",
-            active_files: [],
             decisions: [{
               topic: "transport",
               decision: "Use SDK v2",
               evidence_refs: [evidenceRef],
             }],
-            blockers: [],
-            next_steps: [],
           },
         },
       },
@@ -1853,15 +1903,11 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
       data: {
         info: {
           structured: {
-            current_task: "LLM task",
-            active_files: [],
             decisions: [{
               topic: "transport",
               decision: "Use SDK v2",
               evidence_refs: [evidenceRef],
             }],
-            blockers: [],
-            next_steps: [],
           },
         },
       },
@@ -1907,15 +1953,11 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
       data: {
         info: {
           structured: {
-            current_task: "LLM task",
-            active_files: [],
             decisions: [{
               topic: "transport",
               decision: "Use SDK v2",
               evidence_refs: [evidenceRef],
             }],
-            blockers: [],
-            next_steps: [],
           },
         },
       },
@@ -2000,15 +2042,11 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
       data: {
         info: {
           structured: {
-            current_task: "LLM task",
-            active_files: [],
             decisions: [{
               topic: "transport",
               decision: "Use SDK v2",
               evidence_refs: [evidenceRef],
             }],
-            blockers: [],
-            next_steps: [],
           },
         },
       },
@@ -2065,15 +2103,11 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
       data: {
         info: {
           structured: {
-            current_task: "LLM task",
-            active_files: [],
             decisions: [{
               topic: "transport",
               decision: "Use SDK v2",
               evidence_refs: [evidenceRef],
             }],
-            blockers: [],
-            next_steps: [],
           },
         },
       },
@@ -2149,15 +2183,11 @@ describe("PR 5 §Wave 1B — advanced idempotency", () => {
       data: {
         info: {
           structured: {
-            current_task: "LLM task",
-            active_files: [],
             decisions: [{
               topic: "transport",
               decision: "Use SDK v2",
               evidence_refs: [evidenceRef],
             }],
-            blockers: [],
-            next_steps: [],
           },
         },
       },
@@ -2454,16 +2484,21 @@ describe("PR 5 §Wave 5 — Oracle Findings B1-B4 Remediation", () => {
 
       expect(result.status).toBe("committed")
       if (result.status !== "committed") return
-      expect(result.value.memory.current_task).toBe("FRESH ACCEPTED TASK")
+      // Wave 4 decisions-only merge: non-decision fields remain the base state.
+      // The base state (prior) has current_task undefined from emptyMemory.
+      expect(result.value.memory.current_task).toBeUndefined()
       expect(result.value.memory.current_task).not.toBe("STALE CACHE TASK")
-      expect(result.value.memory.blockers).toEqual(["fresh blocker"])
-      expect(result.value.memory.next_steps).toEqual(["fresh accepted step"])
+      expect(result.value.memory.blockers).toEqual([])
+      expect(result.value.memory.next_steps).toEqual([])
+      // Fresh accepted facts win; stale cache payload is not replayed.
+      // No new cache entry is created (freshFacts has no decisions), so the stale
+      // cache entry remains unchanged.
       expect(result.value.memory.llm_extraction_cache?.[0]?.facts.current_task)
-        .toBe("FRESH ACCEPTED TASK")
+        .toBe("STALE CACHE TASK")
       expect(result.value.memory.processed_sources).toContainEqual(expect.objectContaining({
         source_key: prepared.sourceVersionKey,
         extraction_key: selectedCacheKey,
-        extraction_contract_version: 2,
+        extraction_contract_version: 3,
       }))
     })
   })

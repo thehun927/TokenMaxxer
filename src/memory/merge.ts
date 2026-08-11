@@ -12,9 +12,11 @@
  * This module is pure: input arrays are never mutated and every modified row is
  * a fresh object (per-object spread).
  */
-import type { Decision, Evidence, Provenance } from "./schema"
+import type { Decision, Evidence, MemoryFile, Provenance } from "./schema"
+import type { LLMDecisionFacts } from "./extract-schema"
 import type { EvidenceCandidateMap } from "./extract-llm"
 import { resolveEvidenceReferences } from "./extract-llm"
+import type { HeuristicFacts } from "../types"
 import { sha256Hex, stableJson } from "./extract-prompt"
 import {
   isHumanTrustRow,
@@ -40,6 +42,12 @@ export type ExtractedDecision = {
   /** Legacy heuristic extractor signal; kept for compatibility. */
   foundational_requested?: unknown
 }
+
+/** Explicit heuristic decision input; it may carry the PR3 review request. */
+export type HeuristicDecision = HeuristicFacts["decisions"][number]
+
+/** Decisions-only LLM input; foundational signals are intentionally absent. */
+export type LLMDecision = LLMDecisionFacts["decisions"][number]
 
 /** Merge metadata consumed by decision merging (subset of the writer MergeMeta). */
 export type DecisionMergeMeta = {
@@ -143,7 +151,7 @@ function incomingFoundationalRequested(
   meta: DecisionMergeMeta,
 ): boolean {
   return meta.origin === "llm"
-    ? Boolean(inc.foundational)
+    ? false
     : Boolean(inc.foundational) || Boolean(inc.foundational_requested)
 }
 
@@ -408,4 +416,39 @@ export function mergeDecisions(
   }
 
   return result
+}
+
+/** Heuristic-only typed entry point around the PR3 decision core. */
+export function mergeHeuristicDecisions(
+  existing: readonly Decision[],
+  incoming: readonly HeuristicDecision[],
+  meta: Omit<DecisionMergeMeta, "origin">,
+): Decision[] {
+  return mergeDecisions(existing, incoming, { ...meta, origin: "heuristic" })
+}
+
+/** Decisions-only LLM entry point around the PR3 decision core. */
+export function mergeLLMDecisions(
+  existing: readonly Decision[],
+  incoming: readonly LLMDecision[],
+  meta: Omit<DecisionMergeMeta, "origin">,
+): Decision[] {
+  return mergeDecisions(existing, incoming, { ...meta, origin: "llm" })
+}
+
+/** Merge only evidence-backed LLM decisions and required operational metadata. */
+export function mergeLLMDecisionFacts(
+  existing: MemoryFile,
+  facts: LLMDecisionFacts,
+  meta: DecisionMergeMeta,
+): MemoryFile {
+  return {
+    ...existing,
+    version: 3,
+    project_path: existing.project_path,
+    last_updated: meta.timestamp,
+    last_git_sha: meta.gitSha ?? existing.last_git_sha,
+    last_session_id: meta.sessionId,
+    decisions: mergeLLMDecisions(existing.decisions, facts.decisions, meta),
+  }
 }

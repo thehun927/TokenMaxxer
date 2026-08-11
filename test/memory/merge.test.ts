@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest"
 import { mergeMemory } from "../../src/memory/writer"
-import { mergeDecisions } from "../../src/memory/merge"
+import { mergeDecisions, mergeLLMDecisionFacts } from "../../src/memory/merge"
 import { emptyMemory } from "../../src/memory/schema"
 import type { MemoryFile, Decision } from "../../src/memory/schema"
 import { loadAndMigrate } from "../../src/memory/migrate"
@@ -49,7 +49,7 @@ describe("mergeMemory", () => {
       decisions: [],
     };
     const extracted = {
-      ...makeExtracted({ decisions: [{ topic: "db", decision: "Use MySQL" }] }),
+      ...makeExtracted({ decisions: [{ topic: "db", decision: "Use MySQL", evidence_refs: ["tr-1"] }] }),
     };
     const meta = {
       sessionId: "session-1",
@@ -785,7 +785,7 @@ describe("PR 6 Wave 1 — LLM decisions-only trust boundary", () => {
     expect(result.current_task_provenance?.extractor).toBe("heuristic")
   })
 
-  it("LLM merge appends active_files but never replaces or erases existing files", () => {
+  it("LLM merge preserves active_files byte-for-semantic-value", () => {
     const existing = {
       ...emptyMemory("/test"),
       active_files: [
@@ -797,8 +797,8 @@ describe("PR 6 Wave 1 — LLM decisions-only trust boundary", () => {
       decisions: [{ topic: "db", decision: "Use Postgres" }],
     })
     const result = mergeMemory(existing, extracted, llmMeta)
-    // PR-6: LLM can only add new files, never replace or erase existing
-    expect(result.active_files).toHaveLength(2)
+    // PR-6: LLM decisions-only merge cannot add, replace, or erase files.
+    expect(result.active_files).toEqual(existing.active_files)
     expect(result.active_files.some(f => f.path === "src/main.ts")).toBe(true)
   })
 
@@ -876,5 +876,108 @@ describe("PR 6 Wave 1 — extractor/confidence pairing", () => {
     expect(provenance?.source_audit_session_id).toBe("audit-1")
     expect(provenance?.evidence.length).toBeGreaterThanOrEqual(1)
     expect(provenance?.evidence.length).toBeLessThanOrEqual(3)
+  })
+})
+
+describe("PR 6 Wave 4 — typed decisions-only LLM merge", () => {
+  const llmMeta = {
+    ...meta,
+    origin: "llm" as const,
+    auditSessionID: "audit-wave4",
+    evidenceCandidates: {
+      "tr-wave4": {
+        kind: "transcript" as const,
+        ref: "tr-wave4",
+        digest: "c".repeat(64),
+      },
+    },
+  }
+
+  it("preserves every non-decision semantic field byte-for-semantic-value", () => {
+    const existing = {
+      ...emptyMemory("/test"),
+      current_task: "Heuristic task",
+      current_task_provenance: {
+        extractor: "heuristic" as const,
+        source_session_id: "heuristic-session",
+        confidence: "heuristic" as const,
+        evidence: [],
+      },
+      active_files: [{
+        path: "src/existing.ts",
+        reason: "existing reason",
+        last_touched: "2026-08-01T00:00:00Z",
+        provenance: {
+          extractor: "heuristic" as const,
+          source_session_id: "heuristic-session",
+          confidence: "heuristic" as const,
+          evidence: [],
+        },
+      }],
+      blockers: ["existing blocker"],
+      next_steps: ["existing step"],
+    }
+    const merged = mergeLLMDecisionFacts(existing, {
+      decisions: [{ topic: "database", decision: "Use Postgres", evidence_refs: ["tr-wave4"] }],
+    }, llmMeta)
+
+    expect(merged.current_task).toBe(existing.current_task)
+    expect(merged.current_task_provenance).toEqual(existing.current_task_provenance)
+    expect(merged.active_files).toEqual(existing.active_files)
+    expect(merged.blockers).toEqual(existing.blockers)
+    expect(merged.next_steps).toEqual(existing.next_steps)
+    expect(merged.decisions).toHaveLength(1)
+  })
+
+  it("corroborates equivalent non-human decisions in place and creates new topics", () => {
+    const existing = {
+      ...emptyMemory("/test"),
+      decisions: [makeDecision({ id: "stable-id", topic: "database", decision: "Use Postgres" })],
+    }
+    const merged = mergeLLMDecisionFacts(existing, {
+      decisions: [
+        { topic: "database", decision: "Use Postgres", evidence_refs: ["tr-wave4"] },
+        { topic: "runtime", decision: "Use Node", evidence_refs: ["tr-wave4"] },
+      ],
+    }, llmMeta)
+
+    expect(merged.decisions.filter((decision) => decision.still_valid)).toHaveLength(2)
+    expect(merged.decisions.find((decision) => decision.topic === "database")?.id).toBe("stable-id")
+    expect(merged.decisions.find((decision) => decision.topic === "database")?.provenance?.extractor).toBe("llm")
+    expect(merged.decisions.find((decision) => decision.topic === "runtime")?.provenance?.confidence).toBe("llm-corroborated")
+  })
+
+  it("keeps heuristic and human conflicts invalid without accepting model authority signals", () => {
+    const existing = {
+      ...emptyMemory("/test"),
+      decisions: [makeDecision({
+        id: "human-id",
+        topic: "database",
+        decision: "Use Postgres",
+        foundational: true,
+        human_review: { channel: "interactive-cli", reviewed_at: "2026-08-01T00:00:00Z" },
+        provenance: {
+          extractor: "human" as const,
+          source_session_id: "human-session",
+          confidence: "human-reviewed" as const,
+          evidence: [],
+        },
+      })],
+    }
+    const merged = mergeLLMDecisionFacts(existing, {
+      decisions: [{
+        topic: "database",
+        decision: "Use MySQL",
+        evidence_refs: ["tr-wave4"],
+        foundational: true,
+      } as never],
+    }, llmMeta)
+    const human = merged.decisions.find((decision) => decision.id === "human-id")!
+    const candidate = merged.decisions.find((decision) => decision.decision === "Use MySQL")!
+    expect(human.still_valid).toBe(true)
+    expect(candidate.still_valid).toBe(false)
+    expect(candidate.foundational).toBe(false)
+    expect(candidate.foundational_requested).toBe(false)
+    expect(candidate.conflicts_with).toEqual(["human-id"])
   })
 })
