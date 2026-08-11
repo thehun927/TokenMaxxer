@@ -14,8 +14,12 @@
  *      (this assertion forces an explicit contract review if a future host
  *      legitimately adds it).
  *   4. `HostProjectContext` is a subset of `ToolContext`.
+ *
+ * PR 7 Wave 1 additions:
+ *   5. v1.18.15 hook output has `context: string[]` and optional `prompt`.
+ *   6. CompactionOutput type matches v1.18.15 contract.
  */
-import type { PluginInput, ToolContext } from "@opencode-ai/plugin"
+import type { Hooks, PluginInput, ToolContext } from "@opencode-ai/plugin"
 import type { HostClient, HostToolContext, HostProjectContext } from "../../src/host/contract"
 import type { Equal, Assert } from "./utils"
 
@@ -27,9 +31,7 @@ const client: HostClient = null as unknown as PluginInput["client"]
 const ctx: ToolContext = null as unknown as ToolContext
 
 // 3. ToolContext does not expose `client` under the supported baseline.
-type ToolContextHasNoClient = Assert<
-  Equal<Extract<keyof ToolContext, "client">, never>
->
+type ToolContextHasNoClient = Assert<Equal<Extract<keyof ToolContext, "client">, never>>
 const toolContextHasNoClient: ToolContextHasNoClient = true
 void toolContextHasNoClient
 
@@ -45,3 +47,11 @@ void client
 type _HostToolContextIsToolContext = Assert<Equal<HostToolContext, ToolContext>>
 const _hostToolContextIsToolContext: _HostToolContextIsToolContext = true
 void _hostToolContextIsToolContext
+
+// 5. v1.18.15 exposes the compaction hook with the exact output shape.
+// (PR 7 §14.A.11)
+type CompactionHook = NonNullable<Hooks["experimental.session.compacting"]>
+type _CompactionOutput = Parameters<CompactionHook>[1]
+type _ExpectedCompactionOutput = { context: string[]; prompt?: string }
+const _compactionOutputShape: Assert<Equal<_CompactionOutput, _ExpectedCompactionOutput>> = true
+void _compactionOutputShape

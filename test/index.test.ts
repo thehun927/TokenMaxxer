@@ -194,6 +194,99 @@ describe("plugin initialization", () => {
   })
 })
 
+// ─── PR 7 Wave 1 — Mode assertions for hook behavior ─────────────────────────────
+describe("PR 7 Wave 1 — compaction mode assertions", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    // Clear all env vars before each test
+    Object.keys(process.env).forEach((key) => {
+      if (key.startsWith("TOKENMAXXER_")) {
+        delete process.env[key]
+      }
+    })
+  })
+
+  describe("§14.A.8 — Augment mode appends context and leaves output.prompt unset", () => {
+    it("augment mode should not set output.prompt", async () => {
+      process.env.TOKENMAXXER_COMPACTION_MODE = "augment"
+      const hooks = await TokenmaxxerPlugin(makePluginInput())
+
+      const output = { context: [] as string[] }
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "test-session" },
+        output,
+      )
+
+      // Augment mode should append context but NOT set prompt
+      expect(output.context).toBeDefined()
+      expect(output.prompt).toBeUndefined()
+    })
+
+    it("augment mode should preserve pre-existing context entries", async () => {
+      process.env.TOKENMAXXER_COMPACTION_MODE = "augment"
+      const hooks = await TokenmaxxerPlugin(makePluginInput())
+
+      const output = { context: ["existing-plugin-context"] as string[] }
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "test-session" },
+        output,
+      )
+
+      // Augment mode should preserve existing context
+      expect(output.context).toContain("existing-plugin-context")
+    })
+  })
+
+  describe("§14.A.10 — Replace mode sets output.prompt without erasing unrelated context", () => {
+    it("replace mode should set output.prompt", async () => {
+      process.env.TOKENMAXXER_COMPACTION_MODE = "replace"
+      const hooks = await TokenmaxxerPlugin(makePluginInput())
+
+      const output = { context: [] as string[] }
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "test-session" },
+        output,
+      )
+
+      // Replace mode should set prompt but NOT erase unrelated context
+      expect(output.prompt).toBeDefined()
+      expect(output.prompt).not.toBe("")
+      expect(output.context).toBeDefined()
+    })
+
+    it("replace mode should preserve unrelated context entries", async () => {
+      process.env.TOKENMAXXER_COMPACTION_MODE = "replace"
+      const hooks = await TokenmaxxerPlugin(makePluginInput())
+
+      const output = { context: ["existing-plugin-context"] as string[] }
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "test-session" },
+        output,
+      )
+
+      // Replace mode should preserve unrelated context
+      expect(output.context).toContain("existing-plugin-context")
+    })
+  })
+
+  describe("§14.A.12 — Compaction customization failure remains non-fatal to host hook", () => {
+    it("should not throw when compaction customization fails", async () => {
+      process.env.TOKENMAXXER_COMPACTION_MODE = "invalid-mode"
+      const hooks = await TokenmaxxerPlugin(makePluginInput())
+
+      const output = { context: [] as string[] }
+
+      // Should not throw; should fall back to augment behavior
+      await expect(
+        hooks["experimental.session.compacting"]?.(
+          { sessionID: "test-session" },
+          output,
+        )
+      ).resolves.not.toThrow()
+    })
+  })
+})
+
 // ─── PR 4 §12 F — minimum package / compile contract (Waves 2/6/7) ──────────
 // The plugin must inject `PluginInput.client` into efficiency registration and
 // never rely on a client invented on `ToolContext`.

@@ -12,6 +12,17 @@ vi.mock("../../src/util/log", () => ({
 import { readMemory } from "../../src/memory/store"
 import { buildDurableBlock } from "../../src/compaction/durable"
 
+/**
+ * PR-7 Wave 1 note — these tests freeze the semantic selection/count policy
+ * from the existing bounded decision selection (foundational, recent, older
+ * caps).  They are NOT tests for PR-8 total byte budgeting.
+ *
+ * PR 7 adds per-field render-only character caps (in durable.test.ts) that
+ * are applied during rendering without mutating STATE.  PR 8 will later
+ * define the hard total injection byte budget separately.  Do not weaken
+ * these selection/count assertions.
+ */
+
 const currentSession = "session-current"
 
 function makeDecision(
