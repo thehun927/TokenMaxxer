@@ -111,7 +111,7 @@ describe("plugin initialization", () => {
     expect(input.client.app.log).not.toHaveBeenCalled()
   })
 
-  it("replaces the compaction log with only the newest snapshot", async () => {
+  it("replaces the compaction prompt log with only the newest snapshot", async () => {
     const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-compaction-"))
     buildDurableBlock
       .mockResolvedValueOnce("first durable snapshot")
@@ -135,12 +135,12 @@ describe("plugin initialization", () => {
       )
 
       const memoryDir = join(project, ".opencode", "memory")
-      const snapshot = await readFile(join(memoryDir, "last_compaction.log"), "utf-8")
+      const snapshot = await readFile(join(memoryDir, "last_compaction_prompt.log"), "utf-8")
       expect(snapshot).toContain("session=newest-session")
       expect(snapshot).toContain("newest durable snapshot")
       expect(snapshot).not.toContain("first-session")
       expect(snapshot).not.toContain("first durable snapshot")
-      expect(await readdir(memoryDir)).toEqual(["HEADER.md", "last_compaction.log"])
+      expect(await readdir(memoryDir)).toEqual(["HEADER.md", "last_compaction_prompt.log"])
     } finally {
       await rm(project, { recursive: true, force: true })
     }

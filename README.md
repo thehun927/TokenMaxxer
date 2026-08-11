@@ -175,7 +175,7 @@ Add to your project `.gitignore`:
 
 ```
 .opencode/memory/STATE.json
-.opencode/memory/last_compaction.log
+.opencode/memory/last_compaction_prompt.log
 .opencode/memory/*.corrupt.*
 ```
 
@@ -203,7 +203,7 @@ If the schema-constrained compaction prompt makes things worse, disable it witho
 TOKENMAXXER_NO_PROMPT=1
 ```
 
-This skips prompt replacement but still injects the durable block via `output.context`, letting opencode use its default compaction prompt.
+This selects augment mode for compatibility: the plugin leaves `output.prompt` unset and appends its data-only context, letting opencode use its default compaction prompt.
 
 ## Optional LLM extraction
 
@@ -355,7 +355,7 @@ created because the opt-in path correctly uses heuristics only.
 | What | Where |
 |---|---|
 | Plugin health | Call the `tokenmaxxer_status` tool |
-| Last injected compaction prompt | `.opencode/memory/last_compaction.log` |
+| Last injected compaction prompt | `.opencode/memory/last_compaction_prompt.log` |
 | Raw memory file | `.opencode/memory/STATE.json` (human-readable JSON) |
 | Corrupt file backups | `.opencode/memory/*.corrupt.*` |
 | Plugin load confirmation | opencode logs: `grep "tokenmaxxer plugin loaded" ~/.local/share/opencode/log/opencode.log` |
@@ -394,7 +394,7 @@ Memory is merged across sessions: new decisions on the same topic supersede old 
 src/
   index.ts                # Plugin entry — wires all hooks
   types.ts                # Shared types (CompactionInput, TranscriptPart, etc.)
-  config.ts               # Options + kill switch (TOKENMAXXER_NO_PROMPT)
+  config.ts               # Options + legacy compatibility mapping (TOKENMAXXER_NO_PROMPT)
   memory/
     schema.ts             # Zod schemas (MemoryFile, Decision, ActiveFile)
     migrate.ts            # Version-aware migration (v1 → v2)

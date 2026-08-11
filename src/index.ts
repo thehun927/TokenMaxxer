@@ -65,7 +65,7 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
               ? "replace"
               : "unset")
 
-        // PR 7 Wave 2: Use compactionMode instead of compactionPrompt
+        // PR 7: route through the explicit compaction mode.
         let effectiveMode = options.compactionMode
         let fallbackReason: string | undefined
 
@@ -120,11 +120,11 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
           ...(fallbackReason ? { fallback_reason: fallbackReason } : {}),
         })
 
-        // last_compaction.log is intentionally a last-only snapshot, not a
+        // last_compaction_prompt.log is intentionally a last-only snapshot, not a
         // history. Atomic replacement ensures successive hooks leave only the
         // newest compaction payload visible to diagnostics.
         try {
-          const logPath = join(project, ".opencode", "memory", "last_compaction.log")
+          const logPath = join(project, ".opencode", "memory", "last_compaction_prompt.log")
           const snapshot = [
             `timestamp=${new Date().toISOString()}`,
             `session=${input.sessionID}`,

@@ -195,3 +195,28 @@ decisions, and validation results; do not rewrite prior entries.
   passed**.
 - Wave 6 exit: **complete**. The repeated-compaction information path is
   demonstrably intact in both modes; proceed to Wave 7 diagnostic seam cleanup.
+
+## 2026-08-11 — Wave 7 validation
+
+- Renamed the active diagnostic snapshot to
+  `.opencode/memory/last_compaction_prompt.log`; atomic newest-only replacement
+  and `setLastCompaction()` remain unchanged.
+- Metadata remains bounded and explicit: timestamp, session,
+  requested/effective mode, `kind=context-augmentation|replacement-prompt`,
+  and fallback reason only when applicable.
+- Rejected a lane edit that removed augmentation from unavailable-history
+  fallback. Both normal augment and replacement fallback still call
+  `buildCompactionAugmentation()` and leave `output.prompt` unset.
+- Updated active README references and removed the stale production comment
+  mentioning the old `compactionPrompt` boolean. PR-6 historical documents and
+  legacy `TOKENMAXXER_NO_PROMPT` compatibility mapping remain intact.
+- `npm test -- test/index.test.ts -t "replaces the compaction prompt log"`:
+  **passed, 1 test**.
+- `npm test -- test/tools/status.test.ts test/compaction/config.test.ts
+  test/compaction/history.test.ts`: **3 files passed, 41 tests passed**.
+- `npx tsc --noEmit`: **passed**.
+- `npm run typecheck:host-contract`: **passed**.
+- Full `npm test -- --reporter=dot`: **46 test files passed, 833 tests
+  passed**.
+- Wave 7 exit: **complete**. Proceed to Wave 8 audit and release-chain
+  handoff only.
