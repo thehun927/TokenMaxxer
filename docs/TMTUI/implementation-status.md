@@ -48,7 +48,7 @@
 - `npm run smoke:cli`: passed (`46-49`).
 - `bash -n install.sh`, `bash -n bin/tokenmaxxer`, and `git diff --check`: passed.
 - Focused commit-pulse suite: 17 tests passed (invalid markers return `null` without deletion; reader is non-destructive; fresh marker survives a stale read).
-- CI now provisions Bun `1.3.14` explicitly and runs `check:tui-bundle` as a named step. Clean GitHub Actions execution remains pending after this remediation push.
+- CI now provisions Bun `1.3.14` explicitly and runs `check:tui-bundle` as a named step. Clean GitHub Actions run `31557715584` passed on remediation commit `7b98da9`.
 - No component-level TUI test was added: the repository has no OpenTUI mount/render harness or existing `test/tui` fixture, and the bounded test lane could not exercise the slot without production refactoring. The source-level contract remains verified by typecheck, the reactive bundle gate, and manual code review; component behavior remains a manual OpenCode acceptance item.
 
 ## Outstanding CRIP dependency
@@ -61,4 +61,4 @@ TMTUI-3 must wait until CRIP PR 8 Waves 4–5 are final and landed. After rebasi
 4. Reconcile any existing `beginMemoryActivity()` removal from CRIP rather than mechanically applying the old cleanup plan.
 5. Rerun the complete CRIP + TMTUI validation gate.
 
-TMTUI is not merge-ready until this rebase and TMTUI-3 wiring are complete. The parallel-safe remediation is locally validated; the draft PR's clean-run CI result remains the final pre-PR-8 gate.
+TMTUI is not merge-ready until this rebase and TMTUI-3 wiring are complete. The parallel-safe remediation and clean PR CI are validated; freeze the branch except for rebase maintenance until CRIP PR 8 lands.

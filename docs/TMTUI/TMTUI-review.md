@@ -4,7 +4,7 @@
 **Reviewed head:** `a92751f9d16220b99d4703cfafc6943b43772762`
 **Base:** `6f1412fef2479b7a10f42d4e49f1fdc390a3cfc4`  
 **Review purpose:** pre-PR-8 quality gate for TMTUI-1 / TMTUI-2 before the branch is parked awaiting TMTUI-3.  
-**Gate result:** **Remediation applied; pending clean-run validation and CI result.**
+**Gate result:** **APPROVED / PARKED — TMTUI-1/2 remediation validated; TMTUI-3 remains blocked on post-PR-8 rebase.**
 
 ---
 
@@ -510,7 +510,7 @@ Own:
 TMTUI-1/2 may be considered **parked and ready for PR 8 to finish** when all of the following are true:
 
 - [x] GitHub CI explicitly installs Bun.
-- [ ] Clean PR CI passes (pending after this remediation push).
+- [x] Clean PR CI passes on remediation commit `7b98da9` (run `31557715584`).
 - [x] TUI imports project resolution directly from `memory/paths`.
 - [x] Rebuilt TUI bundle no longer unnecessarily drags in durable storage/schema implementation.
 - [x] Reader-side destructive stale-marker cleanup is removed or made provably race-safe.
