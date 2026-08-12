@@ -2,8 +2,8 @@
  * Status tool — plugin health check.
  *
  * Implements §7.2 from docs/IMPLEMENTATION.md.
- * Also exports `lastCompactionTimestamp` and `setLastCompaction` so
- * index.ts can update the timestamp when the compaction hook fires.
+ * PR-9 Wave 4: status reads durable per-project compaction diagnostics
+ * through canonical artifact APIs, never via process-global cache.
  */
 import { tool } from "@opencode-ai/plugin"
 import { readMemoryState, resolveProjectPath } from "../memory/store"
@@ -12,14 +12,8 @@ import {
   getLLMEvidenceStats,
   getLastLLMModelResolution,
 } from "../memory/extract-llm"
-
-// --- Module-level state (updated by index.ts) ---
-
-export let lastCompactionTimestamp: string | null = null
-
-export function setLastCompaction(ts: string) {
-  lastCompactionTimestamp = ts
-}
+import { readDiagnosticArtifact } from "../diagnostics/artifacts"
+import { validateCompactionResultDiagnostic } from "../diagnostics/compaction"
 
 // --- Inner function (exported for testability) ---
 
@@ -65,6 +59,67 @@ export async function _tokenmaxxerStatus(
         ].join("; ")
       : "none"
 
+    // --- Durable compaction diagnostics (separate, never conflated) ---
+    // Read through canonical artifact APIs; no process-global/module cache.
+    let lastCompletedCompaction = "none"
+    let compactionSession = "none"
+    let compactionSummary = "missing"
+    let compactionResultArtifactLine = "Compaction result artifact: none (none)"
+    let compactionPromptLine = "Compaction prompt snapshot: none (none, 0 bytes)"
+
+    try {
+      const [resultArtifact, promptArtifact] = await Promise.all([
+        readDiagnosticArtifact("last_compaction_result.json", project).catch(() => ({ kind: "unavailable" as const, errors: [] as Array<{ source: "project" | "global"; path: string; code?: string; message: string }> })),
+        readDiagnosticArtifact("last_compaction_prompt.log", project).catch(() => ({ kind: "unavailable" as const, errors: [] as Array<{ source: "project" | "global"; path: string; code?: string; message: string }> })),
+      ])
+
+      // Result artifact — distinct from prompt, never conflated
+      if (resultArtifact.kind === "missing") {
+        lastCompletedCompaction = "none"
+        compactionSession = "none"
+        compactionSummary = "missing"
+        compactionResultArtifactLine = "Compaction result artifact: none (none)"
+      } else if (resultArtifact.kind === "unavailable") {
+        lastCompletedCompaction = "unavailable"
+        compactionSession = "unavailable"
+        compactionSummary = "unavailable"
+        compactionResultArtifactLine = "Compaction result artifact: unavailable (unavailable)"
+      } else if (resultArtifact.kind === "ok") {
+        const validation = validateCompactionResultDiagnostic(resultArtifact.content)
+        if (!validation.ok) {
+          lastCompletedCompaction = "unavailable (invalid diagnostic artifact)"
+          compactionSession = "unavailable (invalid diagnostic artifact)"
+          compactionSummary = "unavailable (invalid diagnostic artifact)"
+          compactionResultArtifactLine = `Compaction result artifact: ${resultArtifact.path} (${resultArtifact.source}, ${resultArtifact.sizeBytes} bytes, mtime=${resultArtifact.mtime}) [invalid]`
+        } else {
+          const v = validation.value
+          lastCompletedCompaction = v.completed_at
+          compactionSession = v.session_id
+          if (v.summary.status === "found") {
+            compactionSummary = `found ${v.summary.bytes} bytes`
+          } else if (v.summary.status === "missing") {
+            compactionSummary = "missing"
+          } else {
+            // unavailable with bounded reason already capped to 500 chars
+            compactionSummary = `unavailable (${v.summary.reason})`
+          }
+          compactionResultArtifactLine = `Compaction result artifact: ${resultArtifact.path} (${resultArtifact.source}, ${resultArtifact.sizeBytes} bytes, mtime=${resultArtifact.mtime})`
+        }
+      }
+
+      // Prompt artifact — separate read, never derives from result
+      if (promptArtifact.kind === "missing") {
+        compactionPromptLine = "Compaction prompt snapshot: none (none, 0 bytes)"
+      } else if (promptArtifact.kind === "unavailable") {
+        compactionPromptLine = "Compaction prompt snapshot: unavailable (unavailable, 0 bytes)"
+      } else if (promptArtifact.kind === "ok") {
+        compactionPromptLine = `Compaction prompt snapshot: ${promptArtifact.path} (${promptArtifact.source}, ${promptArtifact.sizeBytes} bytes, mtime=${promptArtifact.mtime})`
+      }
+    } catch {
+      // Any unexpected artifact read failure must not crash status
+      // Keep defaults already set to safe missing/unavailable values
+    }
+
     return [
       `Project: ${mem?.project_path ?? "none"}`,
       `Memory file: ${result.path ?? "none"} (${result.sizeBytes} bytes)`,
@@ -74,15 +129,19 @@ export async function _tokenmaxxerStatus(
       `Active files: ${mem?.active_files.length ?? 0}`,
       `Last updated: ${mem?.last_updated ?? "never"}`,
       `Last git SHA: ${mem?.last_git_sha ?? "unknown"}`,
-      `Last compaction: ${lastCompactionTimestamp ?? "none"}`,
-      `Queue depth: ${queue.queueDepth}`,
-      `In-flight: ${queue.inFlight}`,
-      `Last idle outcome: ${queue.lastOutcome ?? "none"}`,
+      `Last completed compaction: ${lastCompletedCompaction}`,
+      `Compaction session: ${compactionSession}`,
+      `Compaction summary metadata: ${compactionSummary}`,
+      compactionResultArtifactLine,
+      compactionPromptLine,
+      `Queue depth (process-local): ${queue.queueDepth}`,
+      `In-flight (process-local): ${queue.inFlight}`,
+      `Last idle outcome (process-local): ${queue.lastOutcome ?? "none"}`,
       `LLM evidence (process-wide): ${evidenceStats.accepted} accepted, ${evidenceStats.rejected} rejected`,
       `Legacy facts: ${legacyFacts}`,
       `Quarantined cache rows: ${quarantined}`,
       `LLM candidates (process-wide): ${resolution.candidate_count}`,
-      `LLM selected: ${selectedModel} (${selectedHealth ? "durable-health" : "none"})`,
+      `Latest durable model health: ${selectedModel} (${selectedHealth ? "durable-health" : "none"})`,
       `LLM variant (process-wide): ${resolution.variant ?? "none"}`,
       `LLM health: ${selectedHealth?.last_outcome ?? "none"} cooldown=${selectedHealth?.cooldown_until ?? "none"} reason=${selectedHealth?.failure_reason ?? "none"}`,
       `Provenance: ${provenanceSummary}`,

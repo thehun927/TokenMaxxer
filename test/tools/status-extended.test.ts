@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 
-import { _tokenmaxxerStatus, setLastCompaction } from "../../src/tools/status"
+import { _tokenmaxxerStatus } from "../../src/tools/status"
 import { globalMemoryPath, projectMemoryPath } from "../../src/memory/paths"
 import { emptyMemory } from "../../src/memory/schema"
 import { atomicWrite } from "../../src/util/fs"
@@ -26,7 +26,6 @@ beforeEach(async () => {
   // Isolate the global fallback namespace from the developer's real home.
   homeDir = await mkdtemp(join(tmpdir(), "tokenmaxxer-status-ext-home-"))
   vi.stubEnv("HOME", homeDir)
-  ;(setLastCompaction as (ts: string | null) => void)(null as unknown as string)
 })
 
 afterEach(async () => {
@@ -86,9 +85,11 @@ describe("tokenmaxxer_status reports the selected storage source", () => {
     expect(status).toContain("Active files: 0")
     expect(status).toContain("Last updated:")
     expect(status).toContain("Last git SHA:")
-    expect(status).toContain("Last compaction:")
-    expect(status).toContain("Queue depth:")
-    expect(status).toContain("In-flight:")
+    expect(status).toContain("Last completed compaction:")
+    expect(status).toContain("Compaction result artifact:")
+    expect(status).toContain("Compaction prompt snapshot:")
+    expect(status).toContain("Queue depth (process-local):")
+    expect(status).toContain("In-flight (process-local):")
     expect(status).toContain("LLM evidence (process-wide):")
   })
 })

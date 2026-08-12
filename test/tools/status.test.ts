@@ -8,11 +8,14 @@ vi.mock("../../src/memory/store", () => ({
   resolveProjectPath: vi.fn((worktree: string, directory: string) => directory),
 }))
 
+vi.mock("../../src/diagnostics/artifacts", () => ({
+  readDiagnosticArtifact: vi.fn(async () => ({ kind: "missing" })),
+}))
+
 import { readMemoryState } from "../../src/memory/store"
+import { readDiagnosticArtifact } from "../../src/diagnostics/artifacts"
 import {
   _tokenmaxxerStatus,
-  lastCompactionTimestamp,
-  setLastCompaction,
 } from "../../src/tools/status"
 import { getLLMConfig } from "../../src/memory/extract-llm"
 
@@ -82,13 +85,24 @@ describe("_tokenmaxxerStatus", () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.unstubAllEnvs()
-    // Reset the module-level variable between tests
-    ;(setLastCompaction as (ts: string | null) => void)(null as unknown as string)
+    vi.mocked(readDiagnosticArtifact).mockResolvedValue({ kind: "missing" } as never)
   })
 
   it("with memory: returns formatted status with counts", async () => {
     vi.mocked(readMemoryState).mockResolvedValue(statusResult(makeMemory(), { sizeBytes: 13 }))
-    setLastCompaction("2026-08-08T11:00:00.000Z")
+    const resultJson = JSON.stringify({
+      version: 1,
+      completed_at: "2026-08-08T11:00:00.000Z",
+      session_id: "sess-001",
+      host_event: "session.compacted",
+      summary: { status: "missing" },
+    })
+    vi.mocked(readDiagnosticArtifact).mockImplementation(async (name: string) => {
+      if (name === "last_compaction_result.json") {
+        return { kind: "ok", content: resultJson, source: "project", path: "/home/user/my-project/.opencode/memory/last_compaction_result.json", mtime: 1234567890, sizeBytes: resultJson.length } as never
+      }
+      return { kind: "missing" } as never
+    })
 
     const result = await _tokenmaxxerStatus({}, mockContext)
 
@@ -100,7 +114,10 @@ describe("_tokenmaxxerStatus", () => {
     expect(result).toContain("Active files: 1")
     expect(result).toContain("Last updated: 2026-08-08T12:00:00.000Z")
     expect(result).toContain("Last git SHA: abc1234")
-    expect(result).toContain("Last compaction: 2026-08-08T11:00:00.000Z")
+    expect(result).toContain("Last completed compaction: 2026-08-08T11:00:00.000Z")
+    expect(result).toContain("Compaction session: sess-001")
+    expect(result).toContain("Compaction result artifact: /home/user/my-project/.opencode/memory/last_compaction_result.json (project,")
+    expect(result).toContain("Compaction prompt snapshot: none (none, 0 bytes)")
   })
 
   it("reports STATE.json size using UTF-8 bytes", async () => {
@@ -129,13 +146,16 @@ describe("_tokenmaxxerStatus", () => {
     expect(result).toContain("Last git SHA: unknown")
   })
 
-  it("lastCompactionTimestamp not set: shows 'none'", async () => {
+  it("no result artifact shows Last completed compaction none", async () => {
     vi.mocked(readMemoryState).mockResolvedValue(statusResult(makeMemory(), { sizeBytes: 2 }))
-    // lastCompactionTimestamp was reset to null in beforeEach
+    vi.mocked(readDiagnosticArtifact).mockResolvedValue({ kind: "missing" } as never)
 
     const result = await _tokenmaxxerStatus({}, mockContext)
 
-    expect(result).toContain("Last compaction: none")
+    expect(result).toContain("Last completed compaction: none")
+    expect(result).toContain("Compaction session: none")
+    expect(result).toContain("Compaction summary metadata: missing")
+    expect(result).toContain("Compaction result artifact: none (none)")
   })
 
   it("shows bounded provenance summaries without evidence text", async () => {
@@ -191,7 +211,7 @@ describe("_tokenmaxxerStatus", () => {
     const result = await _tokenmaxxerStatus({}, mockContext)
 
     expect(result).toContain("LLM candidates (process-wide): 1")
-    expect(result).toContain("LLM selected: provider/model (durable-health)")
+    expect(result).toContain("Latest durable model health: provider/model (durable-health)")
     expect(result).toContain("LLM variant (process-wide): none")
     expect(result).toContain("LLM health: timeout")
     expect(result).toContain("reason=timeout")
@@ -250,14 +270,14 @@ describe("_tokenmaxxerStatus", () => {
         directory: projectB,
       })
 
-      expect(statusA).toContain("LLM selected: project-a-provider/project-a-model (durable-health)")
+      expect(statusA).toContain("Latest durable model health: project-a-provider/project-a-model (durable-health)")
       expect(statusA).toContain("LLM health: timeout")
       expect(statusA).toContain("reason=project-a-timeout")
       expect(statusA).not.toContain("global/model")
       expect(statusA).not.toContain("project-b-provider/project-b-model")
       expect(statusA).not.toContain("project-b-validation")
 
-      expect(statusB).toContain("LLM selected: project-b-provider/project-b-model (durable-health)")
+      expect(statusB).toContain("Latest durable model health: project-b-provider/project-b-model (durable-health)")
       expect(statusB).toContain("LLM health: validation-failure")
       expect(statusB).toContain("reason=project-b-validation")
       expect(statusB).not.toContain("global/model")
@@ -281,18 +301,54 @@ describe("_tokenmaxxerStatus", () => {
 
     expect(result).toContain("Error checking status: Error: disk failure")
   })
-})
 
-describe("setLastCompaction", () => {
-  it("updates lastCompactionTimestamp", () => {
-    setLastCompaction("2026-08-08T13:00:00.000Z")
-    expect(lastCompactionTimestamp).toBe("2026-08-08T13:00:00.000Z")
+  it("malformed result JSON does not crash status", async () => {
+    vi.mocked(readMemoryState).mockResolvedValue(statusResult(makeMemory(), { sizeBytes: 2 }))
+    vi.mocked(readDiagnosticArtifact).mockImplementation(async (name: string) => {
+      if (name === "last_compaction_result.json") {
+        return { kind: "ok", content: "{ not valid json", source: "project", path: "/home/user/my-project/.opencode/memory/last_compaction_result.json", mtime: 123, sizeBytes: 15 } as never
+      }
+      return { kind: "missing" } as never
+    })
+    const result = await _tokenmaxxerStatus({}, mockContext)
+    expect(result).toContain("unavailable (invalid diagnostic artifact)")
+    expect(result).toContain("Compaction result artifact:")
+    expect(result).not.toContain("Error checking status")
   })
 
-  it("sets to a new value", () => {
-    setLastCompaction("first")
-    expect(lastCompactionTimestamp).toBe("first")
-    setLastCompaction("second")
-    expect(lastCompactionTimestamp).toBe("second")
+  it("exposes prompt artifact separately without conflating result", async () => {
+    vi.mocked(readMemoryState).mockResolvedValue(statusResult(makeMemory(), { sizeBytes: 2 }))
+    const resultJson = JSON.stringify({
+      version: 1,
+      completed_at: "2026-08-12T00:00:00.000Z",
+      session_id: "sess-result",
+      host_event: "session.compacted",
+      summary: { status: "missing" },
+    })
+    vi.mocked(readDiagnosticArtifact).mockImplementation(async (name: string) => {
+      if (name === "last_compaction_result.json") {
+        return { kind: "ok", content: resultJson, source: "project", path: "/home/user/my-project/.opencode/memory/last_compaction_result.json", mtime: 1000, sizeBytes: resultJson.length } as never
+      }
+      if (name === "last_compaction_prompt.log") {
+        return { kind: "ok", content: "prompt body", source: "global", path: "/home/.config/opencode/memory/abc/last_compaction_prompt.log", mtime: 2000, sizeBytes: 11 } as never
+      }
+      return { kind: "missing" } as never
+    })
+    const result = await _tokenmaxxerStatus({}, mockContext)
+    expect(result).toContain("sess-result")
+    expect(result).toContain("/home/user/my-project/.opencode/memory/last_compaction_result.json (project,")
+    expect(result).toContain("/home/.config/opencode/memory/abc/last_compaction_prompt.log (global, 11 bytes")
+    expect(result).not.toContain("prompt body")
+  })
+
+  it("labels ephemeral values as process-local/process-wide", async () => {
+    vi.mocked(readMemoryState).mockResolvedValue(statusResult(makeMemory(), { sizeBytes: 2 }))
+    const result = await _tokenmaxxerStatus({}, mockContext)
+    expect(result).toContain("Queue depth (process-local):")
+    expect(result).toContain("In-flight (process-local):")
+    expect(result).toContain("Last idle outcome (process-local):")
+    expect(result).toContain("LLM evidence (process-wide):")
+    expect(result).toContain("LLM candidates (process-wide):")
+    expect(result).toContain("LLM variant (process-wide):")
   })
 })

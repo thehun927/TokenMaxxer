@@ -70,3 +70,16 @@ deviations, and unresolved blockers.
   — 15 files, 289/289 passed.
 - `npx tsc --noEmit`: passed with no output.
 - `git diff --check`: passed. No TUI or commit-pulse files changed.
+
+## 2026-08-12 — Wave 4 integrated validation
+
+- Replaced process-global compaction status with separate durable result and
+  prompt artifact reads in `src/tools/status.ts`.
+- Removed `lastCompactionTimestamp` and `setLastCompaction` from status; no
+  module cache, STATE write, revision mutation, IdleWriteOutcome change, or
+  TUI pulse path is used.
+- Luna rerun:
+  `npx vitest run test/tools/status.test.ts test/tools/status-extended.test.ts test/tools/pr9-status.test.ts test/diagnostics/artifacts.test.ts test/index.test.ts test/index-pr9-compaction.test.ts`
+  — 6 files, 83/83 passed.
+- `npx tsc --noEmit`: passed with no output.
+- `git diff --check`: passed.
