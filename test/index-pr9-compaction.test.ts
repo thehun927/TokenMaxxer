@@ -666,4 +666,148 @@ describe("PR-9 Agent 1B — index-level compaction prompt/result contracts", () 
       }
     })
   })
+
+  describe("B1 monotonic last-only regressions (deferred-promise)", () => {
+    function createDeferred<T>() {
+      let resolve!: (v: T) => void
+      let reject!: (e: unknown) => void
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res
+        reject = rej
+      })
+      return { promise, resolve, reject }
+    }
+
+    it("older result starts first/newer finishes first/older finishes last -> newer remains", async () => {
+      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-b1-result-race-"))
+      const deferredOlder = createDeferred<{ data: TranscriptMessage[] }>()
+      const deferredNewer = createDeferred<{ data: TranscriptMessage[] }>()
+      let callCount = 0
+      const sessionMessages = vi.fn(async () => {
+        callCount += 1
+        if (callCount === 1) return deferredOlder.promise
+        if (callCount === 2) return deferredNewer.promise
+        return { data: [] }
+      })
+      const client = makeClient({ session: { messages: sessionMessages } })
+      try {
+        const hooks = await TokenmaxxerPlugin(makePluginInput({ directory: project, worktree: project, client }))
+        // Start older first (non-awaited), then newer; host does not await overlapping callbacks
+        const pOlder = hooks.event?.({ event: { type: "session.compacted", properties: { sessionID: "session-older" } } })
+        // tick to ensure first handler captured seq before second starts
+        await Promise.resolve()
+        await new Promise((r) => setTimeout(r, 1))
+        const pNewer = hooks.event?.({ event: { type: "session.compacted", properties: { sessionID: "session-newer" } } })
+        await Promise.resolve()
+        await new Promise((r) => setTimeout(r, 1))
+        // Newer finishes first
+        deferredNewer.resolve({ data: summaryTranscript("newer summary body") })
+        await Promise.resolve()
+        await new Promise((r) => setTimeout(r, 1))
+        // Older finishes last
+        deferredOlder.resolve({ data: summaryTranscript("older summary body") })
+        await Promise.all([pOlder, pNewer])
+        const memoryDir = join(project, ".opencode", "memory")
+        const result = await readFile(join(memoryDir, "last_compaction_result.json"), "utf-8")
+        const parsed = JSON.parse(result)
+        // Monotonic last-only: newer must remain, older must not overwrite
+        expect(parsed.session_id).toBe("session-newer")
+        expect(parsed.session_id).not.toBe("session-older")
+        // Ensure both handlers did not throw and did not touch STATE
+        expect(writeMemoryOnIdle).not.toHaveBeenCalled()
+      } finally {
+        await rm(project, { recursive: true, force: true })
+      }
+    })
+
+    it("older prompt starts first/newer finishes first/older finishes last -> newer remains", async () => {
+      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-b1-prompt-race-"))
+      const deferredOlder = createDeferred<string>()
+      const deferredNewer = createDeferred<string>()
+      // Use two deferred durables: older resolves last, newer first
+      buildDurableBlock
+        .mockImplementationOnce(() => deferredOlder.promise)
+        .mockImplementationOnce(() => deferredNewer.promise)
+      try {
+        const hooks = await TokenmaxxerPlugin(makePluginInput({ directory: project, worktree: project }))
+        const outOlder: { context: string[]; prompt?: string } = { context: [] }
+        const outNewer: { context: string[]; prompt?: string } = { context: [] }
+        const pOlder = hooks["experimental.session.compacting"]?.({ sessionID: "session-older" } as any, outOlder as any)
+        await Promise.resolve()
+        await new Promise((r) => setTimeout(r, 1))
+        const pNewer = hooks["experimental.session.compacting"]?.({ sessionID: "session-newer" } as any, outNewer as any)
+        await Promise.resolve()
+        await new Promise((r) => setTimeout(r, 1))
+        // Newer finishes first with distinct payload
+        deferredNewer.resolve("durable-newer-payload-UNIQUE-NEWER")
+        await Promise.resolve()
+        await new Promise((r) => setTimeout(r, 1))
+        deferredOlder.resolve("durable-older-payload-UNIQUE-OLDER")
+        await Promise.all([pOlder, pNewer])
+        const memoryDir = join(project, ".opencode", "memory")
+        const snapshot = await readFile(join(memoryDir, "last_compaction_prompt.log"), "utf-8")
+        // Last-only snapshot must be newer
+        expect(snapshot).toContain("session=session-newer")
+        expect(snapshot).toContain("durable-newer-payload-UNIQUE-NEWER")
+        expect(snapshot).not.toContain("durable-older-payload-UNIQUE-OLDER")
+        // Session id line must not be older
+        expect(snapshot).not.toMatch(/session=session-older/)
+      } finally {
+        await rm(project, { recursive: true, force: true })
+      }
+    })
+
+    it("publication failure remains non-fatal and last-only still holds", async () => {
+      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-b1-failure-"))
+      const deferredOlder = createDeferred<{ data: TranscriptMessage[] }>()
+      const deferredNewer = createDeferred<{ data: TranscriptMessage[] }>()
+      let callCount = 0
+      const sessionMessages = vi.fn(async () => {
+        callCount += 1
+        if (callCount === 1) return deferredOlder.promise
+        if (callCount === 2) return deferredNewer.promise
+        return { data: [] }
+      })
+      const client = makeClient({ session: { messages: sessionMessages } })
+      // Spy on artifacts to inject a failure for the older publication's write
+      const artifacts = await import("../src/diagnostics/artifacts")
+      const originalWrite = artifacts.writeDiagnosticArtifact
+      let writeCall = 0
+      const writeSpy = vi.spyOn(artifacts, "writeDiagnosticArtifact").mockImplementation(async (...args: Parameters<typeof originalWrite>) => {
+        writeCall += 1
+        // Fail the first actual write (which will be newer's publish, since newer finishes first)
+        // To make deterministic, we fail the first write invocation; second must succeed and still be newer.
+        // Instead fail the older's write after newer succeeds: we need to know which session is being written.
+        // Content arg is the JSON string; inspect session_id inside.
+        const content = args[2] as string
+        if (content.includes("session-older")) {
+          throw new Error("injected publication failure")
+        }
+        return originalWrite(...args)
+      })
+      try {
+        const hooks = await TokenmaxxerPlugin(makePluginInput({ directory: project, worktree: project, client }))
+        const pOlder = hooks.event?.({ event: { type: "session.compacted", properties: { sessionID: "session-older" } } })
+        await Promise.resolve()
+        await new Promise((r) => setTimeout(r, 1))
+        const pNewer = hooks.event?.({ event: { type: "session.compacted", properties: { sessionID: "session-newer" } } })
+        await Promise.resolve()
+        await new Promise((r) => setTimeout(r, 1))
+        deferredNewer.resolve({ data: summaryTranscript("newer summary") })
+        await Promise.resolve()
+        await new Promise((r) => setTimeout(r, 1))
+        deferredOlder.resolve({ data: summaryTranscript("older summary") })
+        // Both must resolve without throwing despite injected failure
+        await expect(Promise.all([pOlder, pNewer])).resolves.not.toThrow()
+        // Newer should still be persisted even though older's write threw
+        const memoryDir = join(project, ".opencode", "memory")
+        const result = await readFile(join(memoryDir, "last_compaction_result.json"), "utf-8")
+        const parsed = JSON.parse(result)
+        expect(parsed.session_id).toBe("session-newer")
+      } finally {
+        writeSpy.mockRestore()
+        await rm(project, { recursive: true, force: true })
+      }
+    })
+  })
 })

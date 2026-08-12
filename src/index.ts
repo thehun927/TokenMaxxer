@@ -23,7 +23,7 @@ import { resolveProjectPath } from "./memory/store"
 import { registerTools } from "./tools/recall"
 import { registerEfficiencyTools } from "./tools/efficiency"
 import { registerStatusTools } from "./tools/status"
-import { writeDiagnosticArtifact } from "./diagnostics/artifacts"
+import { readDiagnosticArtifact, writeDiagnosticArtifact } from "./diagnostics/artifacts"
 import {
   COMPACTION_PROMPT_ARTIFACT_MAX_BYTES,
   COMPACTION_RESULT_ARTIFACT_MAX_BYTES,
@@ -36,6 +36,18 @@ import { atomicWrite, safeRead } from "./util/fs"
 import { join } from "node:path"
 import { createHash } from "node:crypto"
 import type { CompactionInput, CompactionOutput } from "./types"
+
+// ─── B1 monotonic last-only publication (module-global for same-process cross-instance ordering) ───
+// Captures ordering at hook/event receipt before async history/diagnostic work; history
+// retrieval stays outside any filesystem lock; only short per-project/artifact publication
+// (mtime/metadata check + atomic write) is serialized. Older observations never replace newer.
+let _b1MonotonicSeq = 0
+const _b1LastPublishedSeqByKey = new Map<string, number>()
+const _b1PublicationQueueByKey = new Map<string, Promise<void>>()
+function _b1NextSeq(): number {
+  _b1MonotonicSeq += 1
+  return _b1MonotonicSeq
+}
 
 export const TokenmaxxerPlugin: Plugin = async (ctx) => {
   const { client, directory, worktree } = ctx
@@ -61,8 +73,87 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
     // Non-fatal — best effort
   }
 
+  // B1: per-project/artifact monotonic serialization. History retrieval stays
+  // outside; only short publication (mtime/metadata check + atomic write) is
+  // serialized per project/artifact. Older observations never replace newer.
+  // Fix for stale global guard / timestamp precision: same-process ordering is
+  // authoritative via seq+queue; disk mtime/metadata is consulted only when
+  // we have no in-memory ordering for this project (last==0) to allow a
+  // newer sequential observation in a new plugin instance to win even if
+  // filesystem mtime appears slightly newer due to coarse precision or mocked
+  // Date.now. This preserves overlapping monotonic while not suppressing
+  // normal sequential updates.
+  async function b1MonotonicPublish(
+    artifactName: "last_compaction_prompt.log" | "last_compaction_result.json",
+    seq: number,
+    observedAtMs: number,
+    publish: () => Promise<void>,
+  ): Promise<void> {
+    const key = `${project}:${artifactName}`
+    const prev = _b1PublicationQueueByKey.get(key) ?? Promise.resolve()
+    const next = prev.then(async () => {
+      const last = _b1LastPublishedSeqByKey.get(key) ?? 0
+      if (seq <= last) return
+      // If we already have an in-memory ordering for this project, seq is
+      // authoritative — skip disk time checks to avoid false suppression from
+      // coarse mtime/observed_at precision or mocked clocks. Disk check is
+      // only for the first observation per project in this process (last==0)
+      // to provide best-effort cross-process protection.
+      if (last !== 0) {
+        _b1LastPublishedSeqByKey.set(key, seq)
+        try {
+          await publish()
+        } catch {
+          // publication failure remains non-fatal
+        }
+        return
+      }
+      try {
+        const existing = await readDiagnosticArtifact(artifactName, project)
+        if (existing.kind === "ok") {
+          if (typeof existing.mtime === "number" && existing.mtime > observedAtMs) {
+            _b1LastPublishedSeqByKey.set(key, Math.max(last, seq))
+            return
+          }
+          try {
+            let existingTs: number | null = null
+            if (artifactName === "last_compaction_result.json") {
+              const parsed = JSON.parse(existing.content) as { completed_at?: string }
+              if (typeof parsed.completed_at === "string") {
+                const t = Date.parse(parsed.completed_at)
+                if (!Number.isNaN(t)) existingTs = t
+              }
+            } else {
+              const m = existing.content.match(/^observed_at=(.+)$/m)
+              if (m) {
+                const t = Date.parse(m[1].trim())
+                if (!Number.isNaN(t)) existingTs = t
+              }
+            }
+            if (existingTs !== null && existingTs > observedAtMs) {
+              _b1LastPublishedSeqByKey.set(key, Math.max(last, seq))
+              return
+            }
+          } catch {
+            // ignore parse errors
+          }
+        }
+      } catch {
+        // read failure is non-fatal; proceed with seq ordering
+      }
+      _b1LastPublishedSeqByKey.set(key, seq)
+      try {
+        await publish()
+      } catch {
+        // publication failure remains non-fatal
+      }
+    }).catch(() => {})
+    _b1PublicationQueueByKey.set(key, next)
+    await next
+  }
+
   /**
-   * Bound arbitrary fallback/error text to a deterministic character cap.
+    * Bound arbitrary fallback/error text to a deterministic character cap.
    * Preserves the first `maxLen` characters and adds a truncation suffix when
    * the original exceeds the cap so diagnostics never consume unbounded
    * storage from an arbitrary host error message.
@@ -162,6 +253,9 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
   return {
     // Layer 1: compaction-quality hook
     "experimental.session.compacting": async (input: CompactionInput, output: CompactionOutput) => {
+      // B1: capture ordering at receipt before any async history/diagnostic work
+      const promptSeq = _b1NextSeq()
+      const promptObservedAtMs = Date.now()
       try {
         const durable = (await buildDurableBlock({ worktree, directory, client })) ?? ""
         const requestedMode = process.env.TOKENMAXXER_COMPACTION_MODE
@@ -181,7 +275,7 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
         let tokenMaxxerPayload: string
 
         if (options.compactionMode === "replace") {
-          // Replace mode: attempt to recover previous summary
+          // Replace mode: attempt to recover previous summary (outside lock)
           const historyResult = await readPreviousCompactionSummary({
             client,
             sessionID: input.sessionID,
@@ -253,6 +347,8 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
         // with UTF-8-safe truncation of the stored diagnostic copy only. A
         // persistence failure is a bounded warning and never changes the
         // compaction hook output.
+        // Build artifact outside lock; serialize only short publication.
+        let promptArtifactContent: string
         try {
           const artifact = buildCompactionPromptArtifact({
             sessionID: input.sessionID,
@@ -261,29 +357,47 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
             fallbackReason: boundedFallbackReason,
             payload: tokenMaxxerPayload,
           })
-          const writeResult = await writeDiagnosticArtifact(
-            "last_compaction_prompt.log",
-            project,
-            artifact.content,
-            COMPACTION_PROMPT_ARTIFACT_MAX_BYTES,
-          )
-          if (!writeResult.ok) {
-            // Bounded warning only — never log the prompt body.
-            await log(client, "warn", "compaction prompt artifact not persisted", {
-              artifact: "last_compaction_prompt.log",
-              project,
-              reason: writeResult.reason,
-              sizeBytes: writeResult.sizeBytes,
-              maxBytes: writeResult.maxBytes,
-            })
-          }
+          promptArtifactContent = artifact.content
         } catch (e) {
           await log(client, "warn", "compaction prompt diagnostic failed", {
             artifact: "last_compaction_prompt.log",
             project,
             error: boundReason(e instanceof Error ? e.message : String(e), 500),
           })
+          return
         }
+
+        await b1MonotonicPublish(
+          "last_compaction_prompt.log",
+          promptSeq,
+          promptObservedAtMs,
+          async () => {
+            try {
+              const writeResult = await writeDiagnosticArtifact(
+                "last_compaction_prompt.log",
+                project,
+                promptArtifactContent,
+                COMPACTION_PROMPT_ARTIFACT_MAX_BYTES,
+              )
+              if (!writeResult.ok) {
+                // Bounded warning only — never log the prompt body.
+                await log(client, "warn", "compaction prompt artifact not persisted", {
+                  artifact: "last_compaction_prompt.log",
+                  project,
+                  reason: writeResult.reason,
+                  sizeBytes: writeResult.sizeBytes,
+                  maxBytes: writeResult.maxBytes,
+                })
+              }
+            } catch (e) {
+              await log(client, "warn", "compaction prompt diagnostic failed", {
+                artifact: "last_compaction_prompt.log",
+                project,
+                error: boundReason(e instanceof Error ? e.message : String(e), 500),
+              })
+            }
+          },
+        )
       } catch (e) {
         await log(client, "error", "compaction hook failed", {
           error: boundErrorText(e, 500),
@@ -295,16 +409,93 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
     event: async ({ event }: { event: { type: string; properties?: Record<string, unknown> } }) => {
       try {
         if (event.type === "session.compacted") {
+          // B1: capture ordering at event receipt before async history/diagnostic work
+          const resultSeq = _b1NextSeq()
+          const resultObservedAtMs = Date.now()
+          const resultObservedAtIso = new Date(resultObservedAtMs).toISOString()
           const sessionId = event.properties?.sessionID as string | undefined
           if (!sessionId) {
             await log(client, "warn", "session.compacted missing sessionID")
             return
           }
-          // The host event proves successful completion. The result artifact
-          // is written only here, never from the pre-compaction hook. This
-          // path must not call writeMemoryOnIdle, change STATE, advance a
-          // revision, or pulse TUI.
-          await recordCompactionResultBestEffort({ client, project, sessionID: sessionId })
+          // History retrieval stays outside any filesystem/STATE lock.
+          let summary: CompactionResultSummary
+          let historyOk = true
+          try {
+            const historyResult = await readPreviousCompactionSummary({
+              client,
+              sessionID: sessionId,
+            })
+            if (historyResult.status === "found") {
+              summary = {
+                status: "found",
+                bytes: Buffer.byteLength(historyResult.summary, "utf8"),
+                sha256: createHash("sha256").update(historyResult.summary, "utf8").digest("hex"),
+              }
+            } else if (historyResult.status === "none") {
+              summary = { status: "missing" }
+            } else {
+              summary = { status: "unavailable", reason: historyResult.reason }
+            }
+          } catch (e) {
+            // Keep non-fatal but still record completion with unavailable
+            summary = {
+              status: "unavailable",
+              reason: boundReason(e instanceof Error ? e.message : String(e), 500),
+            }
+            historyOk = false
+            void historyOk
+          }
+          // Build diagnostic outside lock; completed_at uses observation time for monotonic metadata.
+          let resultJson: string
+          try {
+            const artifact = buildCompactionResultDiagnostic({
+              completedAt: resultObservedAtIso,
+              sessionID: sessionId,
+              summary: summary!,
+            })
+            resultJson = artifact.json
+          } catch (e) {
+            await log(client, "warn", "compaction result diagnostic failed", {
+              artifact: "last_compaction_result.json",
+              project,
+              error: boundReason(e instanceof Error ? e.message : String(e), 500),
+            })
+            return
+          }
+          // Serialize only short publication (mtime/metadata check + atomic write).
+          // Older observations must never replace newer persisted observations;
+          // publication failure remains non-fatal and never mutates STATE/revision/IdleWriteOutcome/.commit-pulse.
+          await b1MonotonicPublish(
+            "last_compaction_result.json",
+            resultSeq,
+            resultObservedAtMs,
+            async () => {
+              try {
+                const writeResult = await writeDiagnosticArtifact(
+                  "last_compaction_result.json",
+                  project,
+                  resultJson,
+                  COMPACTION_RESULT_ARTIFACT_MAX_BYTES,
+                )
+                if (!writeResult.ok) {
+                  await log(client, "warn", "compaction result artifact not persisted", {
+                    artifact: "last_compaction_result.json",
+                    project,
+                    reason: writeResult.reason,
+                    sizeBytes: writeResult.sizeBytes,
+                    maxBytes: writeResult.maxBytes,
+                  })
+                }
+              } catch (e) {
+                await log(client, "warn", "compaction result diagnostic failed", {
+                  artifact: "last_compaction_result.json",
+                  project,
+                  error: boundReason(e instanceof Error ? e.message : String(e), 500),
+                })
+              }
+            },
+          )
           return
         }
         if (event.type === "session.idle") {
