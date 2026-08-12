@@ -243,6 +243,13 @@ Wave 1 has not started.
 - The failed CI run was not a production behavior failure; it was a test
   lifecycle/order defect. A corrective commit and replacement CI run are
   required before Oracle evidence is finalized.
+- Replacement CI run `31638682137` at corrective head `dd20469` passed the
+  full suite, typecheck, host contract, audit, build, package, CLI, shell,
+  and reproducibility gates, then failed only because a CI `set -u` shell step
+  referenced the unavailable `npm_package_version` lifecycle variable.
+- Replaced that workflow reference with an explicit `node -p` package-version
+  lookup. Local workflow contracts (23/23), CI YAML parsing, dry-run preflight,
+  and diff-check pass. A second replacement CI run is required.
 - Final checksum policy correction: `SHA256SUMS` now covers all 10 staged
   payloads except the manifest itself, while the installer verifies its five
   downloaded payloads before mutation. Pre-commit staged-manifest evidence at
