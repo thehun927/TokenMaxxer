@@ -143,3 +143,27 @@ Wave 1 has not started.
   the pinned release target `22.23.1`; the reproducibility script compares the
   same local locked toolchain across both passes. No real `v*` tag or GitHub
   Release was created.
+
+## Wave 4 — Release identity preflight — 2026-08-12
+
+- Added executable `scripts/release-preflight.mjs` and the
+  `npm run release:preflight` entry point. It validates package SemVer,
+  exact `v<version>` tag identity, lowercase 40-hex commit shape, OpenCode
+  peer/minimum contracts, schema-v1 `RELEASE.json` when present, and the
+  no-existing-release-tag implementation invariant.
+- The preflight is fail-closed for non-dry-run commit authenticity: a supplied
+  commit that differs from checked-out `HEAD`, or an inability to verify it,
+  exits nonzero. Explicit `--dry-run` skips only this local authenticity check
+  while retaining semantic identity validation; it does not fabricate a
+  release identity.
+- `npx vitest run test/release/workflow/release-identity.test.ts`: 15 passed.
+- `node --check scripts/release-preflight.mjs`: passed.
+- `npx tsc --noEmit`: passed.
+- Manual CLI evidence: valid explicit dry-run exited 0; mismatched tag exited
+  1; malformed/short commit exited 1; `npm run release:preflight` against the
+  checked-out `HEAD` exited 0.
+- No `v*` tag exists and no real release/tag was created or published.
+- Planned network/repository checks (`GITHUB_SHA`, main ancestry, existing
+  GitHub Release, and immutable-release proof) remain workflow-owned and are
+  intentionally deferred to Waves 6–8; no local preflight bypass is treated
+  as release publication evidence.

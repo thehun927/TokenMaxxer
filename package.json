@@ -48,7 +48,8 @@
     "verify:host-contract": "node scripts/verify-host-contract.mjs && npm run typecheck:host-contract",
     "verify:dist": "node scripts/verify-dist.mjs",
     "verify:package": "node scripts/verify-package.mjs",
-    "verify:reproducible-build": "node scripts/verify-reproducible-build.mjs"
+    "verify:reproducible-build": "node scripts/verify-reproducible-build.mjs",
+    "release:preflight": "node scripts/release-preflight.mjs --tag v$npm_package_version --commit $(git rev-parse HEAD)"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.18.15 <2.0.0",
