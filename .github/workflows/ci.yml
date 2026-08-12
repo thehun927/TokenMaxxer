@@ -109,6 +109,7 @@ jobs:
 
       - name: Verify release staging and release set contracts
         run: |
-          npm run release:preflight -- --tag "v${npm_package_version}" --commit "$(git rev-parse HEAD)" --dry-run
+          version="$(node -p 'require("./package.json").version')"
+          npm run release:preflight -- --tag "v${version}" --commit "$(git rev-parse HEAD)" --dry-run
           git diff --check
           git ls-files 'dist/**'
