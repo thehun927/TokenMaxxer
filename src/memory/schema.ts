@@ -15,6 +15,49 @@ const MAX_CACHE_QUARANTINE_COUNT = 10_000
 export const MAX_MODEL_HEALTH_RECORDS = 10
 export const MAX_PROCESSED_SOURCES = 10
 
+/**
+ * PR 8 §8.1 — tight creation limits for new automatic content.
+ *
+ * Heuristic extraction/merge must obey these bounds before values enter
+ * durable state. They are deliberately tighter than the persistence
+ * compatibility ceilings (§8.2) so a previously valid PR-7 `version:3` file
+ * with long but human-reviewed text remains readable.
+ */
+export const MEMORY_CREATION_LIMITS = {
+  currentTaskChars: 512,
+  activeFilePathChars: 2_048,
+  activeFileReasonChars: 512,
+  decisionTopicChars: 256,
+  decisionTextChars: 500,
+  decisionRationaleChars: 500,
+  blockerChars: 512,
+  nextStepChars: 512,
+  blockersMax: 8,
+  nextStepsMax: 8,
+  activeFilesMax: 16,
+} as const
+
+/**
+ * PR 8 §8.2 — broad persistence compatibility ceilings.
+ *
+ * These are the finite schema maxima for formerly unbounded persisted fields.
+ * They are intentionally broad so a previously valid PR-7 `version:3` file
+ * stays readable; new automatic content is capped by the tighter
+ * `MEMORY_CREATION_LIMITS` above. Values beyond these ceilings fail closed.
+ */
+export const MEMORY_PERSISTENCE_CEILINGS = {
+  projectPathChars: 4_096,
+  currentTaskChars: 2_048,
+  activeFilePathChars: 4_096,
+  activeFileReasonChars: 2_048,
+  blockerChars: 2_048,
+  nextStepChars: 2_048,
+  decisionTopicChars: 8_192,
+  decisionTextChars: 8_192,
+  decisionRationaleChars: 8_192,
+  nonAuthoritativeArrayMax: 128,
+} as const
+
 /** The two kinds of source material an extractor may point at. */
 export const EvidenceKindSchema = z.enum(["transcript", "heuristic-candidate"])
 export type EvidenceKind = z.infer<typeof EvidenceKindSchema>
@@ -159,9 +202,15 @@ export const DecisionSchema = z.object({
   // human review, so it shares the same identifier contract as the lineage
   // fields (`superseded_by`, `conflicts_with`, `derived_from_decision_id`).
   id: z.string().min(1).max(MAX_IDENTIFIER),
-  topic: z.string(),
-  decision: z.string(),
-  rationale: z.string().optional(),
+  // PR 8 §8.2 — broad persistence ceilings. New automatic content is capped
+  // by the tighter MEMORY_CREATION_LIMITS; existing v3 human-reviewed text
+  // within these ceilings is never truncated on load.
+  topic: z.string().max(MEMORY_PERSISTENCE_CEILINGS.decisionTopicChars),
+  decision: z.string().max(MEMORY_PERSISTENCE_CEILINGS.decisionTextChars),
+  rationale: z
+    .string()
+    .max(MEMORY_PERSISTENCE_CEILINGS.decisionRationaleChars)
+    .optional(),
   timestamp: z.string().datetime({ offset: true }).or(z.string()), // ISO 8601
   git_sha: z.string().optional(),
   session_id: z.string(),
@@ -196,8 +245,9 @@ export type Decision = Omit<z.input<typeof DecisionSchema>, "provenance"> & {
 }
 
 export const ActiveFileSchema = z.object({
-  path: z.string(),
-  reason: z.string(),
+  // PR 8 §8.2 — broad persistence ceilings for previously valid v3 state.
+  path: z.string().max(MEMORY_PERSISTENCE_CEILINGS.activeFilePathChars),
+  reason: z.string().max(MEMORY_PERSISTENCE_CEILINGS.activeFileReasonChars),
   last_touched: z.string().datetime({ offset: true }).or(z.string()), // ISO 8601
   provenance: NonDecisionProvenanceSchema,
 })
@@ -314,16 +364,30 @@ const MemoryFileBaseSchema = z.object({
   version: z.literal(3),
   /** Monotonic logical freshness signal. Additive: existing STATE files load with revision 0. */
   revision: z.number().int().nonnegative().default(0),
-  project_path: z.string(),
+  // PR 8 §8.2 — broad persistence ceiling for the project path.
+  project_path: z.string().max(MEMORY_PERSISTENCE_CEILINGS.projectPathChars),
   last_updated: z.string().datetime({ offset: true }).or(z.string()), // ISO 8601
   last_git_sha: z.string().optional(),
   last_session_id: z.string().optional(),
-  current_task: z.string().optional(),
+  // PR 8 §8.2 — broad persistence ceiling for current_task. New automatic
+  // content is capped by the tighter MEMORY_CREATION_LIMITS.
+  current_task: z.string().max(MEMORY_PERSISTENCE_CEILINGS.currentTaskChars).optional(),
   current_task_provenance: NonDecisionProvenanceSchema.optional(),
-  active_files: z.array(ActiveFileSchema).default([]),
+  // PR 8 §8.2 — non-authoritative arrays use a broad safety ceiling (128);
+  // new-write creation limits are tighter (see MEMORY_CREATION_LIMITS).
+  active_files: z
+    .array(ActiveFileSchema)
+    .max(MEMORY_PERSISTENCE_CEILINGS.nonAuthoritativeArrayMax)
+    .default([]),
   decisions: z.array(DecisionSchema).default([]),
-  blockers: z.array(z.string()).default([]),
-  next_steps: z.array(z.string()).default([]),
+  blockers: z
+    .array(z.string().max(MEMORY_PERSISTENCE_CEILINGS.blockerChars))
+    .max(MEMORY_PERSISTENCE_CEILINGS.nonAuthoritativeArrayMax)
+    .default([]),
+  next_steps: z
+    .array(z.string().max(MEMORY_PERSISTENCE_CEILINGS.nextStepChars))
+    .max(MEMORY_PERSISTENCE_CEILINGS.nonAuthoritativeArrayMax)
+    .default([]),
   recent_sessions: z.array(z.string()).max(10).default([]),
   llm_extraction_cache: z.array(LLMExtractionCacheEntrySchema).max(10).optional(),
   /** Additive v2 guard metadata; absent in older STATE.json files. */

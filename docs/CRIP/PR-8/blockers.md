@@ -48,3 +48,13 @@ pull PR-9 diagnostics/status or PR-10 release/dependency work into this PR.
 - Temporary measurement files created during fixture calibration (`measure.mjs`, `measure2.mjs`) are excluded from the deliverable and removed before commit.
 - Deepwork ignore rules were added once as required for `.slim/deepwork/`; the unrelated `opencode.json` change remains intentionally unstaged.
 - Wave 2 is complete. Wave 3 schema/migration compatibility is the next dependency-ordered phase; no Wave 4+ integration has started.
+
+## 2026-08-12 — Wave 3 schema/migration compatibility reconciled
+
+- Owned implementation: `src/memory/schema.ts` and `src/memory/migrate.ts`; no transaction, writer, durable, recall, or CLI integration was included.
+- PR-8 focused rerun: `npx vitest run test/memory/pr8-schema-compat.test.ts` → 19 passed, 0 failed.
+- Existing schema/migration regression rerun: `npx vitest run test/memory/schema.test.ts test/memory/migrate.test.ts` → 76 passed, 0 failed.
+- Full memory-suite rerun: 24 files / 562 passed; the only four failures are outside Wave 3 ownership: the intentional Wave-1 typed storage result still reports legacy `commit-failed`, plus existing P0-A direct-write logging/UTF-8 and activity-marker assertions. These remain blockers for later transaction/reliability integration and were not weakened.
+- TypeScript check: `npx tsc --noEmit` → passed (exit 0).
+- Decision: keep broad persistence ceilings separate from tight automatic creation constants; migration repairs only oversized non-authoritative arrays deterministically and never truncates semantic text or invents provenance/evidence.
+- Wave 3 is complete. Wave 4 canonical `mutateMemory()` transaction-budget integration is now the next phase.

@@ -47,6 +47,9 @@ review.
 
 ## Active phase
 
-Wave 1 is complete. Before dispatching Wave 2, reconcile any implementation
-lane ownership against this file and preserve the existing unrelated
-`opencode.json` modification.
+Wave 2 is complete in `f9e079a` with 52/52 primitive tests and a passing
+TypeScript check. Wave 3 schema/migration compatibility is complete with 19/19
+PR-8 contracts, 76 existing schema/migration regressions, and a passing
+TypeScript check. Wave 4 canonical transaction integration is now active. The
+unrelated `opencode.json` modification and untracked `.opencode/` state remain
+outside PR-8 ownership.

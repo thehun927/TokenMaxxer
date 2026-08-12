@@ -12,6 +12,7 @@ import {
   CacheQuarantineMetadataSchema,
   LLMExtractionCacheEntrySchema,
   MAX_IDENTIFIER,
+  MEMORY_PERSISTENCE_CEILINGS,
   MemoryFileSchema,
   type MemoryFile,
   type Provenance,
@@ -466,6 +467,64 @@ function repairIncompleteLLMProvenanceInState(data: RawRecord): RawRecord {
 }
 
 /**
+ * PR 8 §8.3 — deterministic pure repair of oversized non-authoritative arrays.
+ *
+ * A previously valid PR-7 `version:3` file may carry more than 128 active
+ * files / blockers / next steps because those arrays were unbounded. Before
+ * final `MemoryFileSchema.safeParse()` we cap them deterministically:
+ *
+ *  - active files: keep the 128 most-recently-touched (last_touched
+ *    descending, then lexical path ascending for stable ties);
+ *  - blockers / next steps: keep the first 128 entries in document order.
+ *
+ * The repair is a pure function of the input bytes (no random values), never
+ * invents provenance/evidence, never truncates semantic strings, and never
+ * runs storage pruning during a read. Values beyond the broad persistence
+ * ceilings (e.g. a 2049-char blocker) are NOT repaired here — they fail
+ * closed in final validation.
+ */
+function repairOversizedNonAuthoritativeArrays(data: RawRecord): RawRecord {
+  const max = MEMORY_PERSISTENCE_CEILINGS.nonAuthoritativeArrayMax
+  let changed = false
+
+  const result: RawRecord = { ...data }
+
+  if (Array.isArray(result.active_files) && result.active_files.length > max) {
+    const sorted = result.active_files
+      .map((file, index) => ({ file, index }))
+      .sort((a, b) => {
+        const aFile = isRecord(a.file) ? a.file : undefined
+        const bFile = isRecord(b.file) ? b.file : undefined
+        const aTouched = typeof aFile?.last_touched === "string" ? aFile.last_touched : ""
+        const bTouched = typeof bFile?.last_touched === "string" ? bFile.last_touched : ""
+        const touchedCompare = bTouched.localeCompare(aTouched)
+        if (touchedCompare !== 0) return touchedCompare
+        const aPath = typeof aFile?.path === "string" ? aFile.path : ""
+        const bPath = typeof bFile?.path === "string" ? bFile.path : ""
+        const pathCompare = aPath.localeCompare(bPath)
+        if (pathCompare !== 0) return pathCompare
+        return a.index - b.index
+      })
+      .slice(0, max)
+      .map((entry) => entry.file)
+    result.active_files = sorted
+    changed = true
+  }
+
+  if (Array.isArray(result.blockers) && result.blockers.length > max) {
+    result.blockers = result.blockers.slice(0, max)
+    changed = true
+  }
+
+  if (Array.isArray(result.next_steps) && result.next_steps.length > max) {
+    result.next_steps = result.next_steps.slice(0, max)
+    changed = true
+  }
+
+  return changed ? result : data
+}
+
+/**
  * Load a raw parsed JSON value and migrate it to the current MemoryFile schema.
  * Returns null for invalid/corrupt data, unknown versions, or missing version.
  * No filesystem operation is performed on either success or failure.
@@ -523,6 +582,12 @@ export function loadAndMigrate(raw: unknown): MemoryFile | null {
 
   // PR 6 Wave 5 — repair incomplete LLM provenance in active_files and current_task
   data = repairIncompleteLLMProvenanceInState(data)
+
+  // PR 8 §8.3 — deterministically cap grossly excessive non-authoritative
+  // arrays before final validation. This is a pure read-time repair: it never
+  // invents provenance/evidence, never truncates semantic strings, and never
+  // persists a reduced document.
+  data = repairOversizedNonAuthoritativeArrays(data)
 
   const parsed = MemoryFileSchema.safeParse(data)
   if (!parsed.success) {
