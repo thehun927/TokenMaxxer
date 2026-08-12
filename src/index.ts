@@ -73,6 +73,25 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
   }
 
   /**
+   * Safely stringify an arbitrary thrown value and bound the TOTAL value to a
+   * deterministic character cap. Never throws: a hostile value whose
+   * `toString()` throws is replaced with a fixed placeholder so the outer
+   * catch seams can never escape through the logging path. Unlike `boundReason`
+   * (which appends a truncation suffix on top of the cap), the returned value
+   * itself never exceeds `maxLen` characters.
+   */
+  function boundErrorText(error: unknown, maxLen: number): string {
+    let text: string
+    try {
+      text = error instanceof Error ? error.message : String(error)
+    } catch {
+      text = "[unknown error]"
+    }
+    if (text.length <= maxLen) return text
+    return `${text.slice(0, maxLen - 3)}...`
+  }
+
+  /**
    * Best-effort persistence of the successful `session.compacted` observation.
    *
    * The host emits `session.compacted` only after successful compaction
@@ -266,7 +285,9 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
           })
         }
       } catch (e) {
-        await log(client, "error", "compaction hook failed", { error: String(e) })
+        await log(client, "error", "compaction hook failed", {
+          error: boundErrorText(e, 500),
+        })
       }
     },
 
@@ -303,7 +324,10 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
           await writeMemoryOnIdle({ client, worktree, directory, sessionId })
         }
       } catch (e) {
-        await log(client, "error", "event handler failed", { type: event.type, error: String(e) })
+        await log(client, "error", "event handler failed", {
+          type: event.type,
+          error: boundErrorText(e, 500),
+        })
       }
     },
 

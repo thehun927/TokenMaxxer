@@ -28,6 +28,7 @@ export const COMPACTION_RESULT_ARTIFACT_MAX_BYTES = 4096
 /** Result/prompt metadata bounds (contract §4.2 / §5.1). */
 const MAX_SESSION_ID_CHARS = 256
 const MAX_REASON_CHARS = 500
+const MAX_REQUESTED_MODE_CHARS = 64
 /**
  * Cap for a stored fallback_reason value so the full
  * `fallback_reason=<value>` line (16 prefix chars) stays within 550
@@ -49,6 +50,30 @@ function utf8Bytes(value: string): number {
 function boundWithSuffix(value: string, max: number): string {
   if (value.length <= max) return value
   return `${value.slice(0, max - 3)}...`
+}
+
+/**
+ * Normalize a header metadata value to a bounded single line with visible escaping.
+ * - Truncates to maxChars if needed
+ * - Escapes CR/LF/control chars with visible markers
+ * - Ensures emoji-safe byte accounting
+ */
+function normalizeHeaderMetadata(value: string, maxChars: number): string {
+  // First escape control chars (this makes the string longer)
+  let escaped = value.replace(/[\r\n\t]/g, (char) => {
+    if (char === '\r') return '\\r'
+    if (char === '\n') return '\\n'
+    if (char === '\t') return '\\t'
+    return char
+  })
+
+  // Escape other control chars (0x00-0x1F, 0x7F)
+  escaped = escaped.replace(/[\x00-\x1F\x7F]/g, (char) => {
+    return `\\x${char.charCodeAt(0).toString(16).padStart(2, '0')}`
+  })
+
+  // Now truncate to maxChars (after escaping, so we account for escape sequences)
+  return boundWithSuffix(escaped, maxChars)
 }
 
 /**
@@ -96,20 +121,21 @@ export function buildCompactionPromptArtifact(
   input: CompactionPromptArtifactInput,
 ): CompactionPromptArtifact {
   const maxBytes = COMPACTION_PROMPT_ARTIFACT_MAX_BYTES
-  const sessionID = boundWithSuffix(input.sessionID, MAX_SESSION_ID_CHARS)
+  const sessionID = normalizeHeaderMetadata(input.sessionID, MAX_SESSION_ID_CHARS)
+  const requestedMode = normalizeHeaderMetadata(input.requestedMode, MAX_REQUESTED_MODE_CHARS)
+  const effectiveMode = normalizeHeaderMetadata(input.effectiveMode, MAX_REQUESTED_MODE_CHARS)
   const fallbackReason = input.fallbackReason
-    ? boundWithSuffix(input.fallbackReason, MAX_FALLBACK_REASON_LINE_VALUE_CHARS)
+    ? normalizeHeaderMetadata(input.fallbackReason, MAX_FALLBACK_REASON_LINE_VALUE_CHARS)
     : undefined
   const payloadBytes = utf8Bytes(input.payload)
-  const effectiveMode = input.effectiveMode
   const kind = effectiveMode === "replace" ? "replacement-prompt" : "context-augmentation"
 
   const headerLines = (storedBytes: number, truncated: boolean): string[] => [
     "artifact=tokenmaxxer-compaction-prompt",
     "format_version=1",
-    `observed_at=${new Date().toISOString()}`,
+    `observed_at=${normalizeHeaderMetadata(new Date().toISOString(), 128)}`,
     `session=${sessionID}`,
-    `requested_mode=${input.requestedMode}`,
+    `requested_mode=${requestedMode}`,
     `effective_mode=${effectiveMode}`,
     `kind=${kind}`,
     `payload_bytes=${payloadBytes}`,

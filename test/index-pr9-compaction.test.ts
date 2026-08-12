@@ -577,4 +577,93 @@ describe("PR-9 Agent 1B — index-level compaction prompt/result contracts", () 
       }
     })
   })
+
+  describe("B4 — outer arbitrary-error call sites are bounded", () => {
+    it("hostile multi-kilobyte throw from the compaction hook logs a bounded error without leaking raw text", async () => {
+      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-pr9-hook-bound-"))
+      // The hostile marker sits at the END of a multi-kilobyte message so any
+      // truncation that keeps only the head proves the tail is never leaked.
+      const hostile = "H".repeat(10 * 1024) + "HOOK-RAW-TEXT-MUST-NOT-LEAK"
+      const appLog = vi.fn((..._args: unknown[]) => {
+        throw new Error("app.log transport failure")
+      })
+      const client = makeClient({ app: { log: appLog } })
+      buildDurableBlock.mockRejectedValueOnce(new Error(hostile))
+
+      try {
+        const hooks = await TokenmaxxerPlugin(makePluginInput({
+          directory: project,
+          worktree: project,
+          client,
+        }))
+
+        const output = { context: [] as string[] }
+        // The hook must resolve even though the durable builder threw a
+        // multi-kilobyte error AND app.log itself throws.
+        await expect(
+          hooks["experimental.session.compacting"]?.({ sessionID: "session-1" }, output),
+        ).resolves.not.toThrow()
+
+        const failureCall = appLog.mock.calls.find((call) => {
+          const arg = call[0] as { body?: { message?: string } } | undefined
+          return arg?.body?.message === "compaction hook failed"
+        })
+        expect(failureCall).toBeDefined()
+        const body = (failureCall![0] as { body: { extra: Record<string, unknown> } }).body
+        const loggedError = body.extra.error as string
+        // The logged error value itself is bounded to 500 chars.
+        expect(loggedError.length).toBeLessThanOrEqual(500)
+        // The raw multi-kilobyte text (marker at the tail) is not leaked.
+        expect(loggedError).not.toContain("HOOK-RAW-TEXT-MUST-NOT-LEAK")
+        // The bounded head is still informative.
+        expect(loggedError).toContain("HHH")
+      } finally {
+        await rm(project, { recursive: true, force: true })
+      }
+    })
+
+    it("hostile multi-kilobyte throw from the event handler logs a bounded error without leaking raw text", async () => {
+      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-pr9-event-bound-"))
+      const hostile = "E".repeat(10 * 1024) + "EVENT-RAW-TEXT-MUST-NOT-LEAK"
+      const appLog = vi.fn((..._args: unknown[]) => {
+        throw new Error("app.log transport failure")
+      })
+      const client = makeClient({ app: { log: appLog } })
+      // session.idle reaches writeMemoryOnIdle; a hostile throw there must be
+      // bounded by the outer event-handler catch.
+      writeMemoryOnIdle.mockRejectedValueOnce(new Error(hostile))
+
+      try {
+        const hooks = await TokenmaxxerPlugin(makePluginInput({
+          directory: project,
+          worktree: project,
+          client,
+        }))
+
+        // The event handler must resolve even though the memory writer threw a
+        // multi-kilobyte error AND app.log itself throws.
+        await expect(
+          hooks.event?.({
+            event: { type: "session.idle", properties: { sessionID: "session-1" } },
+          }),
+        ).resolves.not.toThrow()
+
+        const failureCall = appLog.mock.calls.find((call) => {
+          const arg = call[0] as { body?: { message?: string } } | undefined
+          return arg?.body?.message === "event handler failed"
+        })
+        expect(failureCall).toBeDefined()
+        const body = (failureCall![0] as { body: { extra: Record<string, unknown> } }).body
+        const loggedError = body.extra.error as string
+        // The logged error value itself is bounded to 500 chars.
+        expect(loggedError.length).toBeLessThanOrEqual(500)
+        // The raw multi-kilobyte text (marker at the tail) is not leaked.
+        expect(loggedError).not.toContain("EVENT-RAW-TEXT-MUST-NOT-LEAK")
+        // The bounded head is still informative.
+        expect(loggedError).toContain("EEE")
+      } finally {
+        await rm(project, { recursive: true, force: true })
+      }
+    })
+  })
 })
