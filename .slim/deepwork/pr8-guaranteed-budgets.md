@@ -54,6 +54,9 @@ TypeScript check. Wave 4 canonical transaction integration is complete in
 `34d777c` with 55 focused transaction tests and a passing TypeScript check.
 Wave 5 mutation callers and retry/public-outcome semantics are complete in
 `03ba91e` with 199 focused tests and a passing TypeScript check. Wave 6
-independent durable-injection selection and 4,096-byte rendering are now active. The
+independent durable-injection selection and 4,096-byte rendering are complete
+in `088fe28` with 78 focused contracts, 214 compaction tests, and a passing
+TypeScript check. Wave 7 pressure/concurrency integration and repository audit
+are now active. The
 unrelated `opencode.json` modification and untracked `.opencode/` state remain
 outside PR-8 ownership.

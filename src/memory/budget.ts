@@ -550,20 +550,31 @@ function stage10EphemeralState(mem: MemoryFile): MemoryFile {
 }
 
 /**
- * Compute the minimal legal state containing all trusted human foundational rows.
+ * Compute the minimal legal state containing all trusted human foundational rows
+ * and any explicitly protected decision rows / proof records.
  *
- * This is used in Stage 11 to determine if the irreducible state exceeds the budget.
+ * This is used in Stage 11 to determine if the irreducible state exceeds the
+ * budget. The returned candidate contains ONLY schema-required base fields plus
+ * protected authority/proof rows — disposable ephemeral fields (blockers,
+ * active_files, next_steps, recent_sessions, cache) are omitted so they do not
+ * inflate the byte measurement.
  */
 function computeMinimalLegalState(mem: MemoryFile, protection?: MemoryBudgetProtection): MemoryFile {
   const protectedIDs = getProtectedDecisionIDs(mem, protection)
   const protectedSourceKeys = getProtectedSourceKeys(protection)
   const protectedAuditIDs = getProtectedAuditSessionIDs(protection)
 
-  // Include all foundational decisions
   const foundationalDecisions = (mem.decisions ?? []).filter((d) => d.foundational)
 
-  // Include all protected decisions (explicitly protected or human_conflict_quarantined)
+  // Include all protected decisions: foundational, human_conflict_quarantined,
+  // and explicitly protected via preserveDecisionIDs. Deduplicate by ID,
+  // preserving first-seen order for deterministic measurement.
   const protectedDecisions = (mem.decisions ?? []).filter((d) => protectedIDs.has(d.id))
+  const allProtectedDecisions = Array.from(
+    new Map(
+      [...foundationalDecisions, ...protectedDecisions].map((d) => [d.id, d]),
+    ).values(),
+  )
 
   // Include all protected processed sources
   const protectedSources = (mem.processed_sources ?? []).filter((ps) =>
@@ -575,16 +586,24 @@ function computeMinimalLegalState(mem: MemoryFile, protection?: MemoryBudgetProt
     protectedAuditIDs.has(a.audit_session_id)
   )
 
-  // Deduplicate decisions
-  const allProtectedDecisions = Array.from(
-    new Map(foundationalDecisions.map((d) => [d.id, d])).values()
-  )
-
+  // Construct an explicit minimal MemoryFile. Do NOT spread `...mem`: that would
+  // leak disposable ephemeral fields (blockers, active_files, next_steps,
+  // recent_sessions, cache, model_health) into the supposedly minimal state and
+  // misclassify required-state-exceeds-budget as foundational-state-exceeds-budget.
   return {
-    ...mem,
+    version: mem.version,
+    revision: mem.revision,
+    project_path: mem.project_path,
+    last_updated: mem.last_updated,
+    last_git_sha: mem.last_git_sha,
+    last_session_id: mem.last_session_id,
+    active_files: [],
     decisions: allProtectedDecisions,
+    blockers: [],
+    next_steps: [],
+    recent_sessions: [],
     processed_sources: protectedSources,
-    llm_extraction_audits: protectedAudits,
+    llm_extraction_audits: protectedAudits.length > 0 ? protectedAudits : undefined,
   }
 }
 

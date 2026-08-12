@@ -7,7 +7,13 @@ import { writeMemoryOnIdle } from "../../src/memory/writer"
 import { pruneOld } from "../../src/memory/writer"
 import { readMemory, writeMemory } from "../../src/memory/store"
 import { globalMemoryPath, projectMemoryPath } from "../../src/memory/paths"
-import { emptyMemory, type LLMAuditMetadata } from "../../src/memory/schema"
+import {
+  emptyMemory,
+  MEMORY_PERSISTENCE_CEILINGS,
+  MemoryFileSchema,
+  type LLMAuditMetadata,
+  type MemoryFile,
+} from "../../src/memory/schema"
 import { atomicWrite } from "../../src/util/fs"
 import {
   isPersistedRetainedExtractionSession,
@@ -39,6 +45,35 @@ async function worktree(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "tokenmaxxer-p0-a-"))
   directories.push(directory)
   return directory
+}
+
+/**
+ * Schema-valid memory whose serialized size is driven by a single broad
+ * persistence-ceiling field (decision.topic, up to 8192 chars). This keeps
+ * the fixture inside MemoryFileSchema while letting the test measure the
+ * exact UTF-8 byte cap against the real serialized STATE.
+ */
+function sizeProbeMemory(project: string, topic: string): MemoryFile {
+  return {
+    ...emptyMemory(project),
+    decisions: [{
+      id: "size-probe",
+      topic,
+      decision: "probe",
+      timestamp: "2026-08-09T00:00:00.000Z",
+      session_id: "source",
+      still_valid: true,
+      foundational: false,
+      foundational_requested: false,
+      human_conflict_quarantined: false,
+      provenance: {
+        extractor: "heuristic",
+        source_session_id: "source",
+        confidence: "heuristic",
+        evidence: [],
+      },
+    }],
+  }
 }
 
 function clientFor(
@@ -90,10 +125,14 @@ describe("P0-A idle reliability", () => {
     const appLog = vi.fn()
     const warn = vi.spyOn(console, "warn")
     const error = vi.spyOn(console, "error")
-    const oversized = {
-      ...emptyMemory(project),
-      next_steps: ["x".repeat(9_000)],
-    }
+    // Schema-valid (decision.topic sits exactly at the 8192-char persistence
+    // ceiling) but the serialized STATE exceeds the 8192-byte storage cap.
+    const oversized = sizeProbeMemory(
+      project,
+      "x".repeat(MEMORY_PERSISTENCE_CEILINGS.decisionTopicChars),
+    )
+    expect(MemoryFileSchema.safeParse(oversized).success).toBe(true)
+    expect(memorySizeBytes(oversized)).toBeGreaterThan(MEMORY_MAX_BYTES)
 
     await expect(writeMemory({
       worktree: project,
@@ -118,18 +157,17 @@ describe("P0-A idle reliability", () => {
 
   it("uses UTF-8 bytes and accepts exactly the cap but rejects one byte over", async () => {
     const project = await worktree()
-    const seed = { ...emptyMemory(project), next_steps: [""] }
-    const exact = {
-      ...emptyMemory(project),
-      next_steps: ["x".repeat(MEMORY_MAX_BYTES - memorySizeBytes(seed))],
-    }
+    const seed = sizeProbeMemory(project, "")
+    const exact = sizeProbeMemory(
+      project,
+      "x".repeat(MEMORY_MAX_BYTES - memorySizeBytes(seed)),
+    )
+    expect(MemoryFileSchema.safeParse(exact).success).toBe(true)
     expect(memorySizeBytes(exact)).toBe(MEMORY_MAX_BYTES)
     expect(await writeMemory({ worktree: project, directory: project }, exact)).toBe(true)
 
-    const crossing = {
-      ...exact,
-      next_steps: [`${exact.next_steps[0]}x`],
-    }
+    const crossing = sizeProbeMemory(project, `${exact.decisions[0]!.topic}x`)
+    expect(MemoryFileSchema.safeParse(crossing).success).toBe(true)
     expect(memorySizeBytes(crossing)).toBe(MEMORY_MAX_BYTES + 1)
     expect(await writeMemory({ worktree: project, directory: project }, crossing)).toBe(false)
   })

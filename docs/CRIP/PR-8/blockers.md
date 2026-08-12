@@ -89,3 +89,15 @@ pull PR-9 diagnostics/status or PR-10 release/dependency work into this PR.
 - TypeScript check: `npx tsc --noEmit` → passed (exit 0).
 - The full repository baseline still has two P0-A reliability failures concerning direct oversized writes/structured logging; they reproduce on the untouched pre-Wave-6 baseline and remain for Wave 7 integration/audit. No durable test was weakened to accommodate them.
 - Wave 6 is complete. Wave 7 pressure/concurrency integration and repository audit is now the active phase.
+
+## 2026-08-12 — Wave 7 pressure, concurrency, and seam audit reconciled
+
+- Added test-only adversarial contracts in `test/memory/pr8-wave7-integration.test.ts`: protected foundational overflow, required proof overflow, same-project concurrent near-cap mutations, final LLM retryability/no completion marker, and recall-promotion protected refusal.
+- Corrected two `src/memory/budget.ts` defects exposed by those contracts: explicit protected decision IDs now participate in irreducible-state classification, and minimal-state measurement no longer spreads disposable blockers/cache/files/task fields.
+- Reconciled the two P0-A fixtures in `test/memory/p0-a-reliability.test.ts` to use schema-valid broad-ceiling decision topics while preserving exact 8,192/8,193 byte and structured size-rejection assertions.
+- Focused Wave 7 rerun: `npx vitest run test/memory/p0-a-reliability.test.ts test/memory/pr8-wave7-integration.test.ts` → 21 passed, 0 failed.
+- Broader integrated rerun: `npx vitest run test/memory/ test/compaction/ test/tools/recall.test.ts test/cli.test.ts` → 51 files, 951 passed, 0 failed after fixture reconciliation.
+- TypeScript check: `npx tsc --noEmit` → passed (exit 0).
+- Repository seam audit (src-only) found zero production `pruneOld()`/`pruneOldForCommit()` callers, all mutation callers routed through central fitting, read-only durable rendering, preserved PR-7 sanitization/augment-replace, and no PR-9/PR-10 scope leakage. Low-severity latent concerns remain: exported dead `pruneOldForCommit()` can return over-cap state if future callers misuse it, and direct commit failure reasons collapse to generic `commit-failed`; neither is an active production path.
+- Decision: do not expand Wave 7 into PR-9 diagnostics, PR-10 dependency cleanup, or unrelated dead-seam refactoring. Preserve concerns for the independent Oracle attack surface.
+- Wave 7 is complete. Wave 8 is now active: exact final release chain and evidence-only Oracle handoff.
