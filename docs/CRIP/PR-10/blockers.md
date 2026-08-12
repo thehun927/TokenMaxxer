@@ -195,3 +195,24 @@ Wave 1 has not started.
   no real tag/release may be created in this implementation workstream. The
   fixture-driven integrity and transaction contracts are green.
 - No real `v*` tag or GitHub Release was created or published.
+
+## Wave 6 — Pinned CI and tag-only release workflow — 2026-08-12
+
+- Pinned all workflow Actions by verified full SHA with tag comments:
+  checkout `de0fac2e4500dabe0009e67214ff5f5447ce83dd` (`v6.0.2`), setup-node
+  `48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e` (`v6.4.0`), and setup-bun
+  `0c5077e51419868618aeaa5fe8019c62421857d6` (`v2.2.0`).
+- Ordinary CI remains limited to `contents: read`, runs on main push/PR, and
+  contains no GitHub Release mutation. It now includes the mandatory release
+  validation, package, installer, reproducibility, dry-run, checksum-contract,
+  and tracked-dist gates.
+- Added `.github/workflows/release.yml` with only `v*.*.*` tag push trigger,
+  `contents: write` job permission, exact Node/Bun toolchain, immutable-release
+  API preflight that fails closed, exact identity preflight, complete release
+  validation, staged asset generation, draft-first creation, exact asset upload,
+  uploaded-set/checksum verification, publish, and post-publish verification.
+- `npx vitest run test/release/workflow/workflow-contract.test.ts`: 23 passed.
+- Both workflow files parse successfully with the repository YAML parser.
+- `git diff --check`: passed.
+- Wave-6 scope leaves README stale-claim failures for Wave 7; no real `v*` tag
+  or GitHub Release was created or published.
