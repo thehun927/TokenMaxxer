@@ -32,6 +32,24 @@ deviations, and unresolved blockers.
 - `npx tsc --noEmit`: passed with no output.
 - `git diff --check`: passed.
 
+## 2026-08-12 — Oracle blocker remediation
+
+- Oracle findings commit: `28c8d7a2e370aed9f6ce2f6cdbb86dd7031190e4`.
+- B2/B4 commit `a4ef369`: prompt metadata is bounded, single-line encoded,
+  and hard-capped at 96 KiB; outer compaction/event errors are capped at 500.
+- B1 commit `2c64d39`: overlapping prompt/result callbacks capture receipt
+  ordering and serialize short per-project/artifact publication.
+- B3 commit `d04c2aa`: persisted result validation enforces raw 4 KiB JSON,
+  session/reason bounds, valid ISO timestamps, safe byte counts, and lowercase
+  SHA-256.
+- Focused remediation audit: 32 files, 630/630 passed; typecheck and diff
+  check passed.
+- Exact remediation release chain: npm test 65 files/1,168 tests passed;
+  host contract, build, TUI bundle, bundle self-containment, CLI
+  verification/smoke, and shell syntax passed. Generated `dist/index.js` was
+  restored and remains outside PR-9.
+- CI evidence is appended to `oracle-rereview.md` after push.
+
 ## 2026-08-12 — Wave 8 local release evidence
 
 - Exact implementation SHA audited locally: `29636b7f53abdac10fabeebbc574e5297268c426`.
