@@ -800,9 +800,16 @@ describe("buildDurableBlock — PR-7 compact provenance", () => {
       client: mockClient,
     })
 
+    // PR-8 §9.5: [llm:eN] uses the actual retained evidence pointer count,
+    // not a render ordinal. llm-1 has 2 evidence refs, llm-2 and llm-3 have 1.
+    const lineFor = (topic: string) =>
+      result.split("\n").find((l) => l.includes(topic))
+    expect(lineFor("topic-one")).toContain("[llm:e2]")
+    expect(lineFor("topic-two")).toContain("[llm:e1]")
+    expect(lineFor("topic-three")).toContain("[llm:e1]")
     expect(result).toContain("[llm:e1]")
     expect(result).toContain("[llm:e2]")
-    expect(result).toContain("[llm:e3]")
+    expect(result).not.toContain("[llm:e3]")
     expect(result).not.toContain("llm-source-11111")
     expect(result).not.toContain("llm-audit-11111")
     expect(result).not.toContain("llm-source-22222")

@@ -137,6 +137,7 @@ function heuristicDecision(
       extractor: "heuristic",
       source_session_id: "sess-001",
       confidence: "heuristic",
+      evidence: [],
     },
     ...overrides,
   }

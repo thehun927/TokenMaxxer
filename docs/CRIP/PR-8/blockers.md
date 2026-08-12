@@ -78,3 +78,14 @@ pull PR-9 diagnostics/status or PR-10 release/dependency work into this PR.
 - TypeScript check: `npx tsc --noEmit` → passed (exit 0).
 - Decision: retain `pruneOld()`/`pruneOldForCommit()` as compatibility/test seams only; no writer durable mutation caller invokes them after Wave 5.
 - Wave 5 is complete. Wave 6 independent durable-injection selection and 4,096-byte rendering is now the active phase.
+
+## 2026-08-12 — Wave 6 durable injection reconciled
+
+- Owned implementation: `src/compaction/durable.ts`; directly related contract adjustments: `test/compaction/pr8-budget.test.ts` and the PR-8 evidence-tag assertions in `test/compaction/durable.test.ts`.
+- `DURABLE_BLOCK_MAX_BYTES` is independently `4_096`; the renderer now selects sanitized candidates under the complete framed UTF-8 budget, with deterministic semantic priority and strict prefix stop.
+- Rendering remains read-only and retention-independent; omitted decisions remain available to pull recall. `[llm:eN]` reports each decision's actual retained evidence pointer count.
+- Focused rerun: `npx vitest run test/compaction/pr8-budget.test.ts test/compaction/durable.test.ts test/compaction/prompt-contract.test.ts` → 78 passed, 0 failed.
+- Full compaction rerun: `npx vitest run test/compaction` → 214 passed, 0 failed across 11 files.
+- TypeScript check: `npx tsc --noEmit` → passed (exit 0).
+- The full repository baseline still has two P0-A reliability failures concerning direct oversized writes/structured logging; they reproduce on the untouched pre-Wave-6 baseline and remain for Wave 7 integration/audit. No durable test was weakened to accommodate them.
+- Wave 6 is complete. Wave 7 pressure/concurrency integration and repository audit is now the active phase.
