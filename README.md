@@ -103,9 +103,9 @@ curl -fsSL https://github.com/thehun927/TokenMaxxer/releases/latest/download/ins
 Restart opencode after installation. Both server layers are then active in all
 projects — no per-project config required.
 
-The one-liner downloads the generated `dist/index.js`, `dist/tui.js`, and
-launcher artifacts directly; it does not require a local build or model
-configuration for installation.
+The one-liner downloads the immutable GitHub Release assets `tokenmaxxer.js`,
+`tokenmaxxer-tui.js`, `tokenmaxxer-cli.js`, and `tokenmaxxer` directly; it does
+not require a local build or model configuration for installation.
 
 - **Layer 1** (compaction hook) fires on every `/compact`
 - **Layer 2** (memory + tools) silently writes `STATE.json` on session idle; it does not write to the composer
@@ -116,6 +116,8 @@ configuration for installation.
 ```bash
 git clone https://github.com/thehun927/TokenMaxxer.git
 cd TokenMaxxer
+npm ci
+npm run build
 mkdir -p ~/.config/opencode/plugins
 cp dist/index.js ~/.config/opencode/plugins/tokenmaxxer.js       # generated server target, global (all projects)
 cp dist/tui.js ~/.config/opencode/plugins/tokenmaxxer-tui.js     # generated TUI target, global (all projects)

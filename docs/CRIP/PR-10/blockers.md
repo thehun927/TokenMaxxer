@@ -196,6 +196,28 @@ Wave 1 has not started.
   fixture-driven integrity and transaction contracts are green.
 - No real `v*` tag or GitHub Release was created or published.
 
+## Oracle final residual remediation — R1/R2 — 2026-08-12
+
+- **R1 closed:** README manual clone instructions now run `npm ci` and
+  `npm run build` before copying generated `dist/index.js` and `dist/tui.js`.
+  The one-liner description now names immutable release assets
+  `tokenmaxxer.js`, `tokenmaxxer-tui.js`, `tokenmaxxer-cli.js`, and
+  `tokenmaxxer`, rather than claiming repository dist paths are downloaded.
+  Focused R1 and stale-document regressions passed 2/2 and 9/9.
+- **R2 closed:** tag-only `.github/workflows/release.yml` now invokes the
+  committed `npm run audit:release` gate, matching ordinary CI. The focused
+  R2 contract verifies both workflows use the same gate and preserve
+  tag-only, Administration-read, draft-first, prepublish verification, and
+  postpublish attestation behavior. R2 and surrounding workflow contracts
+  passed 50/50 in the final micro-wave focus.
+- Final sequential micro-wave chain: full `npm test` 81 files/1334 passed;
+  typecheck; host contract; audit release; build/dist/TUI/CLI/package/
+  reproducibility; shell syntax; release dry-run/verify; focused R1/R2 and
+  workflow contracts; YAML parse; diff-check; and zero tracked dist passed.
+- No real `v*` tag or GitHub Release was created or published. The second
+  Oracle rereview owns the final release gate; this log does not issue a Ship
+  verdict.
+
 ## Oracle remediation — B1–B4 — 2026-08-12
 
 - **B1 installer checksum/E2E closed:** production `install.sh` now stores the

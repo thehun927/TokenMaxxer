@@ -58,7 +58,7 @@ jobs:
           npm test
           npx tsc --noEmit
           npm run verify:host-contract
-          npm audit --audit-level=high
+          npm run audit:release
           npm run build
           npm run verify:dist
           npm run check:tui-bundle
