@@ -56,6 +56,24 @@ deviations, and unresolved blockers.
 - `npx tsc --noEmit`: passed with no output.
 - `git diff --check`: passed after removing one trailing-whitespace defect.
 - TMTUI commit-pulse source remains unchanged.
+
+## 2026-08-12 — Wave 7 Luna reconciliation
+
+- The delegated Wave 7 test-only lane failed first on an unavailable model and
+  the replacement was cancelled as stuck; it left no files or partial changes.
+- Luna therefore performed the required adversarial integration audit directly
+  against the integrated implementation. The broad command covered artifact,
+  compaction, status, index, PR-7/8 budget/schema/integration, persistence
+  warnings, file activity, transaction, and TMTUI pulse suites.
+- Actual broad result: 30 files, 519/519 passed.
+- Follow-up after removing the final explanatory legacy-symbol mention from
+  `src/index.ts`: 5 files, 75/75 passed for compaction/status/index coverage.
+- `npx tsc --noEmit`: passed with no output; `git diff --check`: passed.
+- Production-source search confirms no `lastCompactionTimestamp` or
+  `setLastCompaction` occurrence remains. No `.commit-pulse` source was
+  changed, and the existing TMTUI pulse suites passed in the broad audit.
+- Wave 7 introduced no new test files; evidence mapping in the final Oracle
+  handoff uses the frozen Wave 1 contracts plus existing PR-7/8/TMTUI suites.
 - Test-only repair deviations resolved before this validation: missing status
   filesystem imports and non-unique mocked project hashes in the Agent 1A
   tests.

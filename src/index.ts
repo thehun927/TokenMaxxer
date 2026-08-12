@@ -216,10 +216,9 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
           ? boundReason(fallbackReason, 500)
           : undefined
 
-        // PR-9 Wave 3: the process-global last-compaction timestamp/setter
-        // (`lastCompactionTimestamp` / `setLastCompaction`) is not used here;
-        // the successful-completion observation is the persisted per-project
-        // `last_compaction_result.json`, recorded only on `session.compacted`.
+        // PR-9 Wave 3: successful completion is represented by the persisted
+        // per-project `last_compaction_result.json`, recorded only on
+        // `session.compacted`.
 
         await log(client, "info", "compaction hook fired", {
           session: input.sessionID,
