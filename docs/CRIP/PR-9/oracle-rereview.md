@@ -80,5 +80,15 @@ introduced.
 
 ## CI evidence
 
-Append the exact GitHub run/job, remediation head, conclusion, and pass/skip
-counts after pushing this rereview.
+- Workflow: `CI`
+- Run: `31622854338`
+- URL: https://github.com/thehun927/TokenMaxxer/actions/runs/31622854338
+- Head SHA: `a12bac2fe20a8dccd76b4910ec2aa49fd6e0686a`.
+- Job: `verify`, ID `94201755821`
+- Job URL: https://github.com/thehun927/TokenMaxxer/actions/runs/31622854338/job/94201755821
+- Conclusion: success.
+- CI counts: 64 test files passed and 1 skipped; 1,167 tests passed and 1
+  skipped; 0 failed.
+- All substantive workflow steps passed: clean install, full tests, typecheck,
+  host contract, distribution build, TUI bundle, bundle self-containment, CLI
+  verification/smoke, and shell syntax.

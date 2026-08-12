@@ -50,6 +50,16 @@ deviations, and unresolved blockers.
   restored and remains outside PR-9.
 - CI evidence is appended to `oracle-rereview.md` after push.
 
+## 2026-08-12 — Oracle rereview CI evidence
+
+- CI run `31622854338`:
+  https://github.com/thehun927/TokenMaxxer/actions/runs/31622854338
+- Exact rereview head: `a12bac2fe20a8dccd76b4910ec2aa49fd6e0686a`.
+- Job `verify`, ID `94201755821`, succeeded:
+  https://github.com/thehun927/TokenMaxxer/actions/runs/31622854338/job/94201755821
+- CI counts: 64 test files passed, 1 skipped; 1,167 tests passed, 1 skipped;
+  0 failed. All substantive release-chain steps passed.
+
 ## 2026-08-12 — Wave 8 local release evidence
 
 - Exact implementation SHA audited locally: `29636b7f53abdac10fabeebbc574e5297268c426`.
