@@ -25,6 +25,7 @@ import { readMemoryState } from "../memory/store"
 import { log } from "../util/log"
 import { getCurrentGitSha } from "../util/git"
 import { sanitizeDurableValue } from "./sanitize"
+import { truncateUtf8 } from "../memory/budget"
 
 // ---------------------------------------------------------------------------
 // PR-8 Wave 6 — independent automatic-injection ceiling (§3.2 / §9.1).
@@ -109,9 +110,11 @@ export async function buildDurableBlock(opts: {
     }
 
     // --- Priority 1: project identity + memory-level freshness metadata ---
-    const projectLine = dataLine(
-      `Project: ${sanitizeDurableValue(mem.project_path, CAP_PROJECT_PATH)}`,
-    )
+    // The project identity is sanitized with the PR-7 character cap first.
+    // Its byte budget is enforced below alongside every other byte of framing
+    // (see the §9.1/§9.4 mandatory-prefix budget), so a 1,024-code-point
+    // four-byte path can never push the block past the injection ceiling.
+    const projectValue = sanitizeDurableValue(mem.project_path, CAP_PROJECT_PATH)
     const memFreshness = gitFreshness(mem.last_git_sha ?? null, currentHead)
     const freshnessLine = dataLine(`Memory freshness: ${memFreshness}`)
 
@@ -204,6 +207,30 @@ export async function buildDurableBlock(opts: {
     const lines: string[] = [DELIM_OPEN]
     let usedBytes = Buffer.byteLength(DELIM_OPEN, "utf8")
     const closingBytes = Buffer.byteLength(DELIM_CLOSE, "utf8")
+
+    // §9.1/§9.4 — the mandatory header (opening delimiter, project identity,
+    // memory freshness, closing delimiter) is budgeted exactly like every
+    // optional candidate.  Only the project identity is variable — freshness is
+    // a short fixed vocabulary — so reserve every fixed framing byte and hand
+    // the remainder to UTF-8-safe byte truncation.  `truncateUtf8` guarantees
+    // `utf8Bytes(result) <= budget`, which makes the full mandatory prefix
+    // <= DURABLE_BLOCK_MAX_BYTES by construction.  The strict prefix rule
+    // below is therefore unchanged: candidates still reserve the closing
+    // delimiter before every push and stop on the first candidate that no
+    // longer fits.
+    const freshnessBytes = Buffer.byteLength(freshnessLine, "utf8")
+    const projectBudget =
+      DURABLE_BLOCK_MAX_BYTES -
+      usedBytes -                          // opening delimiter
+      1 -                                  // newline before the project line
+      Buffer.byteLength("DATA Project: ", "utf8") -
+      1 -                                  // newline before the freshness line
+      freshnessBytes -
+      1 -                                  // newline before the closing delimiter
+      closingBytes
+    const projectLine = dataLine(
+      `Project: ${truncateUtf8(projectValue, Math.max(0, projectBudget))}`,
+    )
 
     const pushLine = (content: string): void => {
       lines.push(content)

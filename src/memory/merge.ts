@@ -26,7 +26,50 @@ import {
   resolveDecisionAuthorities,
   type DecisionAuthorityConflict,
 } from "./decision-authority"
+import { MEMORY_CREATION_LIMITS } from "./schema"
 import { randomUUID } from "node:crypto"
+
+/**
+ * PR 8 §8.1 — enforce automatic creation limits for newly created heuristic
+ * decisions. Human-reviewed persisted rows are preserved via the separate
+ * broad persistence ceilings (DecisionSchema 8192). This helper only affects
+ * *incoming* heuristic observations.
+ */
+function isBlank(value: string): boolean {
+  return value.trim().length === 0
+}
+
+function capHeuristicDecision(inc: ExtractedDecision): ExtractedDecision | null {
+  const normalizedTopic = normalizeDecisionTopic(inc.topic ?? "")
+  if (isBlank(normalizedTopic)) return null
+  let topic = normalizedTopic
+  if (topic.length > MEMORY_CREATION_LIMITS.decisionTopicChars) {
+    topic = topic.slice(0, MEMORY_CREATION_LIMITS.decisionTopicChars).trimEnd()
+    if (isBlank(topic)) return null
+  }
+  let decision = (inc.decision ?? "").trim()
+  if (isBlank(decision)) return null
+  if (decision.length > MEMORY_CREATION_LIMITS.decisionTextChars) {
+    decision = decision.slice(0, MEMORY_CREATION_LIMITS.decisionTextChars).trimEnd()
+    if (isBlank(decision)) return null
+  }
+  let rationale: string | undefined = inc.rationale
+  if (rationale !== undefined) {
+    const trimmed = rationale.trim()
+    if (trimmed.length === 0) {
+      rationale = undefined
+    } else {
+      rationale = trimmed
+      if (rationale.length > MEMORY_CREATION_LIMITS.decisionRationaleChars) {
+        rationale = rationale
+          .slice(0, MEMORY_CREATION_LIMITS.decisionRationaleChars)
+          .trimEnd()
+        if (rationale.length === 0) rationale = undefined
+      }
+    }
+  }
+  return { ...inc, topic, decision, rationale }
+}
 
 /**
  * The incoming decision shape used by the extractor and by `mergeMemory`.
@@ -264,6 +307,17 @@ export function mergeDecisions(
   )
 
   for (const inc of incoming) {
+    // PR 8 B4 — enforce creation limits for newly created heuristic decisions.
+    // Existing persisted rows (including long human-reviewed text within the
+    // 8192 persistence ceiling) are preserved; only incoming heuristic
+    // observations are normalized/capped/rejected here.
+    let effectiveInc: ExtractedDecision = inc
+    if (origin === "heuristic") {
+      const capped = capHeuristicDecision(inc)
+      if (!capped) continue
+      effectiveInc = capped
+    }
+
     // Re-resolve against the current group so later incoming items for the
     // same topic judge the newest authority, never a stale mapped index. The
     // durable conflict state is consulted on every iteration.
@@ -279,13 +333,13 @@ export function mergeDecisions(
       }
     }
 
-    const incTopic = normalizeDecisionTopic(inc.topic)
+    const incTopic = normalizeDecisionTopic(effectiveInc.topic)
     const authority = authoritiesByTopic.get(incTopic)
     const conflict = conflictsByTopic.get(incTopic)
 
     const incEvidence = origin === "llm"
-      ? llmEvidenceFor(inc.evidence_refs, meta)
-      : heuristicEvidenceFor({ topic: inc.topic, decision: inc.decision }, meta.evidenceCandidates)
+      ? llmEvidenceFor(effectiveInc.evidence_refs, meta)
+      : heuristicEvidenceFor({ topic: effectiveInc.topic, decision: effectiveInc.decision }, meta.evidenceCandidates)
 
     // Mandatory evidence gate: an LLM decision without resolved exact evidence
     // does not enter decision merging.
@@ -303,7 +357,7 @@ export function mergeDecisions(
     if (conflict) {
       result = [
         ...result,
-        newDecisionRow(inc, meta, provenance, {
+        newDecisionRow(effectiveInc, meta, provenance, {
           still_valid: false,
           conflicts_with: [...conflict.decision_ids],
         }),
@@ -316,12 +370,12 @@ export function mergeDecisions(
       // authority; an evidence-backed LLM observation may too. (A topic under
       // conflict quarantine is handled above, so this branch never upgrades a
       // quarantined topic.)
-      result = [...result, newDecisionRow(inc, meta, provenance)]
+      result = [...result, newDecisionRow(effectiveInc, meta, provenance)]
       continue
     }
 
     const authorityIsHuman = isTrustedHumanFoundational(authority)
-    const sameText = normalizeDecisionText(inc.decision) === normalizeDecisionText(authority.decision)
+    const sameText = normalizeDecisionText(effectiveInc.decision) === normalizeDecisionText(authority.decision)
 
     if (sameText) {
       if (authorityIsHuman) {
@@ -335,10 +389,13 @@ export function mergeDecisions(
       if (index === -1) continue
       const row = result[index]!
       const updated: Decision = { ...row }
-      if (updated.rationale === undefined && inc.rationale !== undefined) {
-        updated.rationale = inc.rationale
+      // PR 8 B4: capping may have shortened rationale; only apply capped value.
+      // For heuristic, enforce rationale creation limit on enrichment as well.
+      const incomingRationale = effectiveInc.rationale
+      if (updated.rationale === undefined && incomingRationale !== undefined) {
+        updated.rationale = incomingRationale
       }
-      if (incomingFoundationalRequested(inc, meta)) {
+      if (incomingFoundationalRequested(effectiveInc, meta)) {
         updated.foundational_requested = true
       }
       if (origin === "llm") {
@@ -361,7 +418,7 @@ export function mergeDecisions(
       // conflicts_with=[humanAuthority.id]) available to the human CLI.
       result = [
         ...result,
-        newDecisionRow(inc, meta, provenance, {
+        newDecisionRow(effectiveInc, meta, provenance, {
           still_valid: false,
           conflicts_with: [authority.id],
         }),
@@ -384,7 +441,7 @@ export function mergeDecisions(
       })
       result = [
         ...superseded,
-        newDecisionRow(inc, meta, provenance, { id: newId }),
+        newDecisionRow(effectiveInc, meta, provenance, { id: newId }),
       ]
       continue
     }
@@ -403,7 +460,7 @@ export function mergeDecisions(
       })
       result = [
         ...superseded,
-        newDecisionRow(inc, meta, provenance, { id: newId }),
+        newDecisionRow(effectiveInc, meta, provenance, { id: newId }),
       ]
       continue
     }
@@ -412,7 +469,7 @@ export function mergeDecisions(
     // the current authority; append an invalid evidence-backed candidate.
     result = [
       ...result,
-      newDecisionRow(inc, meta, provenance, {
+      newDecisionRow(effectiveInc, meta, provenance, {
         still_valid: false,
         conflicts_with: [authority.id],
       }),

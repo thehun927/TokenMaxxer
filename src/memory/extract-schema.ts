@@ -4,20 +4,54 @@
  * This module intentionally has no SDK dependency. The JSON Schema is passed
  * to the SDK by the later LLM integration, while the Zod schema validates the
  * value returned by structured output.
+ *
+ * PR 8 B4 — automatic creation limits are authoritative via
+ * MEMORY_CREATION_LIMITS (src/memory/schema.ts). To avoid a circular
+ * dependency (schema.ts -> extract-schema.ts for LLMDecisionFactsSchema),
+ * the numeric constants are mirrored here and kept in sync via
+ * oracle-b4-creation tests. Prefer the shared export when importing from
+ * outside this cycle; do not introduce a runtime import of schema.ts here.
  */
 import { z } from "zod"
 
+// Mirrored from src/memory/schema.ts MEMORY_CREATION_LIMITS — keep in sync.
+const CREATION_LIMITS = {
+  currentTaskChars: 512,
+  activeFilePathChars: 2_048,
+  activeFileReasonChars: 512,
+  decisionTopicChars: 256,
+  decisionTextChars: 500,
+  decisionRationaleChars: 500,
+  blockerChars: 512,
+  nextStepChars: 512,
+  blockersMax: 8,
+  nextStepsMax: 8,
+  activeFilesMax: 16,
+} as const
+
+const boundedNonEmpty = (max: number) =>
+  z
+    .string()
+    .max(max)
+    .refine((value) => value.trim().length > 0, "must be non-empty")
+
+const evidenceRef = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine((value) => value.trim().length > 0, "evidence ref must be non-empty")
+
 export const ExtractedActiveFileSchema = z
   .object({
-    path: z.string(),
-    reason: z.string(),
+    path: boundedNonEmpty(CREATION_LIMITS.activeFilePathChars),
+    reason: boundedNonEmpty(CREATION_LIMITS.activeFileReasonChars),
   })
   .strict()
 
 export const ExtractedDecisionSchema = z
   .object({
-    topic: z.string(),
-    decision: z.string(),
+    topic: boundedNonEmpty(CREATION_LIMITS.decisionTopicChars),
+    decision: boundedNonEmpty(CREATION_LIMITS.decisionTextChars),
     /** References to labelled source-transcript candidates, never raw quotes. */
     evidence_refs: z
       .array(z.string().min(1).max(128))
@@ -36,7 +70,7 @@ export const ExtractedDecisionSchema = z
           ctx.addIssue({ code: z.ZodIssueCode.custom, message: "evidence refs must be unique" })
         }
       }),
-    rationale: z.string().optional(),
+    rationale: boundedNonEmpty(CREATION_LIMITS.decisionRationaleChars).optional(),
     foundational: z.boolean().optional(),
   })
   .strict()
@@ -44,11 +78,17 @@ export const ExtractedDecisionSchema = z
 /** The facts shape already used by the heuristic extractor. */
 export const ExtractedFactsSchema = z
   .object({
-    current_task: z.string().nullable(),
-    active_files: z.array(ExtractedActiveFileSchema).max(5),
+    current_task: z.string().max(CREATION_LIMITS.currentTaskChars).nullable(),
+    active_files: z.array(ExtractedActiveFileSchema).max(CREATION_LIMITS.activeFilesMax),
     decisions: z.array(ExtractedDecisionSchema),
-    blockers: z.array(z.string()),
-    next_steps: z.array(z.string()).max(5),
+    blockers: z
+      .array(boundedNonEmpty(CREATION_LIMITS.blockerChars))
+      .max(CREATION_LIMITS.blockersMax)
+      .refine((arr) => new Set(arr).size === arr.length, "blockers must be unique"),
+    next_steps: z
+      .array(boundedNonEmpty(CREATION_LIMITS.nextStepChars))
+      .max(CREATION_LIMITS.nextStepsMax)
+      .refine((arr) => new Set(arr).size === arr.length, "next_steps must be unique"),
   })
   .strict()
 
@@ -64,16 +104,17 @@ export const ExtractedFactsJsonSchema = {
   properties: {
     current_task: {
       type: ["string", "null"],
+      maxLength: CREATION_LIMITS.currentTaskChars,
     },
     active_files: {
       type: "array",
-      maxItems: 5,
+      maxItems: CREATION_LIMITS.activeFilesMax,
       items: {
         type: "object",
         additionalProperties: false,
         properties: {
-          path: { type: "string" },
-          reason: { type: "string" },
+          path: { type: "string", minLength: 1, maxLength: CREATION_LIMITS.activeFilePathChars },
+          reason: { type: "string", minLength: 1, maxLength: CREATION_LIMITS.activeFileReasonChars },
         },
         required: ["path", "reason"],
       },
@@ -84,8 +125,8 @@ export const ExtractedFactsJsonSchema = {
         type: "object",
         additionalProperties: false,
         properties: {
-          topic: { type: "string" },
-          decision: { type: "string" },
+          topic: { type: "string", minLength: 1, maxLength: CREATION_LIMITS.decisionTopicChars },
+          decision: { type: "string", minLength: 1, maxLength: CREATION_LIMITS.decisionTextChars },
           evidence_refs: {
             type: "array",
             minItems: 1,
@@ -93,7 +134,7 @@ export const ExtractedFactsJsonSchema = {
             uniqueItems: true,
             items: { type: "string", minLength: 1, maxLength: 128 },
           },
-          rationale: { type: "string" },
+          rationale: { type: "string", minLength: 1, maxLength: CREATION_LIMITS.decisionRationaleChars },
           foundational: { type: "boolean" },
         },
         required: ["topic", "decision", "evidence_refs"],
@@ -101,12 +142,15 @@ export const ExtractedFactsJsonSchema = {
     },
     blockers: {
       type: "array",
-      items: { type: "string" },
+      maxItems: CREATION_LIMITS.blockersMax,
+      uniqueItems: true,
+      items: { type: "string", minLength: 1, maxLength: CREATION_LIMITS.blockerChars },
     },
     next_steps: {
       type: "array",
-      maxItems: 5,
-      items: { type: "string" },
+      maxItems: CREATION_LIMITS.nextStepsMax,
+      uniqueItems: true,
+      items: { type: "string", minLength: 1, maxLength: CREATION_LIMITS.nextStepChars },
     },
   },
   required: [
@@ -123,17 +167,6 @@ export function validateStructuredResult(result: unknown): ExtractedFacts | null
   const parsed = ExtractedFactsSchema.safeParse(result)
   return parsed.success ? parsed.data : null
 }
-
-const boundedNonEmpty = (max: number) => z
-  .string()
-  .max(max)
-  .refine((value) => value.trim().length > 0, "must be non-empty")
-
-const evidenceRef = z
-  .string()
-  .min(1)
-  .max(128)
-  .refine((value) => value.trim().length > 0, "evidence ref must be non-empty")
 
 /** One evidence-backed decision proposed by the structured LLM extractor. */
 export const LLMDecisionSchema = z

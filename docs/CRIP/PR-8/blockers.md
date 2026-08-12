@@ -109,3 +109,16 @@ pull PR-9 diagnostics/status or PR-10 release/dependency work into this PR.
 - Build-generated tracked `dist/index.js` and `dist/tui.js` were restored after verification; the production/test tree remains exactly the implementation SHA.
 - No GitHub CI run/job exists for the exact SHA because it is local and unpushed. The latest observed CI run is explicitly recorded as non-evidence in `oracle-investigation.md`.
 - `docs/CRIP/PR-8/oracle-investigation.md` is complete as evidence-only handoff. No Oracle findings, Ship verdict, or PR-9 advancement is issued by this implementation lane.
+
+## 2026-08-12 — Oracle blocker remediation wave
+
+- B1 resolved in `src/memory/budget.ts`: stages 1–6 now perform genuine exact-byte pressure eviction of disposable completed audits, cache, health/quarantine metadata, sessions/sources, and active files; every non-stale pending audit guard remains retained; `truncateUtf8()` never exceeds budgets 0–3.
+- B2 resolved in `src/compaction/durable.ts`: mandatory project/freshness framing is byte-budgeted with UTF-8-safe project truncation, preserving delimiters, DATA-only sanitization, strict prefix ordering, and the independent 4,096-byte ceiling.
+- B3 resolved in `src/memory/writer.ts`: heuristic and final-LLM HEADER generation consume committed `MemoryMutationResult.memory`, not callback-carried pre-fit memory.
+- B4 resolved in `src/memory/writer.ts`, `src/memory/merge.ts`, and `src/memory/extract-schema.ts`: heuristic producers and structured extraction now use the centralized creation bounds for task, paths, reasons, decisions, blockers, next steps, counts, and automatic heuristic decision fields; human-reviewed persisted text remains governed by broad persistence ceilings.
+- Added focused regression suites: `test/memory/oracle-b1-storage.test.ts`, `test/compaction/oracle-b2-durable.test.ts`, `test/memory/oracle-b3-header.test.ts`, and `test/memory/oracle-b4-creation.test.ts`.
+- Corrected the stale Wave-7 ephemeral-pressure assertion to reflect B1's required behavior: disposable blockers/cache are evicted and the mutation commits rather than being rejected as required-state overflow.
+- Focused blocker matrix: 41 passed, 0 failed.
+- Full local repository rerun: `npm test` → 55 files, 987 tests passed, 0 failed.
+- TypeScript check: `npx tsc --noEmit` → passed (exit 0).
+- Remediation is implementation-complete locally. Release-chain verification and `docs/CRIP/PR-8/oracle-rereview.md` remain pending independent focused Oracle re-review; no Ship verdict or PR-9 advancement is made here.

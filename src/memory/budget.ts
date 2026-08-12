@@ -86,18 +86,26 @@ export function fitsUtf8Budget(value: string, maxBytes: number): boolean {
  */
 export function truncateUtf8(value: string, maxBytes: number): string {
   const bytes = utf8Bytes(value)
+
+  // For maxBytes 0, 1, 2: return empty string (marker doesn't fit)
+  const marker = "..."
+  const markerBytes = utf8Bytes(marker)
+
+  if (maxBytes <= 2) {
+    // Even marker doesn't fit - return empty string
+    return ""
+  }
+
   if (bytes <= maxBytes) {
     return value
   }
 
   // Reserve space for truncation marker
-  const marker = "..."
-  const markerBytes = utf8Bytes(marker)
   const availableBytes = maxBytes - markerBytes
 
   if (availableBytes <= 0) {
-    // Even marker doesn't fit - return marker only
-    return marker
+    // Marker doesn't fit - return empty string
+    return ""
   }
 
   // Find the last valid UTF-8 code point boundary before availableBytes
@@ -209,26 +217,18 @@ function stage0NormalizeMetadata(mem: MemoryFile, options?: { now?: number }): M
  * Remove oldest completed audit rows first. Pending protected audit guards are not eligible.
  */
 function stage1CompletedAudits(mem: MemoryFile, protection?: MemoryBudgetProtection): MemoryFile {
-  const protectedAuditIDs = getProtectedAuditSessionIDs(protection)
-  const pendingProtected = (mem.llm_extraction_audits ?? [])
-    .filter((a) => a.terminal_outcome === "pending" && protectedAuditIDs.has(a.audit_session_id))
-
-  const completedAudits = (mem.llm_extraction_audits ?? [])
-    .filter((a) => a.terminal_outcome !== "pending")
-
-  // Keep newest 20 completed audits (or all if fewer)
-  const retainedCompleted = completedAudits.slice(-20)
-
-  // Combine retained completed audits with pending protected audits
-  const allAudits = [...retainedCompleted, ...pendingProtected]
-
-  if (allAudits.length === 0) {
-    return mem
+  const audits = mem.llm_extraction_audits ?? []
+  const pending = audits.filter((a) => a.terminal_outcome === "pending")
+  const completed = audits.filter((a) => a.terminal_outcome !== "pending")
+  const retained = completed.slice(-20)
+  while (retained.length > 0 && computeMemoryBytes({ ...mem, llm_extraction_audits: [...retained, ...pending] }) > MEMORY_MAX_BYTES) {
+    retained.shift()
   }
+  const allAudits = [...retained, ...pending]
 
   return {
     ...mem,
-    llm_extraction_audits: allAudits,
+    llm_extraction_audits: allAudits.length > 0 ? allAudits : undefined,
   }
 }
 
@@ -239,16 +239,14 @@ function stage1CompletedAudits(mem: MemoryFile, protection?: MemoryBudgetProtect
  */
 function stage2ResultCache(mem: MemoryFile): MemoryFile {
   const cache = mem.llm_extraction_cache ?? []
-  // Keep newest 10 cache entries
   const retained = cache.slice(-10)
-
-  if (retained.length === 0) {
-    return mem
+  while (retained.length > 0 && computeMemoryBytes({ ...mem, llm_extraction_cache: retained }) > MEMORY_MAX_BYTES) {
+    retained.shift()
   }
 
   return {
     ...mem,
-    llm_extraction_cache: retained,
+    llm_extraction_cache: retained.length > 0 ? retained : undefined,
   }
 }
 
@@ -259,13 +257,13 @@ function stage2ResultCache(mem: MemoryFile): MemoryFile {
  */
 function stage3ModelHealth(mem: MemoryFile): MemoryFile {
   const health = mem.model_health ?? []
-  // Keep newest 10 model-health records
   const retainedHealth = health.slice(-10)
-
-  const quarantine = mem.llm_extraction_cache_quarantine
-
-  if (retainedHealth.length === 0 && !quarantine) {
-    return mem
+  let quarantine = mem.llm_extraction_cache_quarantine
+  while (retainedHealth.length > 0 && computeMemoryBytes({ ...mem, model_health: retainedHealth, llm_extraction_cache_quarantine: quarantine }) > MEMORY_MAX_BYTES) {
+    retainedHealth.shift()
+  }
+  if (computeMemoryBytes({ ...mem, model_health: retainedHealth, llm_extraction_cache_quarantine: quarantine }) > MEMORY_MAX_BYTES) {
+    quarantine = undefined
   }
 
   return {
@@ -286,7 +284,6 @@ function stage3ModelHealth(mem: MemoryFile): MemoryFile {
 function stage4SourceSessionBookkeeping(mem: MemoryFile, protection?: MemoryBudgetProtection): MemoryFile {
   const protectedSourceKeys = getProtectedSourceKeys(protection)
 
-  // Remove oldest recent_sessions entries, keep newest 10
   const retainedSessions = (mem.recent_sessions ?? []).slice(-10)
 
   // Remove oldest processed_sources except protected keys. Keep the newest
@@ -295,11 +292,14 @@ function stage4SourceSessionBookkeeping(mem: MemoryFile, protection?: MemoryBudg
   const sources = mem.processed_sources ?? []
   const protectedSources = sources.filter((ps) => protectedSourceKeys.has(ps.source_key))
   const unprotectedSources = sources.filter((ps) => !protectedSourceKeys.has(ps.source_key))
-  const finalSources = [...unprotectedSources.slice(-10), ...protectedSources]
-
-  if (retainedSessions.length === 0 && finalSources.length === 0) {
-    return mem
+  const retainedSources = unprotectedSources.slice(-10)
+  while (retainedSessions.length > 0 && computeMemoryBytes({ ...mem, recent_sessions: retainedSessions, processed_sources: [...retainedSources, ...protectedSources] }) > MEMORY_MAX_BYTES) {
+    retainedSessions.shift()
   }
+  while (retainedSources.length > 0 && computeMemoryBytes({ ...mem, recent_sessions: retainedSessions, processed_sources: [...retainedSources, ...protectedSources] }) > MEMORY_MAX_BYTES) {
+    retainedSources.shift()
+  }
+  const finalSources = [...retainedSources, ...protectedSources]
 
   return {
     ...mem,
@@ -348,16 +348,14 @@ function stage5InvalidDisposableDecisions(mem: MemoryFile, protection?: MemoryBu
  */
 function stage6StaleObservedFiles(mem: MemoryFile): MemoryFile {
   const files = mem.active_files ?? []
-  // Keep newest 16 active files (sorted by last_touched descending)
   const sorted = [...files].sort((a, b) => {
     const aTime = a.last_touched ?? ""
     const bTime = b.last_touched ?? ""
     return bTime.localeCompare(aTime)
   })
   const retained = sorted.slice(0, 16)
-
-  if (retained.length === 0) {
-    return mem
+  while (retained.length > 0 && computeMemoryBytes({ ...mem, active_files: retained }) > MEMORY_MAX_BYTES) {
+    retained.pop()
   }
 
   return {

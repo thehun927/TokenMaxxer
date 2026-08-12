@@ -253,16 +253,14 @@ describe("PR-8 Wave 7 — integration contracts", () => {
     })
   })
 
-  // ─── (2) Protected ephemeral overflow → required-state-exceeds-budget ─────
-  describe("protected ephemeral overflow returns required-state-exceeds-budget", () => {
-    it("rejects with required-state-exceeds-budget when blockers + cache survive pruning but no decisions exist", async () => {
+  // ─── (2) Disposable ephemeral pressure is evicted before refusal ──────────
+  describe("disposable ephemeral overflow is evicted before refusal", () => {
+    it("fits by dropping blockers and cache when no protected proof exists", async () => {
       const project = worktree
 
-      // Build a schema-valid over-cap state with NO decisions. Stage 9 cannot
-      // prune decisions (none exist); stage 8/10 truncate blockers to 8 × 512B
-      // and keep 10 cache entries. The minimal legal state (no decisions, no
-      // protected sources/audits) is tiny and fits, so the refusal reason is
-      // required-state-exceeds-budget rather than foundational.
+      // Build a schema-valid over-cap state with no decisions or required
+      // proof. B1 requires disposable cache/blocker pressure to be evicted
+      // before any typed refusal is considered.
       const blockers: string[] = []
       for (let i = 0; i < 8; i++) {
         blockers.push(`Blocker number ${i} ${"y".repeat(450)}`)
@@ -279,16 +277,15 @@ describe("PR-8 Wave 7 — integration contracts", () => {
       }
       expect(memorySizeBytes(overCap)).toBeGreaterThan(MEMORY_MAX_BYTES)
 
-      // Drive the budget authority directly to assert the typed reason.
+      // Drive the budget authority directly and assert disposable eviction.
       const fit = fitMemoryToBudget(overCap)
-      expect(fit.ok).toBe(false)
-      if (fit.ok) return
-      expect(fit.reason).toBe("required-state-exceeds-budget")
-      expect(fit.requiredBytes).toBeGreaterThan(MEMORY_MAX_BYTES)
-      expect(fit.maxBytes).toBe(MEMORY_MAX_BYTES)
+      expect(fit.ok).toBe(true)
+      if (!fit.ok) return
+      expect(fit.memory.blockers.length).toBeLessThanOrEqual(8)
+      expect(fit.memory.llm_extraction_cache?.length ?? 0).toBeLessThan(10)
+      expect(fit.bytes).toBeLessThanOrEqual(MEMORY_MAX_BYTES)
 
-      // Now drive through mutateMemory and assert the same contract end-to-end
-      // with the no-write/no-revision invariant.
+      // Drive through mutateMemory and assert the fitted candidate commits.
       const path = projectMemoryPath(project)
       await atomicWrite(path, serializeMemory(emptyMemory(project)))
 
@@ -296,18 +293,16 @@ describe("PR-8 Wave 7 — integration contracts", () => {
         { worktree: project, directory: project },
         () => ({ kind: "commit", memory: overCap, value: null }),
       )
-      expect(result.status).toBe("budget-rejected")
-      if (result.status !== "budget-rejected") return
-      expect(result.reason).toBe("required-state-exceeds-budget")
-      expect(result.revision).toBe(0)
+      expect(result.status).toBe("committed")
+      if (result.status !== "committed") return
+      expect(result.memory.blockers.length).toBeLessThanOrEqual(8)
 
-      // No write occurred.
       const after = await readMemoryState({ worktree: project, directory: project })
       expect(after.status).toBe("ok")
       if (after.status === "ok") {
-        expect(after.revision).toBe(0)
+        expect(after.revision).toBe(1)
         expect(after.memory.decisions).toHaveLength(0)
-        expect(after.memory.blockers).toHaveLength(0)
+        expect(after.memory.blockers.length).toBeLessThanOrEqual(8)
       }
     })
   })

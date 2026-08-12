@@ -11,7 +11,7 @@ import type {
   Provenance,
   ProcessedSource,
 } from "./schema"
-import { MAX_PROCESSED_SOURCES, ProcessedSourceSchema } from "./schema"
+import { MAX_PROCESSED_SOURCES, ProcessedSourceSchema, MEMORY_CREATION_LIMITS } from "./schema"
 import { findProcessedSource, upsertProcessedSource } from "./source-processing"
 import type { ExtractedFacts, HeuristicFacts, TranscriptMessage } from "../types"
 import type { LLMDecisionFacts } from "./extract-schema"
@@ -65,6 +65,15 @@ import * as writerModule from "./writer"
 
 const TRANSCRIPT_WINDOW = 50
 const MAX_DIAGNOSTIC_VALUE = 200
+
+/**
+ * Top-N-by-frequency quality selection for active-file observations. This is
+ * the existing top-5 heuristic, which is stricter than the exported
+ * `activeFilesMax` creation ceiling; the emitted count is still bounded by
+ * that ceiling in `extractActiveFiles` so automatic content can never drift
+ * above the creation contract (B4).
+ */
+const TOP_ACTIVE_FILES = 5
 
 /**
  * Wave 6: Centralize final outcome publication.
@@ -407,6 +416,10 @@ async function processPreparedIdleSource(
     },
   )
 
+  // B3: exhaustive status handling for the heuristic transaction. Only the
+  // committed branch carries a fitted `MemoryFile`; every other discriminant
+  // is consumed before the committed state is used for HEADER generation.
+  let heuristicMemory: MemoryFile | undefined
   if (heuristicResult.status === "lock-timeout") {
     void log(client, "warn", "heuristic transaction lock-timeout", { project })
     return "queue-failed"
@@ -424,9 +437,22 @@ async function processPreparedIdleSource(
     void log(client, "warn", "heuristic transaction budget-rejected", { project })
     return "write-failed"
   }
-
-  const heuristicMemory = heuristicResult.value.memory
-  await writeHeaderBestEffort(client, worktree, directory, heuristicMemory)
+  if (heuristicResult.status === "noop") {
+    // Defensive exhaustiveness: the heuristic callback always commits, so a
+    // noop means no durable change was made and there is no fitted committed
+    // memory to render. The completed-source re-check below observes the
+    // unchanged authoritative state.
+    void log(client, "debug", "heuristic transaction produced no durable change", { project })
+  } else {
+    // status === "committed".
+    // B3: HEADER generation and the committed-state representation must use
+    // the actual fitted memory exposed by the transaction
+    // (`heuristicResult.memory`), never the callback-carried pre-fit candidate
+    // in `value.memory` — the central fitter may change/remove current_task
+    // under pressure before persistence.
+    heuristicMemory = heuristicResult.memory
+    await writeHeaderBestEffort(client, worktree, directory, heuristicMemory)
+  }
 
   // Wave 4: Second completion check after heuristic transaction (§9.3)
   // Re-read authoritative state and check if source was already completed
@@ -435,7 +461,7 @@ async function processPreparedIdleSource(
     void log(client, "warn", "memory read failed after heuristic", { project })
     return "write-failed"
   }
-  const afterHeuristic = afterHeuristicState.memory ?? heuristicMemory
+  const afterHeuristic = afterHeuristicState.memory ?? heuristicMemory ?? emptyMemory(project)
   const completedAfterHeuristic = findProcessedSource(afterHeuristic, sourceVersionKey)
   if (completedAfterHeuristic) {
     // Wave 4: Completed-source fast path
@@ -620,11 +646,14 @@ async function processPreparedIdleSource(
     void log(client, "warn", "final llm transaction budget-rejected", { project })
     return finishIdleOutcome(project, "write-failed")
   }
-  if (finalResult.status === "noop" && finalResult.value.outcome === "noop") {
+  if (finalResult.status === "noop") {
     // Wave 6: Already completed by another actor -> cache-hit
     return finishIdleOutcome(project, "cache-hit")
   }
-  const finalMemory = finalResult.value.memory
+  // B3: HEADER generation must use the actual fitted committed state exposed
+  // by the transaction (`finalResult.memory`), never the callback-carried
+  // pre-fit candidate in `value.memory`.
+  const finalMemory = finalResult.memory
   await writeHeaderBestEffort(client, worktree, directory, finalMemory)
   void log(client, "info", "llm extraction facts merged")
   return finishIdleOutcome(project, "llm-success")
@@ -1133,7 +1162,7 @@ function extractCurrentTask(messages: TranscriptMessage[]): string | null {
     const cleaned = stripCodeBlocks(text)
     const firstLine = cleaned.split("\n").find((l) => l.trim().length > 10)
     if (firstLine) {
-      return firstLine.trim().slice(0, 200)
+      return firstLine.trim().slice(0, MEMORY_CREATION_LIMITS.currentTaskChars)
     }
   }
   return null
@@ -1170,15 +1199,22 @@ function extractActiveFiles(
     }
   }
 
-  // Sort by frequency desc, take top 5
+  // Sort by frequency desc, then select the most frequent observations. The
+  // quality rank is the existing top-5 selection bounded by the exported
+  // activeFilesMax creation ceiling so the emitted count can never exceed the
+  // automatic creation contract (B4).
   const sorted = [...fileCounts.entries()]
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
+    .slice(0, Math.min(TOP_ACTIVE_FILES, MEMORY_CREATION_LIMITS.activeFilesMax))
 
-  return sorted.map(([path, count]) => ({
-    path,
-    reason: count > 1 ? `edited ${count} times` : "read once",
-  }))
+  return sorted.map(([path, count]) => {
+    const reason = count > 1 ? `edited ${count} times` : "read once"
+    return {
+      path,
+      // Cap the automatic reason at the creation bound (B4).
+      reason: reason.slice(0, MEMORY_CREATION_LIMITS.activeFileReasonChars),
+    }
+  })
 }
 
 /**
@@ -1220,6 +1256,12 @@ function normalizePath(p: string): string | null {
 
   // Reject if path looks like a command name (single word, no extension)
   if (!path.includes("/") && !path.includes(".")) return null
+
+  // B4: reject paths that exceed the automatic creation bound rather than
+  // emitting a truncated fragment of a real path into durable state. The
+  // persistence ceiling is broader (4,096), so only new automatic paths are
+  // gated here; previously persisted human-reviewed paths are untouched.
+  if (path.length > MEMORY_CREATION_LIMITS.activeFilePathChars) return null
 
   return path
 }
@@ -1334,9 +1376,11 @@ function extractDecisions(messages: TranscriptMessage[]): {
     if (!seen.has(normalized)) {
       seen.add(normalized)
       deduped.push({
-        topic: d.topic,
+        topic: d.topic.slice(0, MEMORY_CREATION_LIMITS.decisionTopicChars),
         decision: d.decision,
-        rationale: d.rationale,
+        rationale: d.rationale
+          ? d.rationale.slice(0, MEMORY_CREATION_LIMITS.decisionRationaleChars)
+          : undefined,
         foundational: d.foundational,
       })
     }
@@ -1437,8 +1481,8 @@ function scanTextForDecisions(text: string): RawDecision[] {
       seenSentences.add(sentenceKey)
 
       decisions.push({
-        topic: topic.normalized,
-        decision: decision.slice(0, 500), // cap decision text length
+        topic: topic.normalized.slice(0, MEMORY_CREATION_LIMITS.decisionTopicChars),
+        decision: decision.slice(0, MEMORY_CREATION_LIMITS.decisionTextChars),
         foundational,
       })
     }
@@ -1579,6 +1623,12 @@ function extractTopicPhrase(afterKeyword: string): { raw: string; normalized: st
     .replace(/\s+/g, " ")
     .trim()
 
+  // B4: cap the normalized topic at the automatic creation bound so a long
+  // noun phrase can never create an over-limit durable heuristic topic.
+  if (normalized.length > MEMORY_CREATION_LIMITS.decisionTopicChars) {
+    normalized = normalized.slice(0, MEMORY_CREATION_LIMITS.decisionTopicChars)
+  }
+
   return { raw: raw, normalized }
 }
 
@@ -1595,11 +1645,12 @@ function extractBlockers(messages: TranscriptMessage[]): string[] {
 
   for (const line of lines) {
     if (/blocked|can't|cannot|fails?|error|stuck|waiting on|depends on/i.test(line)) {
-      blockers.push(line.trim().slice(0, 200))
+      blockers.push(line.trim().slice(0, MEMORY_CREATION_LIMITS.blockerChars))
     }
   }
 
-  return blockers
+  // B4: cap the emitted blocker count at the automatic creation bound.
+  return blockers.slice(0, MEMORY_CREATION_LIMITS.blockersMax)
 }
 
 function extractNextSteps(messages: TranscriptMessage[]): string[] {
@@ -1619,19 +1670,19 @@ function extractNextSteps(messages: TranscriptMessage[]): string[] {
 
     // Numbered list
     if (/^\d+\.\s/.test(trimmed)) {
-      steps.push(trimmed.slice(0, 200))
+      steps.push(trimmed.slice(0, MEMORY_CREATION_LIMITS.nextStepChars))
       continue
     }
 
     // Keyword lines
     if (/^(next|then|step|todo)[\s:]/i.test(trimmed)) {
-      steps.push(trimmed.slice(0, 200))
+      steps.push(trimmed.slice(0, MEMORY_CREATION_LIMITS.nextStepChars))
       continue
     }
   }
 
-  // Cap at 5
-  return steps.slice(0, 5)
+  // B4: cap the emitted step count at the automatic creation bound.
+  return steps.slice(0, MEMORY_CREATION_LIMITS.nextStepsMax)
 }
 
 /** Get all text from text parts of a message. */

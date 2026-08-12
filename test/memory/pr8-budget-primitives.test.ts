@@ -81,9 +81,11 @@ describe("PR-8 Wave 2: Budget Primitives", () => {
       expect(truncated).toBe(original)
     })
 
-    it("truncateUtf8 returns marker only if even marker doesn't fit", () => {
+    it("truncateUtf8 returns empty string for maxBytes 0 (marker doesn't fit)", () => {
+      // For maxBytes 0, the only valid value is an empty string
       const truncated = truncateUtf8("a", 0)
-      expect(truncated).toBe("...")
+      expect(truncated).toBe("")
+      expect(Buffer.byteLength(truncated, "utf8")).toBe(0)
     })
   })
 
