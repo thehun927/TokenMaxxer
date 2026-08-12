@@ -2,6 +2,8 @@
 
 This directory is the canonical home for TokenMaxxer's **Concrete Reliability Implementation Plan** and every document generated while executing it.
 
+**Program status: Complete — 10/10 workstreams independently reviewed and shipped.**
+
 ## Program-level documents
 
 - [`assessment.md`](./assessment.md) — independent codebase assessment that established the confirmed reliability findings.
@@ -20,7 +22,9 @@ This directory is the canonical home for TokenMaxxer's **Concrete Reliability Im
 | PR 7 | Compaction quality and anti-drift | **Complete — Ship** | [`PR-7/`](./PR-7/) |
 | PR 8 | Guaranteed storage and injection budgets | **Complete — Ship** | [`PR-8/`](./PR-8/) |
 | PR 9 | Accurate diagnostics and artifact storage | **Complete — Ship** | [`PR-9/`](./PR-9/) |
-| PR 10 | Reproducible release and dependency hygiene | **Implementation plan ready** | [`PR-10/`](./PR-10/) |
+| PR 10 | Reproducible release and dependency hygiene | **Complete — Ship** | [`PR-10/`](./PR-10/) |
+
+The final PR-10 Oracle gate is recorded in [`PR-10/oracle-second-final-rereview.md`](./PR-10/oracle-second-final-rereview.md). The reviewed implementation head is `ca4e11f440494aae8b8ba02ce33ba72acd315a3a`; GitHub CI run `31650370812` passed on that exact tree. No release tag was created before the final Ship verdict.
 
 ## PR directory convention
 
