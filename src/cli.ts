@@ -297,6 +297,7 @@ async function cmdPromote(
           kind: "commit",
           memory: mutation.memory,
           value: { outcome: "confirmed", targetId: decisionId },
+          budgetProtection: { preserveDecisionIDs: [decisionId] },
         }
       }
       return { kind: "noop", value: { outcome: "promote-failed" } }
@@ -332,6 +333,11 @@ function handlePromoteResult(
     io.stderr.write(msg + "\n")
     return { kind: "failed", message: msg }
   }
+  if (result.status === "budget-rejected") {
+    const msg = "Promotion would exceed the protected STATE budget; STATE unchanged."
+    io.stderr.write(msg + "\n")
+    return { kind: "failed", message: msg }
+  }
   if (result.status === "lock-timeout") {
     const msg = "Timed out waiting for the project lock; try again."
     io.stderr.write(msg + "\n")
@@ -342,6 +348,14 @@ function handlePromoteResult(
     io.stderr.write(msg + "\n")
     return { kind: "commit-failed", message: msg }
   }
+  if (result.status === "unavailable") {
+    const msg = "Authoritative STATE unavailable; promotion aborted."
+    io.stderr.write(msg + "\n")
+    return { kind: "unavailable", message: msg }
+  }
+  // Exhaustive check: all MemoryMutationResult discriminants handled above.
+  const _exhaustive: never = result
+  void _exhaustive
   const msg = "Authoritative STATE unavailable; promotion aborted."
   io.stderr.write(msg + "\n")
   return { kind: "unavailable", message: msg }
@@ -470,6 +484,7 @@ async function cmdSupersede(
           kind: "commit",
           memory: mutation.memory,
           value: { outcome: "superseded", newAuthorityId: mutation.newAuthorityId },
+          budgetProtection: { preserveDecisionIDs: [mutation.newAuthorityId, authorityId, candidateId] },
         }
       }
       return { kind: "noop", value: { outcome: "supersede-failed" } }
@@ -501,6 +516,11 @@ function handleSupersedeResult(
     io.stderr.write(msg + "\n")
     return { kind: "failed", message: msg }
   }
+  if (result.status === "budget-rejected") {
+    const msg = "Supersession would exceed the protected STATE budget; STATE unchanged."
+    io.stderr.write(msg + "\n")
+    return { kind: "failed", message: msg }
+  }
   if (result.status === "lock-timeout") {
     const msg = "Timed out waiting for the project lock; try again."
     io.stderr.write(msg + "\n")
@@ -511,6 +531,14 @@ function handleSupersedeResult(
     io.stderr.write(msg + "\n")
     return { kind: "commit-failed", message: msg }
   }
+  if (result.status === "unavailable") {
+    const msg = "Authoritative STATE unavailable; supersession aborted."
+    io.stderr.write(msg + "\n")
+    return { kind: "unavailable", message: msg }
+  }
+  // Exhaustive check: all MemoryMutationResult discriminants handled above.
+  const _exhaustive: never = result
+  void _exhaustive
   const msg = "Authoritative STATE unavailable; supersession aborted."
   io.stderr.write(msg + "\n")
   return { kind: "unavailable", message: msg }

@@ -1209,7 +1209,7 @@ describe("PR 5 §Wave 1B — idempotency basics", () => {
       },
     )
 
-    expect(result.status).toBe("commit-failed")
+    expect(result.status).toBe("budget-rejected")
     const onDisk = await readMemory({ worktree, directory: worktree })
     expect(onDisk?.processed_sources.some((source) => source.source_key === sourceVersionKey)).toBe(false)
   })

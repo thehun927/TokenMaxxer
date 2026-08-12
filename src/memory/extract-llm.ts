@@ -576,7 +576,7 @@ export type AuditCreatedResult =
   | { status: "committed" }
   | {
       status: "failed"
-      reason: "lock-timeout" | "unavailable" | "commit-failed" | "unexpected"
+      reason: "lock-timeout" | "unavailable" | "commit-failed" | "unexpected" | "budget-rejected"
     }
 
 export type AuditTerminalCallback = (
@@ -831,7 +831,7 @@ export type LLMExtractionRunResult =
   | { status: "unavailable"; reason: "missing-session-endpoint" }
   | {
       status: "guard-failed"
-      reason?: "lock-timeout" | "unavailable" | "commit-failed" | "unexpected"
+      reason?: "lock-timeout" | "unavailable" | "commit-failed" | "unexpected" | "budget-rejected"
     }
   | {
       status: "failed"
@@ -1109,7 +1109,7 @@ async function extractFactsLLMOnce(
 function isAuditGuardFailure(
   value: AuditCreatedResult,
 ): value is Extract<AuditCreatedResult, { status: "failed" }> {
-  return isRecord(value) && value.status === "failed"
+  return isRecord(value) && value.status === "failed" && value.reason !== undefined
 }
 
 async function notifyAuditTerminal(

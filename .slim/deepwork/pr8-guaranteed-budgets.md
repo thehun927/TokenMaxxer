@@ -50,6 +50,8 @@ review.
 Wave 2 is complete in `f9e079a` with 52/52 primitive tests and a passing
 TypeScript check. Wave 3 schema/migration compatibility is complete with 19/19
 PR-8 contracts, 76 existing schema/migration regressions, and a passing
-TypeScript check. Wave 4 canonical transaction integration is now active. The
+TypeScript check. Wave 4 canonical transaction integration is complete in
+`34d777c` with 55 focused transaction tests and a passing TypeScript check.
+Wave 5 mutation callers and retry/public-outcome semantics are now active. The
 unrelated `opencode.json` modification and untracked `.opencode/` state remain
 outside PR-8 ownership.

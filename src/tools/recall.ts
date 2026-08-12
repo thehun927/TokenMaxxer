@@ -166,6 +166,7 @@ function reviewMutationToAction(
         kind: "commit",
         memory: mutation.memory,
         value: { outcome: "requested", id: mutation.targetId },
+        budgetProtection: { preserveDecisionIDs: [mutation.targetId] },
       }
     case "already-reviewed":
       return { kind: "noop", value: { outcome: "already-reviewed", id: mutation.targetId } }

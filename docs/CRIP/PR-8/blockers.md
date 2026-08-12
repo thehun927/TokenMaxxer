@@ -68,3 +68,13 @@ pull PR-9 diagnostics/status or PR-10 release/dependency work into this PR.
 - TypeScript check: `npx tsc --noEmit` → passed (exit 0).
 - Decision: Wave 4 did not add a new public idle outcome; budget refusal remains an internal typed result and is mechanically routed through existing failure behavior until Wave 5 adds bounded reason mapping/protection at each caller.
 - Wave 4 is complete. Wave 5 mutation callers and retry/public-outcome semantics are now the active phase.
+
+## 2026-08-12 — Wave 5 mutation callers reconciled
+
+- Writer integration owns `src/memory/writer.ts` and the related typed failure unions in `src/memory/extract-llm.ts`; human promotion integration owns `src/tools/recall.ts` and `src/cli.ts`; the writer regression expectation is in `test/memory/writer-llm.test.ts`.
+- Final LLM merge protects the new processed-source key; audit guard and terminal updates protect their audit IDs; heuristic and model-health writes submit unpruned candidates to central `mutateMemory()`; ad-hoc `pruneOld()` is no longer used by durable mutation callers.
+- Final LLM budget rejection maps to existing `write-failed`, writes no completion marker, and leaves the source retryable. Audit budget refusal is non-success and boundedly logged. Recall promotion and CLI promote/supersede protect selected human decision IDs and map refusal without inventing public idle outcomes.
+- Combined focused rerun: `npx vitest run test/memory/writer.test.ts test/memory/writer-llm.test.ts test/memory/pr8-storage-budget.test.ts test/memory/transaction.test.ts test/tools/recall.test.ts test/cli.test.ts` → 199 passed, 0 failed.
+- TypeScript check: `npx tsc --noEmit` → passed (exit 0).
+- Decision: retain `pruneOld()`/`pruneOldForCommit()` as compatibility/test seams only; no writer durable mutation caller invokes them after Wave 5.
+- Wave 5 is complete. Wave 6 independent durable-injection selection and 4,096-byte rendering is now the active phase.

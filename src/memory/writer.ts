@@ -60,6 +60,7 @@ import type { CanonicalExtractionInput } from "./extract-prompt"
 import { log } from "../util/log"
 import { beginMemoryActivity } from "./activity-state"
 import { MEMORY_MAX_BYTES, memorySizeBytes } from "./memory-size"
+import type { MemoryBudgetProtection } from "./budget"
 import * as writerModule from "./writer"
 
 const TRANSCRIPT_WINDOW = 50
@@ -392,11 +393,16 @@ async function processPreparedIdleSource(
         timestamp: new Date().toISOString(),
         evidenceCandidates: mergedCandidates,
       })
-      const heuristicMemory = pruneOld(recordRecentSession(merged, sessionId), client)
+      const heuristicMemory = recordRecentSession(merged, sessionId)
+      // Return unpruned candidate with budget protection
+      const budgetProtection: MemoryBudgetProtection = {
+        preserveProcessedSourceKeys: [],
+      }
       return {
         kind: "commit",
         memory: heuristicMemory,
         value: { outcome: "heuristic-only", memory: heuristicMemory },
+        budgetProtection,
       }
     },
   )
@@ -721,6 +727,11 @@ export async function finalLLMMerge(
   },
 ): Promise<MemoryMutationResult<{ outcome: "committed" | "noop"; memory: MemoryFile }>> {
   const { client, worktree, directory } = opts
+  // Wave 5 §10.6: Protect the newly created processed-source key from eviction
+  // The source key is required proof that the source was successfully processed.
+  const budgetProtection: MemoryBudgetProtection = {
+    preserveProcessedSourceKeys: [args.sourceVersionKey],
+  }
   return mutateMemory<{ outcome: "committed" | "noop"; memory: MemoryFile }>(
     { worktree, directory, client },
     (base) => {
@@ -827,20 +838,12 @@ export async function finalLLMMerge(
       }
       const withProcessedSource = upsertProcessedSource(withCache, processedSourceRecord)
 
-      // Wave 5 §10.6: Prune while preserving newly written source key
-      // The newly created source key is temporarily protected from eviction.
-      // If the durable facts plus this proof still cannot fit, leave the
-      // irreducible over-cap state for commitMemoryExact to reject.  That
-      // produces commit-failed rather than an llm-success without proof.
-      const finalMemory = pruneOldForCommit(
-        withProcessedSource,
-        client,
-        Date.now(),
-        args.sourceVersionKey,
-      )
-
-      // Wave 5 §10.7: Commit exactly once
-      return { kind: "commit", memory: finalMemory, value: { outcome: "committed", memory: finalMemory } }
+      // Wave 5 §10.6: Return unpruned candidate with budget protection
+      // The callback memory should be the unpruned withProcessedSource candidate.
+      // Action value may carry that pre-fit memory only for compatibility.
+      // Callers use result.memory (which is the fitted version from central fitMemoryToBudget).
+      // Budget protection belongs on MutationAction.commit, not on the callback.
+      return { kind: "commit", memory: withProcessedSource, value: { outcome: "committed", memory: withProcessedSource }, budgetProtection }
     },
   )
 }
@@ -864,7 +867,7 @@ export type AuditGuardPersistenceResult =
   | { status: "committed" }
   | {
       status: "failed"
-      reason: "lock-timeout" | "unavailable" | "commit-failed" | "unexpected"
+      reason: "lock-timeout" | "unavailable" | "commit-failed" | "unexpected" | "budget-rejected"
     }
 
 export async function persistAuditGuardResult(
@@ -878,7 +881,11 @@ export async function persistAuditGuardResult(
       { worktree: opts.worktree, directory: opts.directory, client: opts.client },
       (base) => {
         const guarded = upsertAuditMetadata(base, audit)
-        return { kind: "commit", memory: pruneOld(guarded, opts.client), value: { outcome: "committed" } }
+        // Return unpruned guarded candidate with budget protection
+        const budgetProtection: MemoryBudgetProtection = {
+          preserveAuditSessionIDs: [audit.audit_session_id],
+        }
+        return { kind: "commit", memory: guarded, value: { outcome: "committed" }, budgetProtection }
       },
     )
   } catch (error) {
@@ -900,10 +907,23 @@ export async function persistAuditGuardResult(
     void log(opts.client, "warn", "audit guard transaction commit-failed", { project })
     return { status: "failed", reason: "commit-failed" }
   }
+  if (result.status === "budget-rejected") {
+    // Budget rejection: bounded warning and non-success behavior
+    void log(opts.client, "warn", "audit guard transaction budget-rejected", {
+      project,
+      reason: result.reason,
+      requiredBytes: result.requiredBytes,
+      maxBytes: result.maxBytes,
+    })
+    return { status: "failed", reason: "budget-rejected" as const }
+  }
   return { status: "committed" }
 }
 
-/** Compatibility boolean seam for callers that only need persistence success. */
+/**
+ * Compatibility boolean seam for callers that only need persistence success.
+ * Returns false on budget rejection.
+ */
 export async function persistAuditGuard(
   opts: { client: unknown; worktree: string; directory: string },
   audit: LLMAuditMetadata,
@@ -933,7 +953,11 @@ export async function persistTerminalTransaction(
         return { kind: "noop", value: { outcome: "noop" } }
       }
       const updated = setAuditTerminalOutcome(base, auditSessionID, outcome)
-      return { kind: "commit", memory: pruneOld(updated, opts.client), value: { outcome: "committed" } }
+      // Return unpruned updated candidate with same audit ID protection
+      const budgetProtection: MemoryBudgetProtection = {
+        preserveAuditSessionIDs: [auditSessionID],
+      }
+      return { kind: "commit", memory: updated, value: { outcome: "committed" }, budgetProtection }
     },
   )
   if (result.status === "noop") return
@@ -947,6 +971,16 @@ export async function persistTerminalTransaction(
   }
   if (result.status === "commit-failed") {
     void log(opts.client, "warn", "audit terminal transaction commit-failed", { project })
+    return
+  }
+  if (result.status === "budget-rejected") {
+    // Budget rejection: bounded warning and non-success behavior
+    void log(opts.client, "warn", "audit terminal transaction budget-rejected", {
+      project,
+      reason: result.reason,
+      requiredBytes: result.requiredBytes,
+      maxBytes: result.maxBytes,
+    })
     return
   }
 }
@@ -965,7 +999,8 @@ export async function persistModelHealth(
     { worktree: opts.worktree, directory: opts.directory, client: opts.client },
     (base) => {
       const updated = upsertModelHealth(base, report)
-      return { kind: "commit", memory: pruneOld(updated, opts.client), value: { outcome: "committed" } }
+      // Model health may remain best-effort and unprotected; no pruneOld call
+      return { kind: "commit", memory: updated, value: { outcome: "committed" } }
     },
   )
   if (result.status === "lock-timeout") {
@@ -978,6 +1013,16 @@ export async function persistModelHealth(
   }
   if (result.status === "commit-failed") {
     void log(opts.client, "warn", "model health transaction commit-failed", { project })
+    return
+  }
+  if (result.status === "budget-rejected") {
+    // Budget rejection: bounded warning and non-success behavior
+    void log(opts.client, "warn", "model health transaction budget-rejected", {
+      project,
+      reason: result.reason,
+      requiredBytes: result.requiredBytes,
+      maxBytes: result.maxBytes,
+    })
     return
   }
 }
