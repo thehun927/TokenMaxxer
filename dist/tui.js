@@ -447,16 +447,6 @@ function handleError(err, owner = Owner) {
 }
 var FALLBACK = Symbol("fallback");
 
-// src/util/fs.ts
-import { mkdir, writeFile, readFile, rename, rm, stat } from "fs/promises";
-async function safeRead(path) {
-  try {
-    return await readFile(path, "utf-8");
-  } catch {
-    return null;
-  }
-}
-
 // src/memory/paths.ts
 import { join } from "path";
 import { createHash } from "crypto";
@@ -474,339 +464,20 @@ function projectStorageHash(project) {
   return createHash("sha256").update(project).digest("hex").slice(0, 16);
 }
 
-// src/memory/schema.ts
-import { z as z2 } from "zod";
+// src/memory/commit-pulse.ts
+import { join as join2 } from "path";
 
-// src/memory/extract-schema.ts
-import { z } from "zod";
-var ExtractedActiveFileSchema = z.object({
-  path: z.string(),
-  reason: z.string()
-}).strict();
-var ExtractedDecisionSchema = z.object({
-  topic: z.string(),
-  decision: z.string(),
-  evidence_refs: z.array(z.string().min(1).max(128)).min(1).max(3).optional().superRefine((refs, ctx) => {
-    if (refs === undefined) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "evidence refs are required" });
-      return;
-    }
-    if (new Set(refs).size !== refs.length) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "evidence refs must be unique" });
-    }
-  }),
-  rationale: z.string().optional(),
-  foundational: z.boolean().optional()
-}).strict();
-var ExtractedFactsSchema = z.object({
-  current_task: z.string().nullable(),
-  active_files: z.array(ExtractedActiveFileSchema).max(5),
-  decisions: z.array(ExtractedDecisionSchema),
-  blockers: z.array(z.string()),
-  next_steps: z.array(z.string()).max(5)
-}).strict();
-var boundedNonEmpty = (max) => z.string().max(max).refine((value) => value.trim().length > 0, "must be non-empty");
-var evidenceRef = z.string().min(1).max(128).refine((value) => value.trim().length > 0, "evidence ref must be non-empty");
-var LLMDecisionSchema = z.object({
-  topic: boundedNonEmpty(256),
-  decision: boundedNonEmpty(500),
-  rationale: boundedNonEmpty(500).optional(),
-  evidence_refs: z.array(evidenceRef).min(1).max(3).refine((refs) => new Set(refs).size === refs.length, "evidence refs must be unique")
-}).strict();
-var LLMDecisionFactsSchema = z.object({
-  decisions: z.array(LLMDecisionSchema).max(10)
-}).strict();
-
-// src/memory/schema.ts
-var MAX_IDENTIFIER = 256;
-var MAX_REFERENCE = 128;
-var MAX_CACHE_QUARANTINE_COUNT = 1e4;
-var MAX_MODEL_HEALTH_RECORDS = 10;
-var MAX_PROCESSED_SOURCES = 10;
-var EvidenceKindSchema = z2.enum(["transcript", "heuristic-candidate"]);
-var EvidenceSchema = z2.object({
-  kind: EvidenceKindSchema,
-  ref: z2.string().min(1).max(MAX_REFERENCE),
-  digest: z2.string().regex(/^[a-f0-9]{64}$/i)
-}).strict();
-var ExtractorSchema = z2.enum(["heuristic", "llm", "human", "legacy"]);
-var ConfidenceSchema = z2.enum([
-  "heuristic",
-  "llm-corroborated",
-  "human-reviewed",
-  "legacy"
-]);
-var HumanReviewSchema = z2.object({
-  channel: z2.literal("interactive-cli"),
-  reviewed_at: z2.string().datetime({ offset: true }).max(64).or(z2.string().max(64))
-}).strict();
-var ProvenanceSchema = z2.object({
-  extractor: ExtractorSchema,
-  source_session_id: z2.string().min(1).max(MAX_IDENTIFIER),
-  source_audit_session_id: z2.string().min(1).max(MAX_IDENTIFIER).optional(),
-  confidence: ConfidenceSchema,
-  evidence: z2.array(EvidenceSchema).max(3).default([])
-}).strict().superRefine((provenance, ctx) => {
-  const { extractor, confidence } = provenance;
-  if (extractor === "llm" && confidence !== "llm-corroborated") {
-    ctx.addIssue({
-      code: z2.ZodIssueCode.custom,
-      path: ["confidence"],
-      message: "extractor=llm must pair with confidence=llm-corroborated"
-    });
+// src/util/fs.ts
+import { mkdir, writeFile, readFile, rename, rm, stat } from "fs/promises";
+async function safeRead(path) {
+  try {
+    return await readFile(path, "utf-8");
+  } catch {
+    return null;
   }
-  if (extractor === "heuristic" && confidence !== "heuristic") {
-    ctx.addIssue({
-      code: z2.ZodIssueCode.custom,
-      path: ["confidence"],
-      message: "extractor=heuristic must pair with confidence=heuristic"
-    });
-  }
-  if (extractor === "human" && confidence !== "human-reviewed") {
-    ctx.addIssue({
-      code: z2.ZodIssueCode.custom,
-      path: ["confidence"],
-      message: "extractor=human must pair with confidence=human-reviewed"
-    });
-  }
-  if (extractor === "legacy" && confidence !== "legacy") {
-    ctx.addIssue({
-      code: z2.ZodIssueCode.custom,
-      path: ["confidence"],
-      message: "extractor=legacy must pair with confidence=legacy"
-    });
-  }
-  if (extractor === "llm" && confidence === "llm-corroborated") {
-    if (!provenance.source_audit_session_id || provenance.source_audit_session_id.length === 0) {
-      ctx.addIssue({
-        code: z2.ZodIssueCode.custom,
-        path: ["source_audit_session_id"],
-        message: "LLM provenance requires non-empty source_audit_session_id"
-      });
-    }
-    if (!provenance.evidence || provenance.evidence.length === 0) {
-      ctx.addIssue({
-        code: z2.ZodIssueCode.custom,
-        path: ["evidence"],
-        message: "LLM provenance requires at least 1 evidence entry"
-      });
-    }
-    if (provenance.evidence.length > 3) {
-      ctx.addIssue({
-        code: z2.ZodIssueCode.custom,
-        path: ["evidence"],
-        message: "LLM provenance evidence must have at most 3 entries"
-      });
-    }
-    if (provenance.evidence.some((e) => e.kind !== "transcript")) {
-      ctx.addIssue({
-        code: z2.ZodIssueCode.custom,
-        path: ["evidence"],
-        message: "LLM provenance evidence must be transcript-only"
-      });
-    }
-  }
-});
-var NonDecisionProvenanceSchema = ProvenanceSchema.superRefine((provenance, ctx) => {
-  if (provenance.extractor !== "heuristic" && provenance.extractor !== "legacy") {
-    ctx.addIssue({
-      code: z2.ZodIssueCode.custom,
-      path: ["extractor"],
-      message: "non-decision provenance must be heuristic or legacy"
-    });
-  }
-  if (provenance.confidence !== "heuristic" && provenance.confidence !== "legacy") {
-    ctx.addIssue({
-      code: z2.ZodIssueCode.custom,
-      path: ["confidence"],
-      message: "non-decision provenance confidence must be heuristic or legacy"
-    });
-  }
-});
-var DecisionSchema = z2.object({
-  id: z2.string().min(1).max(MAX_IDENTIFIER),
-  topic: z2.string(),
-  decision: z2.string(),
-  rationale: z2.string().optional(),
-  timestamp: z2.string().datetime({ offset: true }).or(z2.string()),
-  git_sha: z2.string().optional(),
-  session_id: z2.string(),
-  still_valid: z2.boolean().default(true),
-  foundational: z2.boolean().default(false),
-  foundational_requested: z2.boolean().default(false),
-  last_used_in_session: z2.string().optional(),
-  human_review: HumanReviewSchema.optional(),
-  superseded_by: z2.string().max(MAX_IDENTIFIER).optional(),
-  conflicts_with: z2.array(z2.string().max(MAX_IDENTIFIER)).max(8).optional(),
-  derived_from_decision_id: z2.string().max(MAX_IDENTIFIER).optional(),
-  human_conflict_quarantined: z2.boolean().default(false),
-  provenance: ProvenanceSchema
-});
-var ActiveFileSchema = z2.object({
-  path: z2.string(),
-  reason: z2.string(),
-  last_touched: z2.string().datetime({ offset: true }).or(z2.string()),
-  provenance: NonDecisionProvenanceSchema
-});
-var ModelHealthOutcomeSchema = z2.enum([
-  "success",
-  "structured-shape-failure",
-  "validation-failure",
-  "transport-auth-failure",
-  "timeout"
-]);
-var ModelHealthSchema = z2.object({
-  provider_id: z2.string().min(1).max(MAX_IDENTIFIER),
-  model_id: z2.string().min(1).max(MAX_IDENTIFIER),
-  last_outcome: ModelHealthOutcomeSchema,
-  failure_streak: z2.number().int().min(0).max(32).default(0),
-  last_outcome_at: z2.string().datetime({ offset: true }).or(z2.string().max(128)).optional(),
-  cooldown_until: z2.string().datetime({ offset: true }).or(z2.string().max(128)).optional(),
-  failure_reason: z2.string().max(MAX_REFERENCE).optional()
-});
-var CacheQuarantineMetadataSchema = z2.object({
-  count: z2.number().int().min(0).max(MAX_CACHE_QUARANTINE_COUNT),
-  reason: z2.string().max(MAX_REFERENCE).optional()
-});
-var ProcessedSourceSchema = z2.object({
-  source_key: z2.string().regex(/^v2s:[a-f0-9]{64}$/),
-  extraction_key: z2.string().regex(/^v2e:[a-f0-9]{64}$/),
-  extraction_contract_version: z2.number().int().positive().max(1e4),
-  completed_at: z2.string().datetime({ offset: true }).or(z2.string().max(128))
-}).strict();
-var LLMExtractionCacheEntrySchema = z2.object({
-  cache_key: z2.string(),
-  source_session_id: z2.string(),
-  canonical_input_sha256: z2.string(),
-  provider_id: z2.string(),
-  model_id: z2.string(),
-  completed_at: z2.string().datetime({ offset: true }).or(z2.string()),
-  provenance: ProvenanceSchema.optional(),
-  facts: LLMDecisionFactsSchema,
-  source_key: z2.string().optional(),
-  source_input_sha256: z2.string().optional(),
-  prompt_input_sha256: z2.string().optional(),
-  extraction_contract_version: z2.number().int().positive().max(1e4).optional(),
-  model_variant: z2.string().optional()
-});
-var AuditTerminalOutcomeSchema = z2.enum(["pending", "success", "failed"]);
-var LLMAuditMetadataSchema = z2.object({
-  audit_session_id: z2.string().max(256),
-  source_session_id: z2.string().max(256),
-  cache_key: z2.string().max(512),
-  provider_id: z2.string().max(256),
-  model_id: z2.string().max(256),
-  created_at: z2.string().datetime({ offset: true }).or(z2.string().max(128)),
-  terminal_outcome: AuditTerminalOutcomeSchema,
-  source_key: z2.string().optional(),
-  source_input_sha256: z2.string().optional(),
-  prompt_input_sha256: z2.string().optional(),
-  extraction_contract_version: z2.number().int().positive().max(1e4).optional(),
-  model_variant: z2.string().optional()
-});
-var MemoryFileBaseSchema = z2.object({
-  version: z2.literal(3),
-  revision: z2.number().int().nonnegative().default(0),
-  project_path: z2.string(),
-  last_updated: z2.string().datetime({ offset: true }).or(z2.string()),
-  last_git_sha: z2.string().optional(),
-  last_session_id: z2.string().optional(),
-  current_task: z2.string().optional(),
-  current_task_provenance: NonDecisionProvenanceSchema.optional(),
-  active_files: z2.array(ActiveFileSchema).default([]),
-  decisions: z2.array(DecisionSchema).default([]),
-  blockers: z2.array(z2.string()).default([]),
-  next_steps: z2.array(z2.string()).default([]),
-  recent_sessions: z2.array(z2.string()).max(10).default([]),
-  llm_extraction_cache: z2.array(LLMExtractionCacheEntrySchema).max(10).optional(),
-  llm_extraction_audits: z2.array(LLMAuditMetadataSchema).max(20).optional(),
-  model_health: z2.array(ModelHealthSchema).max(MAX_MODEL_HEALTH_RECORDS).optional(),
-  llm_extraction_cache_quarantine: CacheQuarantineMetadataSchema.optional(),
-  processed_sources: z2.array(ProcessedSourceSchema).max(MAX_PROCESSED_SOURCES).default([])
-});
-var DUPLICATE_DECISION_ID = "DUPLICATE_DECISION_ID";
-var MemoryFileSchema = MemoryFileBaseSchema.superRefine((memory, ctx) => {
-  for (const [index, entry] of (memory.llm_extraction_cache ?? []).entries()) {
-    const provenance = entry.provenance;
-    if (!provenance || provenance.extractor !== "llm" || provenance.confidence !== "llm-corroborated" || !provenance.source_audit_session_id || provenance.evidence.length === 0) {
-      ctx.addIssue({
-        code: z2.ZodIssueCode.custom,
-        path: ["llm_extraction_cache", index, "provenance"],
-        message: "cache entry lacks evidence-backed provenance"
-      });
-    }
-  }
-  for (const [index, decision] of memory.decisions.entries()) {
-    const path = (field) => ["decisions", index, field];
-    const claimsHumanTrust = decision.provenance?.extractor === "human" || decision.provenance?.confidence === "human-reviewed" || decision.human_review !== undefined;
-    if (claimsHumanTrust) {
-      const trustOk = decision.foundational === true && decision.provenance?.extractor === "human" && decision.provenance?.confidence === "human-reviewed" && decision.human_review?.channel === "interactive-cli";
-      if (!trustOk) {
-        ctx.addIssue({
-          code: z2.ZodIssueCode.custom,
-          path: path("provenance"),
-          message: "a human trust claim requires foundational=true, extractor=human, " + "confidence=human-reviewed, and human_review.channel=interactive-cli"
-        });
-      }
-    }
-    if (decision.superseded_by === decision.id) {
-      ctx.addIssue({
-        code: z2.ZodIssueCode.custom,
-        path: path("superseded_by"),
-        message: "a decision cannot supersede itself"
-      });
-    }
-    if (decision.conflicts_with?.includes(decision.id)) {
-      ctx.addIssue({
-        code: z2.ZodIssueCode.custom,
-        path: path("conflicts_with"),
-        message: "a decision cannot conflict with itself"
-      });
-    }
-    if (decision.conflicts_with) {
-      const seen = new Set;
-      for (const id of decision.conflicts_with) {
-        if (seen.has(id)) {
-          ctx.addIssue({
-            code: z2.ZodIssueCode.custom,
-            path: path("conflicts_with"),
-            message: `duplicate conflict id: ${id}`
-          });
-        }
-        seen.add(id);
-      }
-    }
-  }
-  const seenDecisionIds = new Set;
-  for (const [index, decision] of memory.decisions.entries()) {
-    if (seenDecisionIds.has(decision.id)) {
-      ctx.addIssue({
-        code: z2.ZodIssueCode.custom,
-        path: ["decisions", index, "id"],
-        params: { issue: DUPLICATE_DECISION_ID },
-        message: `duplicate decision id: ${decision.id}`
-      });
-    }
-    seenDecisionIds.add(decision.id);
-  }
-});
-
-// src/memory/project-lock.ts
-import { z as z3 } from "zod";
-var ProjectLockOwnerSchema = z3.object({
-  version: z3.literal(1),
-  pid: z3.number().int().positive().max(2147483647),
-  hostname: z3.string().min(1).max(255),
-  acquired_at: z3.string().max(64),
-  nonce: z3.string().min(1).max(64)
-}).strict();
-
-// src/memory/store.ts
-var cache = new Map;
+}
 
 // src/memory/commit-pulse.ts
-import { unlink } from "fs/promises";
-import { join as join2 } from "path";
 var MEMORY_COMMIT_RECENT_MS = 2000;
 var COMMIT_PULSE_FILE = ".commit-pulse";
 function memoryCommitPulsePath(project) {
@@ -826,13 +497,11 @@ async function readRecentMemoryCommit(project, now = Date.now()) {
   try {
     parsed = JSON.parse(raw);
   } catch {
-    await unlink(path).catch(() => {});
     return null;
   }
   const committedAt = parsed?.committed_at;
   const fresh = typeof committedAt === "number" && Number.isFinite(committedAt) && committedAt <= now && now - committedAt <= MEMORY_COMMIT_RECENT_MS;
   if (!fresh) {
-    await unlink(path).catch(() => {});
     return null;
   }
   return committedAt;
@@ -859,26 +528,35 @@ var tui = async (api) => {
         const project = projectFromState(api.state.path);
         let lastSeenCommitAt = 0;
         let pollInFlight = false;
+        let disposed = false;
         let pulseTimer;
         let pollTimer;
         let unsubscribe;
         const startPulse = () => {
+          if (disposed)
+            return;
           if (pulseTimer)
             clearTimeout(pulseTimer);
           setPulseStage("bright");
           pulseTimer = setTimeout(() => {
+            if (disposed)
+              return;
             setPulseStage("fade");
             pulseTimer = setTimeout(() => {
+              if (disposed)
+                return;
               setPulseStage("idle");
               pulseTimer = undefined;
             }, FADE_MS);
           }, BRIGHT_MS);
         };
         const poll = () => {
-          if (!project || pollInFlight)
+          if (!project || disposed || pollInFlight)
             return;
           pollInFlight = true;
           readRecentMemoryCommit(project).then((committedAt) => {
+            if (disposed)
+              return;
             if (committedAt !== null && committedAt > lastSeenCommitAt) {
               lastSeenCommitAt = committedAt;
               startPulse();
@@ -895,6 +573,7 @@ var tui = async (api) => {
         poll();
         pollTimer = setInterval(poll, POLL_MS);
         onCleanup(() => {
+          disposed = true;
           if (pollTimer)
             clearInterval(pollTimer);
           if (pulseTimer)

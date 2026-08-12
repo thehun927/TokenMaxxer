@@ -45,4 +45,23 @@ if (!hasExpectedImports) {
   process.exit(1);
 }
 
+// Check 5: Reject accidental TUI dependency on storage-authority modules
+// TMTUI-1/2 may depend on leaf path helpers and commit-pulse telemetry,
+// but must not bundle the durable STATE transaction/schema subsystem merely to render the composer indicator.
+const storageAuthorityMarkers = [
+  /src\/memory\/store\.ts/,
+  /src\/memory\/schema\.ts/,
+  /src\/memory\/extract-schema\.ts/,
+  /\bmutateMemory\b/,
+  /\bcommitMemoryExact\b/,
+  /\bMemoryFileSchema\b/,
+];
+
+const hasStorageAuthorityMarkers = storageAuthorityMarkers.some(marker => marker.test(tuiJs));
+
+if (hasStorageAuthorityMarkers) {
+  console.error("ERROR: TMTUI build accidentally bundles storage-authority modules (store.ts, schema.ts, extract-schema.ts)");
+  process.exit(1);
+}
+
 console.log("check:tui-bundle: OK");

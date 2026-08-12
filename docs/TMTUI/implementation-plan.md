@@ -181,9 +181,30 @@ Rules:
 - never contain memory/transcript/prompt data;
 - do not refresh on an interval;
 - do not delete immediately after write;
-- malformed/future/stale timestamps return `null` and may be unlinked best effort.
+- malformed/future/stale timestamps return `null` (fail-closed) and are **never
+  unlinked by the reader** — the marker is tiny and the next successful commit
+  atomically overwrites it, so reader-side cleanup would only introduce a
+  TOCTOU race in which a stale read could delete a freshly written marker
+  (docs/TMTUI/TMTUI-review.md Finding 3). Any future cleanup must use
+  compare-and-delete semantics, never a blind unlink by pathname after a stale
+  read.
 
 The 2-second recent window is intentionally longer than the TUI polling interval but short enough that an old marker cannot look like current activity after restart.
+
+#### 2.5.1 Burst coalescing
+
+The marker is a single timestamp file, not an event log. Two or more successful
+commits between polls may overwrite the same marker before the TUI observes
+every intermediate timestamp, and two commits within the same millisecond are
+indistinguishable with a millisecond timestamp alone.
+
+The intended invariant is:
+
+> **A newly observed successful durable commit causes a visible pulse. Rapid
+> commit bursts may coalesce into one pulse. Green must never represent a
+> failed or uncommitted mutation.**
+
+Do not introduce a queue/event log to achieve strict one-animation-per-physical-commit accounting unless real product evidence demands it.
 
 #### 2.6 Replace activity UI state with a finite pulse state
 
@@ -290,7 +311,9 @@ Commit-pulse module tests:
 - rejects stale timestamp;
 - rejects future timestamp;
 - rejects malformed JSON;
-- cleans malformed/stale marker best effort;
+- invalid markers return `null` without requiring destructive cleanup;
+- reader is non-destructive: stale/future/malformed markers are left in place;
+- a fresh atomically replaced marker is not lost after a stale read (TOCTOU regression);
 - I/O failure does not throw from `recordMemoryCommit()`;
 - path is derived from the global per-project namespace;
 - marker contains no supplied memory payload because the API accepts no payload.

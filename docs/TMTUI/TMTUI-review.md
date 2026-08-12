@@ -1,10 +1,10 @@
 # TMTUI Pre-PR-8 Review
 
 **Branch reviewed:** `feat/tmtui`  
-**Reviewed head:** `2e1192aef749cddb38fb13ef93bc1cb1a362d39c`  
+**Reviewed head:** `a92751f9d16220b99d4703cfafc6943b43772762`
 **Base:** `6f1412fef2479b7a10f42d4e49f1fdc390a3cfc4`  
 **Review purpose:** pre-PR-8 quality gate for TMTUI-1 / TMTUI-2 before the branch is parked awaiting TMTUI-3.  
-**Gate result:** **APPROVE WITH FIXES — do not call TMTUI-1/2 fully complete until the required remediation below is applied and revalidated.**
+**Gate result:** **Remediation applied; pending clean-run validation and CI result.**
 
 ---
 
@@ -509,17 +509,17 @@ Own:
 
 TMTUI-1/2 may be considered **parked and ready for PR 8 to finish** when all of the following are true:
 
-- [ ] GitHub CI explicitly installs Bun.
-- [ ] Clean PR CI passes.
-- [ ] TUI imports project resolution directly from `memory/paths`.
-- [ ] Rebuilt TUI bundle no longer unnecessarily drags in durable storage/schema implementation.
-- [ ] Reader-side destructive stale-marker cleanup is removed or made provably race-safe.
-- [ ] Async poll completion cannot create timers/update state after component disposal.
-- [ ] Commit-pulse tests are updated and pass.
-- [ ] Full repository test/typecheck/build/smoke gate passes.
-- [ ] Generated `dist/tui.js` and `dist/tui.d.ts` match source/build output.
-- [ ] TMTUI documentation reflects the actual build sequence and burst-coalescing semantics.
-- [ ] No TMTUI-3 persistence hook has been added to obsolete pre-PR-8 commit semantics.
+- [x] GitHub CI explicitly installs Bun.
+- [ ] Clean PR CI passes (pending after this remediation push).
+- [x] TUI imports project resolution directly from `memory/paths`.
+- [x] Rebuilt TUI bundle no longer unnecessarily drags in durable storage/schema implementation.
+- [x] Reader-side destructive stale-marker cleanup is removed or made provably race-safe.
+- [x] Async poll completion cannot create timers/update state after component disposal.
+- [x] Commit-pulse tests are updated and pass.
+- [x] Full repository test/typecheck/build/smoke gate passes locally.
+- [x] Generated `dist/tui.js` and `dist/tui.d.ts` match source/build output.
+- [x] TMTUI documentation reflects the actual build sequence and burst-coalescing semantics.
+- [x] No TMTUI-3 persistence hook has been added to obsolete pre-PR-8 commit semantics.
 
 Once that checklist is green, freeze the branch except for rebase maintenance until CRIP PR 8 lands.
 

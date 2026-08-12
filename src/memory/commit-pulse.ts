@@ -10,8 +10,15 @@
  * The marker is deliberately not instrumented through the generic
  * `atomicWrite()` helper's call sites; it is written only from the canonical
  * successful STATE commit boundary (TMTUI-3) and read by the TUI.
+ *
+ * The reader is strictly non-destructive. Stale, future, and malformed
+ * markers return `null` but are never unlinked: the marker is tiny and the
+ * next successful commit atomically overwrites it, so reader-side cleanup
+ * would only introduce a TOCTOU race in which a stale read could delete a
+ * freshly written marker between the writer's atomic replace and the reader's
+ * unlink. Any future cleanup must use compare-and-delete semantics, never a
+ * blind unlink by pathname after a stale read.
  */
-import { unlink } from "node:fs/promises"
 import { join } from "node:path"
 import { atomicWrite, safeRead } from "../util/fs"
 import { globalProjectStorageDir } from "./paths"
@@ -57,8 +64,13 @@ export async function recordMemoryCommit(project: string): Promise<void> {
  *
  * Returns the `committed_at` timestamp when the marker exists, parses as
  * `{"committed_at": number}`, and is within `MEMORY_COMMIT_RECENT_MS` of
- * `now`. Stale, future, and malformed markers return `null` and are unlinked
- * best effort.
+ * `now`. Stale, future, and malformed markers return `null`.
+ *
+ * The reader never deletes the marker. A stale/future/malformed marker is
+ * left in place so a concurrent writer's atomic replace of a fresh marker can
+ * never be deleted by a stale read (TOCTOU). The marker is tiny and the next
+ * successful commit atomically overwrites it, so reader cleanup provides no
+ * value worth the concurrency race it introduces.
  */
 export async function readRecentMemoryCommit(
   project: string,
@@ -77,7 +89,6 @@ export async function readRecentMemoryCommit(
   try {
     parsed = JSON.parse(raw)
   } catch {
-    await unlink(path).catch(() => {})
     return null
   }
 
@@ -89,7 +100,6 @@ export async function readRecentMemoryCommit(
     now - committedAt <= MEMORY_COMMIT_RECENT_MS
 
   if (!fresh) {
-    await unlink(path).catch(() => {})
     return null
   }
   return committedAt

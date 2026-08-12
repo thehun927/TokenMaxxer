@@ -2,7 +2,7 @@
 
 import type { TuiPluginModule as TuiPluginModuleType } from "@opencode-ai/plugin/tui"
 import { createSignal, onCleanup } from "solid-js"
-import { resolveProjectPath } from "./memory/store"
+import { resolveProjectPath } from "./memory/paths"
 import { readRecentMemoryCommit } from "./memory/commit-pulse"
 
 // TMTUI-2 (docs/TMTUI/implementation-plan.md §2.6–2.8): the composer status
@@ -53,16 +53,21 @@ const tui: TuiPluginModuleType["tui"] = async (api) => {
         let lastSeenCommitAt = 0
         // Guards against overlapping reads if one poll outlives the interval.
         let pollInFlight = false
+        // Guards against async operations completing after component cleanup.
+        let disposed = false
         let pulseTimer: ReturnType<typeof setTimeout> | undefined
         let pollTimer: ReturnType<typeof setInterval> | undefined
         let unsubscribe: (() => void) | undefined
 
         const startPulse = () => {
+          if (disposed) return
           if (pulseTimer) clearTimeout(pulseTimer)
           setPulseStage("bright")
           pulseTimer = setTimeout(() => {
+            if (disposed) return
             setPulseStage("fade")
             pulseTimer = setTimeout(() => {
+              if (disposed) return
               setPulseStage("idle")
               pulseTimer = undefined
             }, FADE_MS)
@@ -70,10 +75,11 @@ const tui: TuiPluginModuleType["tui"] = async (api) => {
         }
 
         const poll = () => {
-          if (!project || pollInFlight) return
+          if (!project || disposed || pollInFlight) return
           pollInFlight = true
           void readRecentMemoryCommit(project)
             .then((committedAt) => {
+              if (disposed) return
               if (committedAt !== null && committedAt > lastSeenCommitAt) {
                 lastSeenCommitAt = committedAt
                 startPulse()
@@ -102,6 +108,7 @@ const tui: TuiPluginModuleType["tui"] = async (api) => {
         pollTimer = setInterval(poll, POLL_MS)
 
         onCleanup(() => {
+          disposed = true
           if (pollTimer) clearInterval(pollTimer)
           if (pulseTimer) clearTimeout(pulseTimer)
           unsubscribe?.()
