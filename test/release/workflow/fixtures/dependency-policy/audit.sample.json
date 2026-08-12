@@ -1,0 +1,42 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "esbuild": {
+      "name": "esbuild",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": ["esbuild"],
+      "effects": [],
+      "range": "<0.25.0",
+      "nodes": [],
+      "fixAvailable": {
+        "name": "esbuild",
+        "version": "0.25.0",
+        "isSemVerMajor": false
+      }
+    },
+    "undici": {
+      "name": "undici",
+      "severity": "low",
+      "isDirect": false,
+      "via": ["undici"],
+      "effects": [],
+      "range": "<7.9.0",
+      "nodes": [],
+      "fixAvailable": false
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 1,
+      "moderate": 1,
+      "high": 0,
+      "critical": 0
+    },
+    "dependencies": 184,
+    "devDependencies": 163,
+    "optionalDependencies": 0,
+    "totalDependencies": 347
+  }
+}

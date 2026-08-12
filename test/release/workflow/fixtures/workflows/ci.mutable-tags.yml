@@ -1,0 +1,37 @@
+# Fixture: CI workflow with mutable tag refs (the pre-PR-10 baseline shape).
+# Known-bad input for the workflow contract parser (Wave 1, Agent 1C).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Clean install
+        run: npm ci
+
+      - name: Run full test suite
+        run: npm test
