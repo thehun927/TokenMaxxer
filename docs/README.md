@@ -8,6 +8,7 @@ This directory contains the long-lived product documentation plus explicitly sco
 - [`PLAN.md`](./PLAN.md) — project planning/reference document.
 - [`v1.1-plan.md`](./v1.1-plan.md) — version-specific planning document.
 - [`CRIP/`](./CRIP/) — **Concrete Reliability Implementation Plan**, including its assessment, master implementation plan, and all PR-specific investigation/review artifacts.
+- [`TMTUI/`](./TMTUI/) — **TokenMaxxer TUI program**, covering the OpenCode TUI build/runtime fix, truthful STATE commit pulse, composer-status UX, tests, and CRIP concurrency rules.
 
 ## Earlier reliability planning
 
@@ -19,3 +20,5 @@ These predate the current CRIP execution sequence and are retained for historica
 ## Documentation rule
 
 All new documents produced as part of the Concrete Reliability Implementation Plan belong under `docs/CRIP/`. PR-specific plans, blocker logs, oracle investigations, findings, and re-reviews belong under `docs/CRIP/PR-N/`; do not add new CRIP artifacts directly to `docs/`.
+
+Independent implementation programs should receive their own clearly named directory under `docs/` rather than being mixed into CRIP. TMTUI artifacts belong under `docs/TMTUI/`.
