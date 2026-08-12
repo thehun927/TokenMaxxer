@@ -77,3 +77,37 @@ Wave 1 has not started.
   production owners land in Waves 2–7; dependency audit artifacts,
   `release-preflight.mjs`, release workflow, and production installer behavior
   are not yet implemented. No real `v*` tag or GitHub Release was created.
+
+## Wave 2 — Dependency remediation and audit evidence — 2026-08-12
+
+- Upgraded the development test toolchain from Vitest `2.1.9`/Vite `5.4.21`
+  to Vitest `4.1.10`/Vite `8.2.1`, preserving the OpenCode peer range
+  `>=1.18.15 <2.0.0` and development pin `1.18.15`.
+- Added exact builder hints: Node `22.23.1` in `.node-version`, Bun `1.3.14`
+  in `.bun-version`, `npm@10.9.8` as `packageManager`, and package engine
+  `>=22.23.1`.
+- Fresh final `npm audit --json` was independently regenerated and compared
+  byte-structurally by metadata to the committed snapshot:
+  5 low, 0 moderate, 0 high, 0 critical, 5 total. npm's audit command exits
+  `1` because low findings remain; this is expected and is not the release
+  high/critical gate.
+- The five remaining low findings are real and explicitly triaged in the
+  machine-parseable 11-column table in `dependency-audit.md`; no unresolved
+  high or critical finding remains. The report records build/runtime scope,
+  reachability, non-breaking action, and residual risk without claiming zero
+  risk or silently waiving advisories.
+- `npx vitest run test/release/workflow/dependency-policy.test.ts`: 10 passed.
+- `npm audit --audit-level=high`: exit 0.
+- `npm audit --omit=dev --audit-level=low`: exit 0.
+- `npm install --package-lock-only --ignore-scripts --dry-run`: exit 0.
+- `npx tsc --noEmit`: passed.
+- `npm run verify:host-contract`: passed; peer range, dev pin, and installed
+  host dependency remain aligned.
+- Full `npm test` after the dependency upgrade: 1258 passed, 25 expected
+  pre-PR-10 failures in Waves 3–7 (dist tracking/inventory, installer,
+  workflow/release, preflight, and stale README contracts). No dependency
+  regression was observed.
+- Wave-2 deviation: low advisories remain because the release gate requires
+  zero high/critical, while the current audit snapshot still reports five
+  low findings. They are documented and triaged; this is not a release-gate
+  blocker under the plan. No real `v*` tag or GitHub Release was created.
