@@ -175,5 +175,17 @@ The build-regenerated tracked `dist/index.js` was restored and is excluded.
 
 ## CI evidence
 
-Append exact GitHub run ID, URL, head SHA, job conclusion, and pass/skip counts
-after pushing this handoff.
+- Workflow: `CI`
+- Run: `31619120327`
+- URL: https://github.com/thehun927/TokenMaxxer/actions/runs/31619120327
+- Head SHA: `476b26f0370dffc00641d5cf28c6ec3209d66590` (the evidence-only
+  handoff commit; its parent implementation SHA is
+  `29636b7f53abdac10fabeebbc574e5297268c426`).
+- Job: `verify`, job ID `94189200265`
+- Job URL: https://github.com/thehun927/TokenMaxxer/actions/runs/31619120327/job/94189200265
+- Conclusion: success.
+- Workflow steps: 14 substantive verification steps passed, including clean
+  install, full tests, typecheck, host contract, build, TUI bundle, bundle
+  self-containment, CLI verification/smoke, and shell syntax.
+- CI test counts from the job log: 64 test files passed and 1 skipped; 1,150
+  tests passed and 1 skipped; 0 failed.
