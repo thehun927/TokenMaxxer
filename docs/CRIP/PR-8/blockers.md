@@ -133,3 +133,12 @@ pull PR-9 diagnostics/status or PR-10 release/dependency work into this PR.
 - Full local rerun: `npm test` → 56 files, 999 tests passed, 0 failed.
 - TypeScript check: `npx tsc --noEmit` → passed (exit 0).
 - The final Oracle report's red CI run is addressed locally; a new pushed release-chain run remains required before independent Oracle re-review.
+
+## 2026-08-12 — Final residual release verification
+
+- Residual remediation commit: `15d3bb55b180c1db4981abb517f6bd159c68e049`.
+- R1 focused rerun: `npx vitest run test/memory/oracle-r1-storage-policy.test.ts test/memory/oracle-b3-header.test.ts` → 16 passed, 0 failed.
+- Full suite: `npm test` → 56 files, 999 tests passed, 0 failed.
+- `npx tsc --noEmit`, `npm run verify:host-contract`, shell syntax, build, `npm run verify-cli-bundle`, and `npm run smoke:cli` all passed on the residual remediation SHA.
+- Generated `dist/index.js` and `dist/tui.js` were restored after build verification.
+- The exact residual tree is ready for the independent Oracle's final re-review and a pushed CI run; this implementation lane issues no clearance or Ship verdict.
