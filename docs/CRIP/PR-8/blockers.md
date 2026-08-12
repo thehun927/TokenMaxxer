@@ -122,3 +122,14 @@ pull PR-9 diagnostics/status or PR-10 release/dependency work into this PR.
 - Full local repository rerun: `npm test` → 55 files, 987 tests passed, 0 failed.
 - TypeScript check: `npx tsc --noEmit` → passed (exit 0).
 - Remediation is implementation-complete locally. Release-chain verification and `docs/CRIP/PR-8/oracle-rereview.md` remain pending independent focused Oracle re-review; no Ship verdict or PR-9 advancement is made here.
+
+## 2026-08-12 — Final Oracle R1/R2 residual remediation
+
+- R1 residual fixed in `src/memory/budget.ts`: Stage 10 now threads the candidate through exact-priority eviction of oldest active files, blockers, next steps, and current task; Stage 5/7 zero-retained candidates now return `decisions: []` rather than the original state.
+- R2 validation stabilized in `test/memory/oracle-b3-header.test.ts` using actual serialized candidate-byte measurement and deterministic full-pipeline probing; the strict fitted-STATE/HEADER equality assertion remains unchanged.
+- Added `test/memory/oracle-r1-storage-policy.test.ts` with 12 focused storage-policy regressions. Removed the stray non-Vitest quick-verify script.
+- Focused residual rerun: `npx vitest run test/memory/oracle-r1-storage-policy.test.ts test/memory/oracle-b3-header.test.ts` → 16 passed, 0 failed.
+- Supporting rerun: `npx vitest run test/memory/pr8-budget-primitives.test.ts test/memory/pr8-storage-budget.test.ts test/memory/pr8-wave7-integration.test.ts` → 73 passed, 0 failed.
+- Full local rerun: `npm test` → 56 files, 999 tests passed, 0 failed.
+- TypeScript check: `npx tsc --noEmit` → passed (exit 0).
+- The final Oracle report's red CI run is addressed locally; a new pushed release-chain run remains required before independent Oracle re-review.

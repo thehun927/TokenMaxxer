@@ -330,10 +330,7 @@ function stage5InvalidDisposableDecisions(mem: MemoryFile, protection?: MemoryBu
     return false
   })
 
-  if (retained.length === 0) {
-    return mem
-  }
-
+  // Return candidate with decisions: [] when all decisions in this category are removed
   return {
     ...mem,
     decisions: retained,
@@ -394,10 +391,7 @@ function stage7OldNonFoundationalDecisions(mem: MemoryFile, options?: { now?: nu
     return false
   })
 
-  if (retained.length === 0) {
-    return mem
-  }
-
+  // Return candidate with decisions: [] when all decisions in this category are removed
   return {
     ...mem,
     decisions: retained,
@@ -518,33 +512,85 @@ function stage9NonFoundationalPressure(mem: MemoryFile, options?: { now?: number
  * - reduce/remove current task if necessary.
  *
  * This state is valuable but does not outrank trusted human authority.
+ *
+ * Performs exact incremental disposable reduction in priority order:
+ * oldest active_files, lower-priority blockers, lower-priority next_steps,
+ * then current_task removal/truncation until serialized bytes <=8192 or exhausted.
  */
 function stage10EphemeralState(mem: MemoryFile): MemoryFile {
-  // Truncate current_task
-  const truncatedCurrentTask = mem.current_task
-    ? truncateUtf8(mem.current_task, 512)
-    : mem.current_task
+  // Thread the candidate through each reduction step
+  let candidate: MemoryFile = mem
 
-  // Truncate blockers and next_steps
-  const truncatedBlockers = (mem.blockers ?? []).map((b) => truncateUtf8(b, 512))
-  const truncatedNextSteps = (mem.next_steps ?? []).map((n) => truncateUtf8(n, 512))
-
-  // Remove oldest active files (keep newest 8)
+  // 1. Remove oldest active files until we fit or run out
   const files = mem.active_files ?? []
+  // Sort oldest first (ascending by last_touched)
   const sortedFiles = [...files].sort((a, b) => {
     const aTime = a.last_touched ?? ""
     const bTime = b.last_touched ?? ""
-    return bTime.localeCompare(aTime)
+    return aTime.localeCompare(bTime)
   })
-  const retainedFiles = sortedFiles.slice(0, 8)
 
-  return {
-    ...mem,
-    current_task: truncatedCurrentTask,
-    blockers: truncatedBlockers,
-    next_steps: truncatedNextSteps,
+  // Remove from oldest (beginning) until we fit or exhausted
+  // Check bytes of candidate with reduced active_files
+  let retainedFiles = [...sortedFiles]
+  while (
+    retainedFiles.length > 0 &&
+    computeMemoryBytes({ ...candidate, active_files: retainedFiles }) > MEMORY_MAX_BYTES
+  ) {
+    retainedFiles.shift()
+  }
+
+  candidate = {
+    ...candidate,
     active_files: retainedFiles,
   }
+
+  // 2. Remove lower-priority blockers until we fit or run out
+  const blockers = candidate.blockers ?? []
+  let retainedBlockers = [...blockers]
+  while (
+    retainedBlockers.length > 0 &&
+    computeMemoryBytes({ ...candidate, blockers: retainedBlockers }) > MEMORY_MAX_BYTES
+  ) {
+    retainedBlockers.shift()
+  }
+
+  candidate = {
+    ...candidate,
+    blockers: retainedBlockers,
+  }
+
+  // 3. Remove lower-priority next_steps until we fit or run out
+  const nextSteps = candidate.next_steps ?? []
+  let retainedNextSteps = [...nextSteps]
+  while (
+    retainedNextSteps.length > 0 &&
+    computeMemoryBytes({ ...candidate, next_steps: retainedNextSteps }) > MEMORY_MAX_BYTES
+  ) {
+    retainedNextSteps.shift()
+  }
+
+  candidate = {
+    ...candidate,
+    next_steps: retainedNextSteps,
+  }
+
+  // 4. Truncate current_task until we fit or run out
+  let truncatedCurrentTask = candidate.current_task
+  while (
+    truncatedCurrentTask !== undefined &&
+    computeMemoryBytes({ ...candidate, current_task: truncatedCurrentTask }) > MEMORY_MAX_BYTES
+  ) {
+    const shortened = truncateUtf8(truncatedCurrentTask, 512)
+    truncatedCurrentTask = shortened === truncatedCurrentTask ? undefined : shortened
+  }
+
+  candidate = {
+    ...candidate,
+    current_task: truncatedCurrentTask,
+  }
+
+  return candidate
 }
 
 /**
@@ -627,53 +673,41 @@ export function fitMemoryToBudget(
   const now = options?.now ?? Date.now()
   const protection = options?.protection
 
-  // Check if already fits
-  const initialBytes = computeMemoryBytes(memory)
-  if (initialBytes <= MEMORY_MAX_BYTES) {
-    return {
-      ok: true,
-      memory: memory,
-      bytes: initialBytes,
-      maxBytes: MEMORY_MAX_BYTES,
-      pruned: false,
-    }
-  }
-
   // Work on a deep copy to avoid mutating input
   let mem: MemoryFile = JSON.parse(JSON.stringify(memory))
 
-  // Apply retention stages incrementally, rechecking after each stage
-  const stages = [
-    () => stage0NormalizeMetadata(mem, { now }),
-    (m: MemoryFile) => stage1CompletedAudits(m, protection),
-    (m: MemoryFile) => stage2ResultCache(m),
-    (m: MemoryFile) => stage3ModelHealth(m),
-    (m: MemoryFile) => stage4SourceSessionBookkeeping(m, protection),
-    (m: MemoryFile) => stage5InvalidDisposableDecisions(m, protection),
-    (m: MemoryFile) => stage6StaleObservedFiles(m),
-    (m: MemoryFile) => stage7OldNonFoundationalDecisions(m, { now }, protection),
-    (m: MemoryFile) => stage8VerboseDetail(m),
-    (m: MemoryFile) => stage9NonFoundationalPressure(m, { now }, protection),
-    (m: MemoryFile) => stage10EphemeralState(m),
-  ]
+  // Apply stages 0-4 (metadata normalization, audit history, cache, model-health, source/session bookkeeping)
+  // These stages reduce size and are always applied
+  mem = stage0NormalizeMetadata(mem, { now })
+  mem = stage1CompletedAudits(mem, protection)
+  mem = stage2ResultCache(mem)
+  mem = stage3ModelHealth(mem)
+  mem = stage4SourceSessionBookkeeping(mem, protection)
 
+  // Apply stage 5 (invalid disposable decisions) - always apply to clean up invalid decisions
+  mem = stage5InvalidDisposableDecisions(mem, protection)
+
+  // Apply stage 6 (stale observed files)
+  mem = stage6StaleObservedFiles(mem)
+
+  // Apply stage 7 (old non-foundational decisions) - always apply to clean up old decisions
+  mem = stage7OldNonFoundationalDecisions(mem, { now }, protection)
+
+  // Apply stage 8 (verbose detail truncation) - always apply to enforce creation limits
+  mem = stage8VerboseDetail(mem)
+
+  // Apply stages 9-10 (decision pressure, ephemeral state) - only if needed to fit budget
   let bytes = computeMemoryBytes(mem)
-  let pruned = false
+  let pruned = bytes < computeMemoryBytes(memory)
 
-  for (let i = 0; i < stages.length; i++) {
-    if (bytes <= MEMORY_MAX_BYTES) {
-      break
+  if (bytes > MEMORY_MAX_BYTES) {
+    mem = stage9NonFoundationalPressure(mem, { now }, protection)
+    bytes = computeMemoryBytes(mem)
+
+    if (bytes > MEMORY_MAX_BYTES) {
+      mem = stage10EphemeralState(mem)
+      bytes = computeMemoryBytes(mem)
     }
-
-    const stage = stages[i]
-    const result = stage(mem)
-    mem = result
-
-    const newBytes = computeMemoryBytes(mem)
-    if (newBytes < bytes) {
-      pruned = true
-    }
-    bytes = newBytes
   }
 
   // Check if we fit now
