@@ -167,3 +167,31 @@ Wave 1 has not started.
   GitHub Release, and immutable-release proof) remain workflow-owned and are
   intentionally deferred to Waves 6–8; no local preflight bypass is treated
   as release publication evidence.
+
+## Wave 5 — Immutable installer and truthful launcher identity — 2026-08-12
+
+- Replaced mutable-main payload URLs with one embedded exact release tag and
+  one `releases/download/${RELEASE_TAG}` base. The installer stages launcher,
+  server/TUI/CLI bundles, `RELEASE.json`, and `SHA256SUMS` before any target or
+  configuration mutation.
+- The staged manifest is validated for schema v1, exact version/tag, exact
+  lowercase 40-hex commit, peer range, and minimum verified host. SHA256SUMS
+  rejects malformed, duplicate, missing, extra, and mismatched entries and
+  verifies all five staged files before commit.
+- Target replacement is transactionally backed up and rollback-capable. The
+  receipt records schema v1, exact version, tag, and manifest commit. The
+  launcher `version` command reports a validated receipt identity or an
+  explicit unavailable state; it never fabricates a commit and no longer
+  advertises an unverified npm `@latest` channel.
+- `npx vitest run test/release/installer/installer-contract.test.ts`: 31
+  passed, 0 failed.
+- `bash -n install.sh`: passed; `bash -n bin/tokenmaxxer`: passed.
+- `bash test/cli-smoke/smoke.sh`: passed, cases 46–49.
+- `npx tsc --noEmit`: passed.
+- Manual launcher evidence with an empty HOME: `tokenmaxxer version` exits 0
+  and reports `unavailable (no release receipt)`; no commit is fabricated.
+- Wave-5 limitation: actual GitHub Release download, tamper, and rollback
+  execution against a published asset set cannot be performed locally because
+  no real tag/release may be created in this implementation workstream. The
+  fixture-driven integrity and transaction contracts are green.
+- No real `v*` tag or GitHub Release was created or published.
