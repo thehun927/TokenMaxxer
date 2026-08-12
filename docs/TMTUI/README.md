@@ -6,7 +6,7 @@ Its first target is the `memory` status element rendered in OpenCode's `session_
 
 ## Status
 
-**Planning complete — implementation ready.**
+**Parallel-safe implementation complete — TMTUI-3 blocked on CRIP PR 8.**
 
 TMTUI is intentionally separate from the Concrete Reliability Implementation Plan (CRIP). CRIP owns TokenMaxxer's durable-memory correctness and reliability program; TMTUI owns the TUI build/runtime boundary and presentation of memory persistence state.
 
@@ -14,6 +14,7 @@ See:
 
 - [`implementation-plan.md`](./implementation-plan.md) — concrete implementation sequence and acceptance criteria.
 - [`concurrency.md`](./concurrency.md) — rules for running TMTUI while CRIP is active.
+- [`implementation-status.md`](./implementation-status.md) — live implementation evidence, deviations, and remaining dependency.
 
 ## Confirmed current problems
 
