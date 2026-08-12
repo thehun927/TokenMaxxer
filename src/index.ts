@@ -22,10 +22,19 @@ import {
 import { resolveProjectPath } from "./memory/store"
 import { registerTools } from "./tools/recall"
 import { registerEfficiencyTools } from "./tools/efficiency"
-import { registerStatusTools, setLastCompaction } from "./tools/status"
+import { registerStatusTools } from "./tools/status"
+import { writeDiagnosticArtifact } from "./diagnostics/artifacts"
+import {
+  COMPACTION_PROMPT_ARTIFACT_MAX_BYTES,
+  COMPACTION_RESULT_ARTIFACT_MAX_BYTES,
+  buildCompactionPromptArtifact,
+  buildCompactionResultDiagnostic,
+} from "./diagnostics/compaction"
+import type { CompactionResultSummary } from "./diagnostics/compaction"
 import { log } from "./util/log"
 import { atomicWrite, safeRead } from "./util/fs"
 import { join } from "node:path"
+import { createHash } from "node:crypto"
 import type { CompactionInput, CompactionOutput } from "./types"
 
 export const TokenmaxxerPlugin: Plugin = async (ctx) => {
@@ -61,6 +70,73 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
   function boundReason(reason: string, maxLen: number): string {
     if (reason.length <= maxLen) return reason
     return reason.slice(0, maxLen) + `... [truncated ${reason.length - maxLen} chars]`
+  }
+
+  /**
+   * Best-effort persistence of the successful `session.compacted` observation.
+   *
+   * The host emits `session.compacted` only after successful compaction
+   * processing, so it is the authority for completion. We re-read the session
+   * transcript through the verified PR-7 summary path to attach bounded
+   * metadata (UTF-8 byte count + SHA-256 only; the summary body and
+   * conversation are never persisted). A missing/unavailable summary still
+   * records successful completion, and a diagnostic write failure never
+   * throws from the event handler, never touches STATE, never advances a
+   * revision, never alters IdleWriteOutcome, and never pulses TUI.
+   */
+  async function recordCompactionResultBestEffort(opts: {
+    client: unknown
+    project: string
+    sessionID: string
+  }): Promise<void> {
+    try {
+      const historyResult = await readPreviousCompactionSummary({
+        client: opts.client,
+        sessionID: opts.sessionID,
+      })
+
+      let summary: CompactionResultSummary
+      if (historyResult.status === "found") {
+        summary = {
+          status: "found",
+          bytes: Buffer.byteLength(historyResult.summary, "utf8"),
+          sha256: createHash("sha256").update(historyResult.summary, "utf8").digest("hex"),
+        }
+      } else if (historyResult.status === "none") {
+        summary = { status: "missing" }
+      } else {
+        summary = { status: "unavailable", reason: historyResult.reason }
+      }
+
+      const artifact = buildCompactionResultDiagnostic({
+        completedAt: new Date().toISOString(),
+        sessionID: opts.sessionID,
+        summary,
+      })
+
+      const writeResult = await writeDiagnosticArtifact(
+        "last_compaction_result.json",
+        opts.project,
+        artifact.json,
+        COMPACTION_RESULT_ARTIFACT_MAX_BYTES,
+      )
+      if (!writeResult.ok) {
+        // Bounded warning only — never log the summary body or session text.
+        await log(opts.client, "warn", "compaction result artifact not persisted", {
+          artifact: "last_compaction_result.json",
+          project: opts.project,
+          reason: writeResult.reason,
+          sizeBytes: writeResult.sizeBytes,
+          maxBytes: writeResult.maxBytes,
+        })
+      }
+    } catch (e) {
+      await log(opts.client, "warn", "compaction result diagnostic failed", {
+        artifact: "last_compaction_result.json",
+        project: opts.project,
+        error: boundReason(e instanceof Error ? e.message : String(e), 500),
+      })
+    }
   }
 
   // --- Hooks map ---
@@ -140,7 +216,10 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
           ? boundReason(fallbackReason, 500)
           : undefined
 
-        setLastCompaction(new Date().toISOString())
+        // PR-9 Wave 3: the process-global last-compaction timestamp/setter
+        // (`lastCompactionTimestamp` / `setLastCompaction`) is not used here;
+        // the successful-completion observation is the persisted per-project
+        // `last_compaction_result.json`, recorded only on `session.compacted`.
 
         await log(client, "info", "compaction hook fired", {
           session: input.sessionID,
@@ -151,25 +230,41 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
         })
 
         // last_compaction_prompt.log is intentionally a last-only snapshot, not a
-        // history. Atomic replacement ensures successive hooks leave only the
-        // newest compaction payload visible to diagnostics.
+        // history. The prompt artifact records the exact TokenMaxxer-supplied
+        // payload for this hook invocation and is bounded to 96 KiB UTF-8 bytes
+        // with UTF-8-safe truncation of the stored diagnostic copy only. A
+        // persistence failure is a bounded warning and never changes the
+        // compaction hook output.
         try {
-          const logPath = join(project, ".opencode", "memory", "last_compaction_prompt.log")
-          const snapshotLines = [
-            `timestamp=${new Date().toISOString()}`,
-            `session=${input.sessionID}`,
-            `requested_mode=${requestedMode}`,
-            `effective_mode=${effectiveMode}`,
-            `kind=${effectiveMode === "replace" ? "replacement-prompt" : "context-augmentation"}`,
-            ...(boundedFallbackReason ? [`fallback_reason=${boundedFallbackReason}`] : []),
-            tokenMaxxerPayload,
-            "---",
-            "",
-          ]
-          const snapshot = snapshotLines.join("\n")
-          await atomicWrite(logPath, snapshot)
-        } catch {
-          // Non-fatal
+          const artifact = buildCompactionPromptArtifact({
+            sessionID: input.sessionID,
+            requestedMode,
+            effectiveMode,
+            fallbackReason: boundedFallbackReason,
+            payload: tokenMaxxerPayload,
+          })
+          const writeResult = await writeDiagnosticArtifact(
+            "last_compaction_prompt.log",
+            project,
+            artifact.content,
+            COMPACTION_PROMPT_ARTIFACT_MAX_BYTES,
+          )
+          if (!writeResult.ok) {
+            // Bounded warning only — never log the prompt body.
+            await log(client, "warn", "compaction prompt artifact not persisted", {
+              artifact: "last_compaction_prompt.log",
+              project,
+              reason: writeResult.reason,
+              sizeBytes: writeResult.sizeBytes,
+              maxBytes: writeResult.maxBytes,
+            })
+          }
+        } catch (e) {
+          await log(client, "warn", "compaction prompt diagnostic failed", {
+            artifact: "last_compaction_prompt.log",
+            project,
+            error: boundReason(e instanceof Error ? e.message : String(e), 500),
+          })
         }
       } catch (e) {
         await log(client, "error", "compaction hook failed", { error: String(e) })
@@ -179,6 +274,19 @@ export const TokenmaxxerPlugin: Plugin = async (ctx) => {
     // Layer 2: event handlers
     event: async ({ event }: { event: { type: string; properties?: Record<string, unknown> } }) => {
       try {
+        if (event.type === "session.compacted") {
+          const sessionId = event.properties?.sessionID as string | undefined
+          if (!sessionId) {
+            await log(client, "warn", "session.compacted missing sessionID")
+            return
+          }
+          // The host event proves successful completion. The result artifact
+          // is written only here, never from the pre-compaction hook. This
+          // path must not call writeMemoryOnIdle, change STATE, advance a
+          // revision, or pulse TUI.
+          await recordCompactionResultBestEffort({ client, project, sessionID: sessionId })
+          return
+        }
         if (event.type === "session.idle") {
           const sessionId = event.properties?.sessionID as string | undefined
           if (!sessionId) {

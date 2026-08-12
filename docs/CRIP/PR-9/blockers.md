@@ -53,3 +53,20 @@ deviations, and unresolved blockers.
 - Luna rerun: `npx tsc --noEmit` — passed with no output.
 - `git diff --check` passed. `src/util/fs.ts` was restored to baseline and is
   outside Wave 2 ownership.
+
+## 2026-08-12 — Wave 3 integrated validation
+
+- Added pure bounded compaction diagnostic builders/validator and wired
+  `src/index.ts` to separate prompt observation from successful
+  `session.compacted` completion.
+- Removed all index imports/calls of `lastCompactionTimestamp` and
+  `setLastCompaction`; their remaining definitions are isolated to
+  `src/tools/status.ts` and are Wave 4 scope.
+- Focused Luna rerun:
+  `npx vitest run test/diagnostics/compaction.test.ts test/index-pr9-compaction.test.ts`
+  — 2 files, 39/39 passed.
+- Regression/compaction Luna rerun:
+  `npx vitest run test/index.test.ts test/diagnostics/ test/compaction/`
+  — 15 files, 289/289 passed.
+- `npx tsc --noEmit`: passed with no output.
+- `git diff --check`: passed. No TUI or commit-pulse files changed.
