@@ -1,10 +1,10 @@
 # TMTUI Final Review
 
 **Branch reviewed:** `feat/tmtui`  
-**Reviewed head:** `a92751f9d16220b99d4703cfafc6943b43772762`
-**Base:** `6f1412fef2479b7a10f42d4e49f1fdc390a3cfc4`  
+**Reviewed head:** `1a4e801b55bfec1b1dfc57158b06811c432101c3`
+**Base:** `ae35be8305fcbb0d39572062af4d3ef7bb971360`
 **Review purpose:** final TMTUI-1/TMTUI-2/TMTUI-3 release gate after CRIP PR 8.
-**Gate result:** **Pending final integrated validation and independent release review.**
+**Gate result:** **Independent review approved; final GitHub Actions result pending.**
 
 ## Post-PR-8 integration addendum
 
@@ -13,7 +13,7 @@
 - `writer.ts` no longer starts the legacy activity lifecycle; `activity-state.ts` and its tests are removed.
 - Focused post-PR-8 suites currently pass 66 tests.
 - The 66 focused tests are enumerated in `implementation-status.md`: 10 + 19 + 7 + 17 + 13.
-- The final gate must establish a clean full-suite count, final CI run, and independent release review.
+- Final local validation is green; final GitHub Actions validation is the remaining release gate.
 
 ---
 

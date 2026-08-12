@@ -47,7 +47,7 @@
 
 ## Verification evidence
 
-- `npm test`: 1,050 tests passed across 59 files.
+- `npm test`: 1,049 tests passed, 1 skipped, across 59 files.
 - `npx tsc --noEmit`: passed.
 - `npm run verify:host-contract`: passed.
 - `npm run build`: passed; `dist/index.js`, `dist/tui.js`, `dist/tui.d.ts`, and `dist/cli.js` were produced.
@@ -57,13 +57,13 @@
 - `bash -n install.sh`, `bash -n bin/tokenmaxxer`, and `git diff --check`: passed.
 - Focused pre-PR8 commit-pulse suite: 17 tests passed (invalid markers return `null` without deletion; reader is non-destructive; fresh marker survives a stale read).
 - Focused post-PR8 suites: 66 tests passed — `store-commit-pulse.test.ts` (10), `tmtui3-pulse-store.test.ts` (19), `tmtui3-pulse-writer.test.ts` (7), `commit-pulse.test.ts` (17), and `transaction.test.ts` (13). Coverage includes local/global success, telemetry isolation, non-committed outcomes, exact-once behavior, writer integration, transaction semantics, and legacy activity absence.
-- CI now provisions Bun `1.3.14` explicitly and runs `check:tui-bundle` as a named step. Clean GitHub Actions run `31557715584` passed on remediation commit `7b98da9`.
+- CI provisions Bun `1.3.14` explicitly and runs `check:tui-bundle` as a named step. The final-head CI run is recorded below after push.
 - No component-level TUI test was added: the repository has no OpenTUI mount/render harness or existing `test/tui` fixture, and the bounded test lane could not exercise the slot without production refactoring. The source-level contract remains verified by typecheck, the reactive bundle gate, and manual code review; component behavior remains a manual OpenCode acceptance item.
 
 ## Final validation and acceptance
 
 - TMTUI-1: complete.
 - TMTUI-2: complete.
-- TMTUI-3: complete in the working tree; final clean-branch and GitHub Actions evidence will be recorded after the integrated commit.
+- TMTUI-3: complete at final commit `1a4e801` plus the generated TUI artifact follow-up.
 - Manual OpenCode mount/render acceptance was unavailable in this environment; source-level lifecycle review, reactive bundle checks, and deterministic protocol/transaction tests are the available evidence.
 - `dist/index.js` was regenerated because the post-PR8 server bundle includes the canonical store hook. Its large format-level diff reflects the repository's floating `tsup` toolchain output rather than broad TMTUI source scope; dependency/toolchain pinning remains PR 10 work.

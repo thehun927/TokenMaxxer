@@ -485,12 +485,7 @@ function memoryCommitPulsePath(project) {
 }
 async function readRecentMemoryCommit(project, now = Date.now()) {
   const path = memoryCommitPulsePath(project);
-  let raw;
-  try {
-    raw = await safeRead(path);
-  } catch {
-    return null;
-  }
+  const raw = await safeRead(path);
   if (raw === null)
     return null;
   let parsed;
