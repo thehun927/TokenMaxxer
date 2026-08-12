@@ -32,6 +32,26 @@ deviations, and unresolved blockers.
 - `npx tsc --noEmit`: passed with no output.
 - `git diff --check`: passed.
 
+## 2026-08-12 — Wave 8 local release evidence
+
+- Exact implementation SHA audited locally: `29636b7f53abdac10fabeebbc574e5297268c426`.
+- `npm ci`: passed; local Node emitted the `ini@7.0.0` engine warning and
+  npm reported 9 audit findings. No dependency or PR-10 remediation was made.
+- `npm test`: 65 files, 1,151/1,151 passed.
+- `npx tsc --noEmit`: passed.
+- `npm run verify:host-contract`: passed; installed host 1.18.15 and declared
+  peer range checks passed.
+- `npm run build`: passed; server, TUI, declarations, and CLI bundles built.
+- `npm run check:tui-bundle`: passed.
+- Self-contained bundle check for `dist/index.js`, `dist/tui.js`, and
+  `dist/cli.js`: passed.
+- `npm run verify-cli-bundle`: passed.
+- `npm run smoke:cli`: passed cases 46–49.
+- `bash -n install.sh` and `bash -n bin/tokenmaxxer`: passed.
+- `git diff --check`: passed after restoring the build-regenerated tracked
+  `dist/index.js`; no generated dist change is part of PR-9.
+- GitHub CI run/job evidence is appended to the handoff after push.
+
 ## 2026-08-12 — Wave 5 integrated validation
 
 - Hardened best-effort terminal/model-health persistence in
