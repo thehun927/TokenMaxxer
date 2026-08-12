@@ -20,6 +20,7 @@ import {
 } from "./project-lock"
 import type { ProjectLockOptions } from "./project-lock"
 import { fitMemoryToBudget, type MemoryBudgetFailureReason, type MemoryBudgetProtection } from "./budget"
+import { recordMemoryCommit } from "./commit-pulse"
 
 export type MemorySource = "project" | "global"
 
@@ -333,26 +334,28 @@ async function commitMemoryExact(
     return { ok: false, reason: "size-cap-exceeded" }
   }
 
-  const path = projectMemoryPath(project)
+  const localPath = projectMemoryPath(project)
+  const globalPath = globalMemoryPath(project)
+  let writtenPath = localPath
   try {
-    await atomicWrite(path, json)
+    await atomicWrite(localPath, json)
   } catch {
     // Project path read-only — try global fallback
     try {
-      await atomicWrite(globalMemoryPath(project), json)
+      await atomicWrite(globalPath, json)
+      writtenPath = globalPath
     } catch {
       // Both paths failed — give up silently (don't throw from event handler)
       cache.delete(project)
       return { ok: false, reason: "io-failed" }
     }
-    // Even on global fallback success, invalidate the cache
-    cache.delete(project)
-    return { ok: true, path: globalMemoryPath(project) }
   }
-
   // Invalidate cache after successful write
   cache.delete(project)
-  return { ok: true, path }
+  // TMTUI-3: Record commit telemetry after successful durable write
+  void recordMemoryCommit(project)
+  // Return the actual path that was successfully written
+  return { ok: true, path: writtenPath }
 }
 
 /**

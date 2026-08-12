@@ -3,11 +3,11 @@
 ## Baseline
 
 - TMTUI branch: `feat/tmtui`
-- TMTUI base: `6f1412fef2479b7a10f42d4e49f1fdc390a3cfc4` (`origin/main` at branch creation)
-- CRIP local `main` advanced to PR 8 Wave 4 at `34d777c`; its `store.ts`/`writer.ts` work remains active and is not present on this branch.
-- No TMTUI production hook has been added to `store.ts` or `writer.ts`.
+- Post-PR-8 rebase base: `ae35be8305fcbb0d39572062af4d3ef7bb971360` (`origin/main`)
+- Pre-rebase TMTUI head: `01ae2c06c5c11f33aafc3d8f45dd4abc2e882dd2`
+- CRIP PR 8 is complete/Ship; PR 9 remains next and was not modified.
 
-## Completed parallel-safe work
+## Completed work
 
 ### TMTUI-1 — build/runtime
 
@@ -25,6 +25,14 @@
 - `session.idle` accelerates polling only; it cannot create a pulse.
 - Burst semantics documented: a newly observed successful durable commit causes a visible pulse; rapid commit bursts may coalesce into one pulse (TMTUI-review.md §4).
 
+### TMTUI-3 — post-PR8 persistence integration
+
+- Canonical hook: `commitMemoryExact()` in `src/memory/store.ts`, after successful project-local or global-fallback STATE persistence.
+- Both paths converge on one success epilogue that invalidates cache, emits one `void recordMemoryCommit(project)`, and returns the actual written path.
+- No pulse occurs for noop, unavailable, lock timeout, budget rejection, validation failure, size-cap failure, callback failure, transaction failure, or both-destination failure.
+- `recordMemoryCommit()` remains fire-and-forget and best effort; telemetry cannot change authoritative mutation results.
+- Removed the obsolete `beginMemoryActivity()` writer lifecycle and deleted `src/memory/activity-state.ts` plus its tests.
+
 ## Design deviation record
 
 1. **Plan proposal:** use a literal `grep -q 'solid-js/dist/server.js' dist/tui.js` regression check.
@@ -39,7 +47,7 @@
 
 ## Verification evidence
 
-- `npm test`: 861 tests passed across 47 files.
+- `npm test`: 1,050 tests passed across 59 files.
 - `npx tsc --noEmit`: passed.
 - `npm run verify:host-contract`: passed.
 - `npm run build`: passed; `dist/index.js`, `dist/tui.js`, `dist/tui.d.ts`, and `dist/cli.js` were produced.
@@ -47,18 +55,15 @@
 - `npm run verify-cli-bundle`: passed.
 - `npm run smoke:cli`: passed (`46-49`).
 - `bash -n install.sh`, `bash -n bin/tokenmaxxer`, and `git diff --check`: passed.
-- Focused commit-pulse suite: 17 tests passed (invalid markers return `null` without deletion; reader is non-destructive; fresh marker survives a stale read).
+- Focused pre-PR8 commit-pulse suite: 17 tests passed (invalid markers return `null` without deletion; reader is non-destructive; fresh marker survives a stale read).
+- Focused post-PR8 suites: 66 tests passed — `store-commit-pulse.test.ts` (10), `tmtui3-pulse-store.test.ts` (19), `tmtui3-pulse-writer.test.ts` (7), `commit-pulse.test.ts` (17), and `transaction.test.ts` (13). Coverage includes local/global success, telemetry isolation, non-committed outcomes, exact-once behavior, writer integration, transaction semantics, and legacy activity absence.
 - CI now provisions Bun `1.3.14` explicitly and runs `check:tui-bundle` as a named step. Clean GitHub Actions run `31557715584` passed on remediation commit `7b98da9`.
 - No component-level TUI test was added: the repository has no OpenTUI mount/render harness or existing `test/tui` fixture, and the bounded test lane could not exercise the slot without production refactoring. The source-level contract remains verified by typecheck, the reactive bundle gate, and manual code review; component behavior remains a manual OpenCode acceptance item.
 
-## Outstanding CRIP dependency
+## Final validation and acceptance
 
-TMTUI-3 must wait until CRIP PR 8 Waves 4–5 are final and landed. After rebasing onto that post-PR-8 `main`:
-
-1. Re-inspect the final `mutateMemory()` / `commitMemoryExact()` transaction boundary.
-2. Emit exactly one best-effort pulse only after a successful committed local or global STATE write.
-3. Emit none for noop, budget rejection, validation failure, lock timeout, unavailable state, commit failure, or aborted mutation.
-4. Reconcile any existing `beginMemoryActivity()` removal from CRIP rather than mechanically applying the old cleanup plan.
-5. Rerun the complete CRIP + TMTUI validation gate.
-
-TMTUI is not merge-ready until this rebase and TMTUI-3 wiring are complete. The parallel-safe remediation and clean PR CI are validated; freeze the branch except for rebase maintenance until CRIP PR 8 lands.
+- TMTUI-1: complete.
+- TMTUI-2: complete.
+- TMTUI-3: complete in the working tree; final clean-branch and GitHub Actions evidence will be recorded after the integrated commit.
+- Manual OpenCode mount/render acceptance was unavailable in this environment; source-level lifecycle review, reactive bundle checks, and deterministic protocol/transaction tests are the available evidence.
+- `dist/index.js` was regenerated because the post-PR8 server bundle includes the canonical store hook. Its large format-level diff reflects the repository's floating `tsup` toolchain output rather than broad TMTUI source scope; dependency/toolchain pinning remains PR 10 work.

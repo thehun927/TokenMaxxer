@@ -77,12 +77,7 @@ export async function readRecentMemoryCommit(
   now = Date.now(),
 ): Promise<number | null> {
   const path = memoryCommitPulsePath(project)
-  let raw: string | null
-  try {
-    raw = await safeRead(path)
-  } catch {
-    return null
-  }
+  const raw = await safeRead(path)
   if (raw === null) return null
 
   let parsed: unknown

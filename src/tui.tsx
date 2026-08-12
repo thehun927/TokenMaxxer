@@ -118,11 +118,10 @@ const tui: TuiPluginModuleType["tui"] = async (api) => {
         // the label and the idle dot use the muted text color; the finite
         // pulse uses the theme's success color. No hard-coded green. The fade
         // stage keeps the theme's success color per the recommended JSX shape.
-        const muted = api.theme.current.textMuted
         return (
           <box flexDirection="row">
-            <text fg={muted}>memory  </text>
-            <text fg={pulseStage() === "idle" ? muted : api.theme.current.success}>
+            <text fg={api.theme.current.textMuted}>memory  </text>
+            <text fg={pulseStage() === "idle" ? api.theme.current.textMuted : api.theme.current.success}>
               {pulseStage() === "bright" ? "●" : pulseStage() === "fade" ? "•" : "·"}
             </text>
           </box>

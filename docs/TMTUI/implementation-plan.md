@@ -2,7 +2,7 @@
 
 **Program:** TokenMaxxer TUI (TMTUI)  
 **Scope:** OpenCode composer memory-status integration  
-**Status:** Implementation ready  
+**Status:** Complete after rebase onto post-CRIP-8 main
 **Program overview:** [`README.md`](./README.md)  
 **Concurrency rules:** [`concurrency.md`](./concurrency.md)
 
@@ -335,7 +335,7 @@ TUI behavior tests/smoke coverage:
 ### TMTUI-3 — Wire pulse to canonical successful persistence
 
 **Can run concurrently with CRIP PR 8 implementation:** No.  
-**Merge order:** CRIP PR 8 first, then rebase TMTUI-3 onto its final canonical commit boundary.
+**Completed:** Rebased onto post-CRIP-8 `main` at `ae35be8305fcbb0d39572062af4d3ef7bb971360`; hook verified against the final canonical commit boundary.
 
 Purpose: emit the UI event from the one place that actually knows a durable STATE write succeeded.
 
@@ -395,7 +395,7 @@ finally {
 
 and remove the import.
 
-Once no production call sites remain, remove `src/memory/activity-state.ts` and migrate/delete its tests.
+Once no production call sites remain, remove `src/memory/activity-state.ts` and migrate/delete its tests. This cleanup is complete: no production or test consumer remains.
 
 Do not preserve the old optimistic idle LED behavior.
 

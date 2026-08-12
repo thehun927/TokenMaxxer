@@ -2,9 +2,11 @@
 
 TMTUI can run while the Concrete Reliability Implementation Plan (CRIP) is active, but it should not be treated as completely independent. The overlap is small and manageable if the work is staged deliberately.
 
-## Current CRIP context at TMTUI planning time
+## CRIP context at TMTUI-3 completion
 
-The checked-in CRIP index currently shows:
+The post-PR-8 `origin/main` baseline used for final TMTUI-3 integration is `ae35be8305fcbb0d39572062af4d3ef7bb971360`. CRIP PR 8 is complete and shipped; PR 9 is next and was not changed by this work.
+
+The original planning index showed:
 
 - PR 1–7: complete;
 - PR 8: implementation plan ready;
@@ -30,7 +32,7 @@ TMTUI-2 pulse protocol + UI ──────────┴───┘
 
 TMTUI-1 and TMTUI-2 are safe to develop while CRIP PR 8 is underway.
 
-TMTUI-3 must wait for, or at minimum rebase onto, the final PR 8 storage boundary before it is merged.
+TMTUI-3 waited for and rebased onto the final PR 8 storage boundary before integration.
 
 ## File-level concurrency matrix
 
@@ -64,7 +66,7 @@ Recommended sequence:
 
 Do not resolve a rebase conflict in `store.ts` by mechanically preserving both sides. Re-derive the pulse hook from PR 8's final transaction semantics.
 
-## Why TMTUI-3 waits for PR 8
+## Why TMTUI-3 waited for PR 8
 
 TMTUI wants this invariant:
 

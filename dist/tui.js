@@ -580,19 +580,25 @@ var tui = async (api) => {
             clearTimeout(pulseTimer);
           unsubscribe?.();
         });
-        const muted = api.theme.current.textMuted;
         return (() => {
           var _el$ = _$createElement("box"), _el$2 = _$createElement("text"), _el$4 = _$createElement("text");
           _$insertNode(_el$, _el$2);
           _$insertNode(_el$, _el$4);
           _$setProp(_el$, "flexDirection", "row");
           _$insertNode(_el$2, _$createTextNode(`memory `));
-          _$setProp(_el$2, "fg", muted);
           _$insert(_el$4, (() => {
             var _c$ = _$memo(() => pulseStage() === "bright");
             return () => _c$() ? "\u25CF" : pulseStage() === "fade" ? "\u2022" : "\xB7";
           })());
-          _$effect((_$p) => _$setProp(_el$4, "fg", pulseStage() === "idle" ? muted : api.theme.current.success, _$p));
+          _$effect((_p$) => {
+            var _v$ = api.theme.current.textMuted, _v$2 = pulseStage() === "idle" ? api.theme.current.textMuted : api.theme.current.success;
+            _v$ !== _p$.e && (_p$.e = _$setProp(_el$2, "fg", _v$, _p$.e));
+            _v$2 !== _p$.t && (_p$.t = _$setProp(_el$4, "fg", _v$2, _p$.t));
+            return _p$;
+          }, {
+            e: undefined,
+            t: undefined
+          });
           return _el$;
         })();
       }
