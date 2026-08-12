@@ -1190,17 +1190,49 @@ function extractCurrentTask(messages: TranscriptMessage[]): string | null {
   return null
 }
 
+/**
+ * PR-9 Wave 6 — transient file activity counts by tool category.
+ * Only completed tool operations count; errored/pending calls do not.
+ */
+type FileActivity = {
+  reads: number
+  edits: number
+  writes: number
+  searches: number
+  shellRefs: number
+}
+
+/**
+ * Render a deterministic reason string from activity counts.
+ * Uses compact explicit category labels containing only nonzero counts.
+ */
+function renderReason(activity: FileActivity): string {
+  const parts: string[] = []
+  if (activity.reads > 0) parts.push(`reads=${activity.reads}`)
+  if (activity.edits > 0) parts.push(`edits=${activity.edits}`)
+  if (activity.writes > 0) parts.push(`writes=${activity.writes}`)
+  if (activity.searches > 0) parts.push(`searches=${activity.searches}`)
+  if (activity.shellRefs > 0) parts.push(`shell_refs=${activity.shellRefs}`)
+  return parts.join(" ")
+}
+
 function extractActiveFiles(
   messages: TranscriptMessage[],
 ): { path: string; reason: string }[] {
-  const fileCounts = new Map<string, number>()
+  // Track activity counts by tool category for each file path
+  const fileActivities = new Map<string, FileActivity>()
 
   for (const msg of messages) {
     for (const part of msg.parts) {
       if (part.type !== "tool") continue
 
       const toolName = part.tool
-      const input = ((part as { state?: { input?: Record<string, unknown> } }).state?.input || {}) as Record<string, unknown>
+      const state = (part as { state?: { status?: string; input?: Record<string, unknown> } }).state
+
+      // PR-9 §8.2: Only completed tool operations count
+      if (!state || state.status !== "completed") continue
+
+      const input = (state.input || {}) as Record<string, unknown>
 
       if (
         toolName === "read" ||
@@ -1213,24 +1245,47 @@ function extractActiveFiles(
         const paths = extractPaths(toolName, input)
         for (const p of paths) {
           const normalized = normalizePath(p)
-          if (normalized) {
-            fileCounts.set(normalized, (fileCounts.get(normalized) ?? 0) + 1)
+          if (!normalized) continue
+
+          // Get or create activity record for this path
+          const activity = fileActivities.get(normalized) || {
+            reads: 0,
+            edits: 0,
+            writes: 0,
+            searches: 0,
+            shellRefs: 0,
           }
+
+          // Increment the appropriate counter based on tool type
+          if (toolName === "read") activity.reads++
+          else if (toolName === "edit") activity.edits++
+          else if (toolName === "write") activity.writes++
+          else if (toolName === "glob" || toolName === "grep") activity.searches++
+          else if (toolName === "bash") activity.shellRefs++
+
+          fileActivities.set(normalized, activity)
         }
       }
     }
   }
 
-  // Sort by frequency desc, then select the most frequent observations. The
-  // quality rank is the existing top-5 selection bounded by the exported
+  // Sort by total observed completed activity count desc, then first-seen order for ties.
+  // The quality rank is the existing top-5 selection bounded by the exported
   // activeFilesMax creation ceiling so the emitted count can never exceed the
   // automatic creation contract (B4).
-  const sorted = [...fileCounts.entries()]
-    .sort((a, b) => b[1] - a[1])
+  const sorted = [...fileActivities.entries()]
+    .sort((a, b) => {
+      const totalA = a[1].reads + a[1].edits + a[1].writes + a[1].searches + a[1].shellRefs
+      const totalB = b[1].reads + b[1].edits + b[1].writes + b[1].searches + b[1].shellRefs
+      // Sort by total count desc
+      if (totalB !== totalA) return totalB - totalA
+      // Stable first-seen order (original order in map is insertion order)
+      return 0
+    })
     .slice(0, Math.min(TOP_ACTIVE_FILES, MEMORY_CREATION_LIMITS.activeFilesMax))
 
-  return sorted.map(([path, count]) => {
-    const reason = count > 1 ? `edited ${count} times` : "read once"
+  return sorted.map(([path, activity]) => {
+    const reason = renderReason(activity)
     return {
       path,
       // Cap the automatic reason at the creation bound (B4).
@@ -1911,11 +1966,13 @@ export function mergeHeuristicMemory(
   const oldFileMap = new Map(existing.active_files.map((f) => [f.path, f]))
   const incomingFiles = extracted.active_files.map((f) => {
     const old = oldFileMap.get(f.path)
-    const oldReason = old?.reason
-    const isGeneric = f.reason === "read once" || f.reason.startsWith("edited ")
+    // PR-9 §8.5: Current-session observed activity replaces stale old reasons.
+    // The incoming reason is derived from actual tool types observed in this
+    // session transcript, so it must always be used. Prior reasons are not
+    // evidence of what happened in this source transcript.
     return {
       path: f.path,
-      reason: oldReason && isGeneric ? oldReason : f.reason,
+      reason: f.reason,
       last_touched: meta.timestamp,
       provenance: makeProvenance(
         meta,

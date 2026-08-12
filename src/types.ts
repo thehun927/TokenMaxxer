@@ -11,6 +11,19 @@ export interface CompactionOutput {
   prompt?: string
 }
 
+/**
+ * PR-9 Wave 6 — transient file activity counts by tool category.
+ * Only completed tool operations count; errored/pending calls do not.
+ * This type is transient and must not enter durable STATE.
+ */
+export interface FileActivity {
+  reads: number
+  edits: number
+  writes: number
+  searches: number
+  shellRefs: number
+}
+
 /** Full facts extracted from a session transcript by the heuristic extractor. */
 export interface HeuristicFacts {
   current_task: string | null

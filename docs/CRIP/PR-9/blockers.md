@@ -44,6 +44,18 @@ deviations, and unresolved blockers.
   — 6 files, 133/133 passed.
 - `npx tsc --noEmit`: passed with no output.
 - `git diff --check`: passed. No TUI or commit-pulse source changes.
+
+## 2026-08-12 — Wave 6 integrated validation
+
+- Added transient completed-tool activity categorization in `writer.ts` and
+  current-session reason replacement; no durable schema/version bump and no
+  transient activity object is persisted.
+- Luna rerun:
+  `npx vitest run test/memory/pr9-file-activity.test.ts test/memory/writer.test.ts test/memory/merge.test.ts test/memory/writer-header.test.ts`
+  — 4 files, 111/111 passed.
+- `npx tsc --noEmit`: passed with no output.
+- `git diff --check`: passed after removing one trailing-whitespace defect.
+- TMTUI commit-pulse source remains unchanged.
 - Test-only repair deviations resolved before this validation: missing status
   filesystem imports and non-unique mocked project hashes in the Agent 1A
   tests.

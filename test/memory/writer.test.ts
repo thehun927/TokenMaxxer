@@ -268,11 +268,13 @@ describe("extractFactsHeuristic", () => {
 
       const indexFile = facts.active_files.find((f) => f.path === "src/index.ts")
       expect(indexFile).toBeDefined()
-      expect(indexFile!.reason).toBe("edited 2 times")
+      // PR-9 Wave 6: reads and edits are counted separately, not collapsed
+      expect(indexFile!.reason).toBe("reads=1 edits=1")
 
       const utilFile = facts.active_files.find((f) => f.path === "src/util.ts")
       expect(utilFile).toBeDefined()
-      expect(utilFile!.reason).toBe("read once")
+      // PR-9 Wave 6: write is counted as writes, not collapsed into edit/read
+      expect(utilFile!.reason).toBe("writes=1")
     })
 
     it("caps at top 5 files by frequency", () => {

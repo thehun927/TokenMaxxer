@@ -165,7 +165,7 @@ describe("mergeMemory", () => {
     expect(result.current_task).toBe("Old task")
   })
 
-  it("active_files: replace with reason preservation for files in both", () => {
+  it("active_files: current-session reason replaces stale old reason (PR-9 Wave 6)", () => {
     const existing = {
       ...emptyMemory("/test"),
       active_files: [
@@ -176,9 +176,9 @@ describe("mergeMemory", () => {
 
     const extracted = makeExtracted({
       active_files: [
-        { path: "src/main.ts", reason: "read once" },
-        { path: "src/auth.ts", reason: "edited 5 times" },
-        { path: "src/new.ts", reason: "read once" },
+        { path: "src/main.ts", reason: "reads=1" },
+        { path: "src/auth.ts", reason: "edits=1" },
+        { path: "src/new.ts", reason: "reads=1" },
       ],
     })
 
@@ -186,17 +186,18 @@ describe("mergeMemory", () => {
 
     expect(result.active_files).toHaveLength(3)
 
-    // src/main.ts: new reason is generic "read once", should preserve old
+    // PR-9 §8.5: Current-session observed activity replaces stale old reasons.
+    // The incoming reason is derived from actual tool types observed in this
+    // session transcript, so it must always be used.
     const mainFile = result.active_files.find((f) => f.path === "src/main.ts")
-    expect(mainFile!.reason).toBe("entry point, contains startup logic")
+    expect(mainFile!.reason).toBe("reads=1")
 
-    // src/auth.ts: new reason is specific "edited 5 times", should use new
     const authFile = result.active_files.find((f) => f.path === "src/auth.ts")
-    expect(authFile!.reason).toBe("complex auth logic") // old reason beats generic non-"read once" / non-"edited N"
+    expect(authFile!.reason).toBe("edits=1")
 
     // src/new.ts: new file, should have its reason
     const newFile = result.active_files.find((f) => f.path === "src/new.ts")
-    expect(newFile!.reason).toBe("read once")
+    expect(newFile!.reason).toBe("reads=1")
   })
 
   it("blockers and next_steps are overwritten", () => {
