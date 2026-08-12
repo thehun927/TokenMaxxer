@@ -28,7 +28,7 @@ tokenmaxxer is an opencode plugin that solves both problems in two layers:
 
 ### Layer 1 — Compaction-quality hook
 
-When compaction fires, tokenmaxxer intercepts it (`experimental.session.compacting` hook) and replaces the default compaction prompt with a **schema-constrained** one. The model is forced to produce a structured summary with exactly these sections:
+When compaction fires, tokenmaxxer intercepts it (`experimental.session.compacting` hook) and augments the native compaction prompt with a **schema-constrained** one. The model is forced to produce a structured summary with exactly these sections:
 
 | Section | What it captures |
 |---|---|
@@ -65,9 +65,9 @@ Session 2 (new): model calls get_project_state
   → "You have a prior decision: use Postgres (SHA abc1234, 2026-08-08)"
 ```
 
-### Tracked single-file distribution
+### Generated single-file distribution
 
-The repository tracks the built server and TUI artifacts in `dist/`. The build
+The repository generates the built server and TUI artifacts in `dist/`. The build
 uses `--no-splitting`, so `dist/index.js` and `dist/tui.js` are each a
 self-contained target with no generated chunk files to copy alongside it.
 They retain imports only for host/runtime packages supplied by OpenCode or the
@@ -97,13 +97,13 @@ titled `tokenmaxxer extract · …`.
 ### One-liner (global — recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/thehun927/TokenMaxxer/main/install.sh | bash
+curl -fsSL https://github.com/thehun927/TokenMaxxer/releases/latest/download/install.sh | bash
 ```
 
 Restart opencode after installation. Both server layers are then active in all
 projects — no per-project config required.
 
-The one-liner downloads the tracked `dist/index.js`, `dist/tui.js`, and
+The one-liner downloads the generated `dist/index.js`, `dist/tui.js`, and
 launcher artifacts directly; it does not require a local build or model
 configuration for installation.
 
@@ -111,14 +111,14 @@ configuration for installation.
 - **Layer 2** (memory + tools) silently writes `STATE.json` on session idle; it does not write to the composer
 - **7 custom tools** are registered and available to the agent in every session
 
-### Manual install from the tracked artifacts
+### Manual install from generated artifacts
 
 ```bash
 git clone https://github.com/thehun927/TokenMaxxer.git
 cd TokenMaxxer
 mkdir -p ~/.config/opencode/plugins
-cp dist/index.js ~/.config/opencode/plugins/tokenmaxxer.js       # tracked server target, global (all projects)
-cp dist/tui.js ~/.config/opencode/plugins/tokenmaxxer-tui.js     # tracked TUI target, global (all projects)
+cp dist/index.js ~/.config/opencode/plugins/tokenmaxxer.js       # generated server target, global (all projects)
+cp dist/tui.js ~/.config/opencode/plugins/tokenmaxxer-tui.js     # generated TUI target, global (all projects)
 # or: cp dist/index.js .opencode/plugins/tokenmaxxer.js       # local (single project)
 ```
 
@@ -190,7 +190,7 @@ The plugin registers 7 custom tools, available to the agent in every session:
 | `get_project_state` | **Call once at session start** when resuming work | Full project memory: current task, active files, valid decisions, blockers, next steps |
 | `recall_decision` | When you need to recall a prior decision | Decisions matching a topic query (or most recent if no query) |
 | `get_active_files` | When you need to know which files matter | Files being worked on and why each matters |
-| `recall_promote` | When a decision should never be forgotten | Marks a decision as foundational — always included in compaction context |
+| `recall_promote` | When a decision should never be forgotten | Requests human review to mark a decision as foundational — always included in compaction context |
 | `preview_compaction` | When context is getting large | Previews what would survive compaction before it fires |
 | `head_files` | When exploring large files | First N lines of files — cheaper than full `read` |
 | `tokenmaxxer_status` | When debugging | Plugin health: memory file path, size, decision count, last write, last compaction |
@@ -203,7 +203,7 @@ If the schema-constrained compaction prompt makes things worse, disable it witho
 TOKENMAXXER_NO_PROMPT=1
 ```
 
-This selects augment mode for compatibility: the plugin leaves `output.prompt` unset and appends its data-only context, letting opencode use its default compaction prompt.
+This selects augment mode for compatibility: the plugin leaves `output.prompt` unset and appends its data-only context, letting opencode use its default compaction prompt. The compaction hook always augments the native prompt with structured context; it does not replace it.
 
 ## Optional LLM extraction
 
@@ -356,6 +356,7 @@ created because the opt-in path correctly uses heuristics only.
 |---|---|
 | Plugin health | Call the `tokenmaxxer_status` tool |
 | Last injected compaction prompt | `.opencode/memory/last_compaction_prompt.log` |
+| Last compaction result | `.opencode/memory/last_compaction_result.json` |
 | Raw memory file | `.opencode/memory/STATE.json` (human-readable JSON) |
 | Corrupt file backups | `.opencode/memory/*.corrupt.*` |
 | Plugin load confirmation | opencode logs: `grep "tokenmaxxer plugin loaded" ~/.local/share/opencode/log/opencode.log` |

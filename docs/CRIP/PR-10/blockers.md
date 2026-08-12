@@ -216,3 +216,23 @@ Wave 1 has not started.
 - `git diff --check`: passed.
 - Wave-6 scope leaves README stale-claim failures for Wave 7; no real `v*` tag
   or GitHub Release was created or published.
+
+## Wave 7 — Production README truth pass — 2026-08-12
+
+- README now points installation at the canonical GitHub Release asset
+  `releases/latest/download/install.sh`, never mutable `raw.githubusercontent`
+  main content.
+- README now describes `dist/` as generated-only and not tracked, while
+  preserving the six-file self-contained release target explanation.
+- Current behavior is documented accurately: compaction augments the native
+  prompt by default; replacement is explicit; LLM durable authority is
+  decisions-only; `recall_promote` requests human review; prompt diagnostics
+  and successful result diagnostics are distinct, including
+  `last_compaction_result.json`.
+- Removed the unverified `npm install -g tokenmaxxer@latest` recovery claim.
+- `npx vitest run test/release/workflow/stale-doc-claims.test.ts`: 9 passed.
+- `npm test`: 75 files, 1283 passed.
+- Focused installer/workflow suites: 5 files, 88 passed.
+- `npx tsc --noEmit`, `bash -n install.sh`, `bash -n bin/tokenmaxxer`, and
+  `git diff --check`: passed.
+- No real `v*` tag or GitHub Release was created or published.
