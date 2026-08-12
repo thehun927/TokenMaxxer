@@ -360,4 +360,172 @@ describe("PR-9 Agent 1B — compaction prompt/result diagnostic contracts", () =
       }
     })
   })
+
+  describe("B3 — read-side validator is authoritative for persisted bounds", () => {
+    const completedAt = "2026-08-12T00:00:00.000Z"
+    const validSha = "a".repeat(64)
+
+    // Corrupt artifacts bypass the builder entirely (they model manually
+    // damaged / legacy / externally modified persisted JSON) and are fed
+    // straight to the runtime validator.
+    function rawResult(overrides: Record<string, unknown>): string {
+      return JSON.stringify({
+        version: 1,
+        completed_at: completedAt,
+        session_id: "session-1",
+        host_event: "session.compacted",
+        summary: { status: "missing" },
+        ...overrides,
+      })
+    }
+
+    it("rejects raw result JSON larger than 4096 UTF-8 bytes before/while parse", () => {
+      // Structurally valid but oversized whole JSON (padding field keeps the
+      // schema valid so only the raw-size bound can reject it).
+      const blob = JSON.stringify({
+        version: 1,
+        completed_at: completedAt,
+        session_id: "session-1",
+        host_event: "session.compacted",
+        summary: { status: "missing" },
+        padding: "x".repeat(5000),
+      })
+      expect(Buffer.byteLength(blob, "utf8")).toBeGreaterThan(RESULT_MAX)
+      const parsed = validateCompactionResultDiagnostic(blob)
+      expect(parsed.ok).toBe(false)
+    })
+
+    it("rejects session_id longer than 256 chars", () => {
+      const parsed = validateCompactionResultDiagnostic(
+        rawResult({ session_id: "s".repeat(257) }),
+      )
+      expect(parsed.ok).toBe(false)
+    })
+
+    it("rejects unavailable reason longer than 500 chars", () => {
+      const parsed = validateCompactionResultDiagnostic(
+        rawResult({ summary: { status: "unavailable", reason: "R".repeat(501) } }),
+      )
+      expect(parsed.ok).toBe(false)
+    })
+
+    it("rejects negative summary.bytes", () => {
+      const parsed = validateCompactionResultDiagnostic(
+        rawResult({ summary: { status: "found", bytes: -1, sha256: validSha } }),
+      )
+      expect(parsed.ok).toBe(false)
+    })
+
+    it("rejects fractional summary.bytes", () => {
+      const parsed = validateCompactionResultDiagnostic(
+        rawResult({ summary: { status: "found", bytes: 1.5, sha256: validSha } }),
+      )
+      expect(parsed.ok).toBe(false)
+    })
+
+    it("rejects unsafe summary.bytes beyond MAX_SAFE_INTEGER", () => {
+      const parsed = validateCompactionResultDiagnostic(
+        rawResult({
+          summary: { status: "found", bytes: Number.MAX_SAFE_INTEGER + 1, sha256: validSha },
+        }),
+      )
+      expect(parsed.ok).toBe(false)
+    })
+
+    it("rejects non-finite summary.bytes (Infinity via 1e999)", () => {
+      // JSON.parse("1e999") -> Infinity, which is not a finite number.
+      const blob =
+        '{"version":1,"completed_at":"2026-08-12T00:00:00.000Z","session_id":"session-1","host_event":"session.compacted",' +
+        `"summary":{"status":"found","bytes":1e999,"sha256":"${validSha}"}}`
+      const parsed = validateCompactionResultDiagnostic(blob)
+      expect(parsed.ok).toBe(false)
+    })
+
+    it("rejects malformed completed_at timestamps", () => {
+      const malformed = [
+        "not-a-timestamp",
+        "2026-08-12",
+        "2026-08-12T00:00:00",
+        "2026-08-12T00:00:00.000",
+        "2026-02-30T00:00:00.000Z", // impossible calendar day
+        "2026-13-45T99:99:99.000Z", // impossible month/time
+        "",
+      ]
+      for (const completedAtValue of malformed) {
+        const parsed = validateCompactionResultDiagnostic(
+          rawResult({ completed_at: completedAtValue }),
+        )
+        expect(parsed.ok).toBe(false)
+      }
+    })
+
+    it("keeps exact 64-lowercase-hex sha256 validation", () => {
+      const badShaValues = [
+        "A".repeat(64), // uppercase is not allowed
+        "a".repeat(63), // too short
+        "a".repeat(65), // too long
+        "g".repeat(64), // not hex
+        "a".repeat(64).toUpperCase(),
+      ]
+      for (const sha256 of badShaValues) {
+        const parsed = validateCompactionResultDiagnostic(
+          rawResult({ summary: { status: "found", bytes: 10, sha256 } }),
+        )
+        expect(parsed.ok).toBe(false)
+      }
+      // The valid lowercase 64-hex form is still accepted.
+      const parsed = validateCompactionResultDiagnostic(
+        rawResult({ summary: { status: "found", bytes: 10, sha256: validSha } }),
+      )
+      expect(parsed.ok).toBe(true)
+    })
+
+    it("invalid artifact returns ok:false without throwing (status maps to unavailable)", () => {
+      const hostileInputs = [
+        "{ not valid json",
+        "",
+        "null",
+        "42",
+        '{"version":1}',
+        JSON.stringify({
+          version: 1,
+          completed_at: completedAt,
+          session_id: "s".repeat(4096), // also oversized whole JSON
+          host_event: "session.compacted",
+          summary: { status: "missing" },
+        }),
+      ]
+      for (const hostile of hostileInputs) {
+        let result
+        expect(() => {
+          result = validateCompactionResultDiagnostic(hostile)
+        }).not.toThrow()
+        expect(result!.ok).toBe(false)
+      }
+    })
+
+    it("valid builder output still validates across all summary statuses", () => {
+      const cases: Array<{ completedAt: string; sessionID: string; summary: CompactionResultSummary }> = [
+        { completedAt, sessionID: "session-1", summary: { status: "missing" } },
+        { completedAt, sessionID: "session-1", summary: { status: "unavailable", reason: "history unavailable" } },
+        { completedAt, sessionID: "session-1", summary: { status: "found", bytes: 1024, sha256: validSha } },
+        // Boundary-sized session/reason must still validate after builder bounding.
+        { completedAt, sessionID: "s".repeat(256), summary: { status: "missing" } },
+        { completedAt, sessionID: "session-1", summary: { status: "unavailable", reason: "R".repeat(500) } },
+      ]
+      for (const input of cases) {
+        const artifact = buildCompactionResultDiagnostic(input)
+        expect(Buffer.byteLength(artifact.json, "utf8")).toBeLessThanOrEqual(RESULT_MAX)
+        const parsed = validateCompactionResultDiagnostic(artifact.json)
+        expect(parsed.ok).toBe(true)
+      }
+    })
+
+    it("valid ISO timestamps with numeric UTC offsets are accepted", () => {
+      const parsed = validateCompactionResultDiagnostic(
+        rawResult({ completed_at: "2026-08-12T00:00:00.000+02:00" }),
+      )
+      expect(parsed.ok).toBe(true)
+    })
+  })
 })

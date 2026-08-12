@@ -214,13 +214,24 @@ export type CompactionResultDiagnosticArtifact = {
 }
 
 /**
+ * Clamp a byte count to the authoritative persisted representation: a
+ * non-negative safe integer (matching `validateCompactionResultDiagnostic`).
+ * Negative, fractional, unsafe, or non-finite inputs collapse to 0 so builder
+ * output always passes the read-side validator.
+ */
+function normalizeByteCount(value: number): number {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0
+}
+
+/**
  * Normalize a summary for persistence: bound the unavailable reason to 500
- * chars, keep only finite byte counts, and require a 64-lowercase-hex SHA-256
- * identity. The summary body itself is never carried here.
+ * chars, keep only non-negative safe byte counts, and require a
+ * 64-lowercase-hex SHA-256 identity. The summary body itself is never carried
+ * here.
  */
 function normalizeResultSummary(summary: CompactionResultSummary): CompactionResultSummary {
   if (summary.status === "found") {
-    const bytes = Number.isFinite(summary.bytes) ? summary.bytes : 0
+    const bytes = normalizeByteCount(summary.bytes)
     const sha256 =
       typeof summary.sha256 === "string" && /^[0-9a-f]{64}$/.test(summary.sha256)
         ? summary.sha256
@@ -273,14 +284,66 @@ function boundedErrorText(error: unknown, maxChars = 200): string {
 }
 
 /**
+ * Strong ISO-8601 timestamp check for `completed_at` (contract §5.1).
+ *
+ * Requires the builder-consistent representation — `YYYY-MM-DDTHH:mm:ss`
+ * with optional milliseconds and a `Z` or numeric UTC offset — and rejects
+ * impossible calendar/clock values (e.g. `2026-02-30` or `24:00`) that
+ * `Date.parse` would otherwise silently roll over.
+ */
+const ISO_TIMESTAMP_RE =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/
+
+function daysInMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate()
+}
+
+function isIsoTimestamp(value: string): boolean {
+  const match = ISO_TIMESTAMP_RE.exec(value)
+  if (!match) return false
+  const [, yearStr, monthStr, dayStr, hourStr, minuteStr, secondStr] = match
+  const year = Number(yearStr)
+  const month = Number(monthStr)
+  const day = Number(dayStr)
+  const hour = Number(hourStr)
+  const minute = Number(minuteStr)
+  const second = Number(secondStr)
+  if (month < 1 || month > 12) return false
+  if (day < 1 || day > daysInMonth(year, month)) return false
+  if (hour > 23 || minute > 59 || second > 59) return false
+  return !Number.isNaN(Date.parse(value))
+}
+
+/**
  * Runtime schema check for a persisted result artifact (contract §5.1).
- * A malformed artifact is a diagnostic failure, not memory corruption; the
- * caller decides how to surface it without throwing the whole status away.
+ *
+ * This validator is authoritative for the persisted result schema, not merely
+ * for builder output: it enforces every declared persisted bound even when a
+ * damaged, legacy, or externally modified JSON artifact bypasses the builder's
+ * normalizing side. A malformed artifact is a diagnostic failure, not memory
+ * corruption; the caller decides how to surface it without throwing the whole
+ * status away (status reports it as `unavailable (invalid diagnostic
+ * artifact)`).
+ *
+ * Enforced persisted bounds:
+ * - the raw result JSON is `<= 4096` UTF-8 bytes (checked before parsing);
+ * - `session_id` is `<= 256` chars;
+ * - `summary.reason` is `<= 500` chars;
+ * - `summary.bytes` is a non-negative safe integer;
+ * - `completed_at` is a valid ISO-8601 timestamp consistent with the builder;
+ * - `summary.sha256` is exactly 64 lowercase hex chars.
  */
 export function validateCompactionResultDiagnostic(
   json: string,
 ): CompactionResultValidationResult {
   try {
+    // Reject an oversized raw artifact before spending any parse effort.
+    if (utf8Bytes(json) > COMPACTION_RESULT_ARTIFACT_MAX_BYTES) {
+      return {
+        ok: false,
+        reason: `result JSON exceeds ${COMPACTION_RESULT_ARTIFACT_MAX_BYTES} UTF-8 bytes`,
+      }
+    }
     const parsed: unknown = JSON.parse(json)
     if (!isRecord(parsed)) {
       return { ok: false, reason: "result is not a JSON object" }
@@ -294,8 +357,17 @@ export function validateCompactionResultDiagnostic(
     if (typeof parsed.completed_at !== "string") {
       return { ok: false, reason: "completed_at is not a string" }
     }
+    if (!isIsoTimestamp(parsed.completed_at)) {
+      return { ok: false, reason: "completed_at is not a valid ISO timestamp" }
+    }
     if (typeof parsed.session_id !== "string") {
       return { ok: false, reason: "session_id is not a string" }
+    }
+    if (parsed.session_id.length > MAX_SESSION_ID_CHARS) {
+      return {
+        ok: false,
+        reason: `session_id exceeds ${MAX_SESSION_ID_CHARS} chars`,
+      }
     }
     const summary = parsed.summary
     if (!isRecord(summary)) {
@@ -305,8 +377,8 @@ export function validateCompactionResultDiagnostic(
     const status = summary.status
     if (status === "found") {
       const bytes = summary.bytes
-      if (typeof bytes !== "number" || !Number.isFinite(bytes)) {
-        return { ok: false, reason: "summary.bytes is not a finite number" }
+      if (typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0) {
+        return { ok: false, reason: "summary.bytes is not a non-negative safe integer" }
       }
       const sha256 = summary.sha256
       if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256)) {
@@ -341,6 +413,12 @@ export function validateCompactionResultDiagnostic(
       const reason = summary.reason
       if (typeof reason !== "string") {
         return { ok: false, reason: "summary.reason is not a string" }
+      }
+      if (reason.length > MAX_REASON_CHARS) {
+        return {
+          ok: false,
+          reason: `summary.reason exceeds ${MAX_REASON_CHARS} chars`,
+        }
       }
       return {
         ok: true,
