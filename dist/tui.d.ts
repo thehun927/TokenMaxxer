@@ -1,7 +1,4 @@
-import { TuiPluginModule as TuiPluginModule$1 } from '@opencode-ai/plugin/tui';
-
 /** @jsxImportSource @opentui/solid */
-
-declare const TuiPluginModule: TuiPluginModule$1;
-
-export { TuiPluginModule as default };
+import type { TuiPluginModule as TuiPluginModuleType } from "@opencode-ai/plugin/tui";
+declare const TuiPluginModule: TuiPluginModuleType;
+export default TuiPluginModule;

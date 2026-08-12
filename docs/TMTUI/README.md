@@ -6,7 +6,7 @@ Its first target is the `memory` status element rendered in OpenCode's `session_
 
 ## Status
 
-**Planning complete — implementation ready.**
+**TMTUI-1, TMTUI-2, and TMTUI-3 complete — validated on post-CRIP-8 main.**
 
 TMTUI is intentionally separate from the Concrete Reliability Implementation Plan (CRIP). CRIP owns TokenMaxxer's durable-memory correctness and reliability program; TMTUI owns the TUI build/runtime boundary and presentation of memory persistence state.
 
@@ -14,6 +14,8 @@ See:
 
 - [`implementation-plan.md`](./implementation-plan.md) — concrete implementation sequence and acceptance criteria.
 - [`concurrency.md`](./concurrency.md) — rules for running TMTUI while CRIP is active.
+- [`implementation-status.md`](./implementation-status.md) — live implementation evidence, deviations, and remaining dependency.
+- [`TMTUI-review.md`](./TMTUI-review.md) — final review findings and release-gate evidence.
 
 ## Confirmed current problems
 
@@ -149,8 +151,9 @@ Suggested payload:
 - Best effort: failure to write the pulse marker must never turn a successful STATE commit into a failed memory operation.
 - Not refreshed periodically.
 - Not immediately removed after the commit.
-- Readers accept only recent timestamps and may remove stale/malformed markers best effort.
+- Readers accept only recent timestamps; stale/future/malformed markers return `null` (fail-closed) and are **never unlinked by the reader**. The marker is tiny and the next successful commit atomically overwrites it, so reader-side cleanup would only introduce a TOCTOU race in which a stale read could delete a freshly written marker. Any future cleanup must use compare-and-delete semantics.
 - The TUI remembers the last observed timestamp so polling the same marker cannot retrigger the animation.
+- Burst semantics: a newly observed successful durable commit causes a visible pulse; rapid commit bursts may coalesce into one pulse. Green never represents a failed or uncommitted mutation.
 
 ### Do not instrument generic `atomicWrite()`
 

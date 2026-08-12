@@ -33,7 +33,10 @@
     }
   },
   "scripts": {
-    "build": "tsup src/index.ts src/tui.tsx --format esm --dts --no-splitting --clean --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opentui/solid --external @opentui/core --external @opentui/keymap --external zod && tsup src/cli.ts --format esm --target node18 --out-dir dist --dts --no-splitting && npm run check-cli-bundle",
+    "build": "rm -rf dist && npm run build:tui && npm run build:tui-decl && tsup src/index.ts --format esm --dts --no-splitting --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opentui/solid --external @opentui/core --external @opentui/keymap --external zod && tsup src/cli.ts --format esm --target node18 --out-dir dist --dts --no-splitting && npm run check:tui-bundle && npm run check-cli-bundle",
+    "build:tui": "bun run scripts/build-tui.ts",
+    "build:tui-decl": "tsc --emitDeclarationOnly --declaration --outDir dist --project tsconfig.tui-decl.json",
+    "check:tui-bundle": "node scripts/check-tui-bundle.mjs",
     "build:cli": "tsup src/cli.ts --format esm --target node18 --out-dir dist --dts --no-splitting",
     "check-cli-bundle": "test -s dist/cli.js || (echo 'missing dist/cli.js' >&2; exit 1)",
     "verify-cli-bundle": "bash -n install.sh && bash -n bin/tokenmaxxer && npm run check-cli-bundle && grep -q 'CLI_PLUGIN_URL=.*dist/cli.js' install.sh && echo 'verify-cli-bundle: OK'",

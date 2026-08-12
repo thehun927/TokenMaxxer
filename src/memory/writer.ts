@@ -58,7 +58,6 @@ import {
 import { makeExtractionCacheKey } from "./extract-prompt"
 import type { CanonicalExtractionInput } from "./extract-prompt"
 import { log } from "../util/log"
-import { beginMemoryActivity } from "./activity-state"
 import { MEMORY_MAX_BYTES, memorySizeBytes } from "./memory-size"
 import type { MemoryBudgetProtection } from "./budget"
 import * as writerModule from "./writer"
@@ -670,60 +669,54 @@ async function processPreparedIdleSource(
  */
 export async function writeMemoryOnIdle(opts: IdleWriteOptions): Promise<IdleWriteOutcome> {
   const project = resolveProjectPath(opts.worktree, opts.directory)
-  const stopActivity = beginMemoryActivity(project)
 
   // Wave 4: Prepare source BEFORE enqueueing to avoid holding locks across I/O
-  // Wave 6: Wrap preparation and pre-queue terminal handling in try/finally to ensure cleanup
   // All terminal outcomes use finishIdleOutcome to set queue status
   let outcome: IdleWriteOutcome
+  let prepared: PreparedIdleSource
   try {
-    let prepared: PreparedIdleSource
-    try {
-      prepared = await prepareIdleSource(opts)
-    } catch (error) {
-      // Preparation is outside the queue.  An unexpected source/preparation
-      // exception is an application error, not a queue rejection.
-      void log(opts.client, "error", "idle source preparation failed", {
-        error: String(error),
-      })
-      return finishIdleOutcome(project, "error")
-    }
+    prepared = await prepareIdleSource(opts)
+  } catch (error) {
+    // Preparation is outside the queue.  An unexpected source/preparation
+    // exception is an application error, not a queue rejection.
+    void log(opts.client, "error", "idle source preparation failed", {
+      error: String(error),
+    })
+    return finishIdleOutcome(project, "error")
+  }
 
-    if (prepared.kind === "no-messages") {
-      outcome = finishIdleOutcome(project, "no-messages")
-    } else if (prepared.kind === "error") {
-      outcome = finishIdleOutcome(project, "error")
-    } else if (prepared.kind === "write-failed") {
-      outcome = finishIdleOutcome(project, "write-failed")
-    } else {
-      // Queue key is the source-version key, not just session ID
-      const queueKey = `idle:${prepared.sourceVersionKey}`
-      try {
-        outcome = await enqueueProjectJob(
-          project,
-          queueKey,
-          async () => {
-            try {
-              return await processPreparedIdleSource(opts, prepared)
-            } catch (error) {
-              // A queue job that reaches the writer but hits an unexpected
-              // application exception is an error, not a heuristic fallback.
-              void log(opts.client, "error", "idle memory pipeline failed", {
-                error: String(error),
-              })
-              return finishIdleOutcome(project, "error")
-            }
-          },
-        )
-      } catch {
-        // A rejection from the queue boundary itself is a queue failure.
-        outcome = finishIdleOutcome(project, "queue-failed")
-      }
-      // Wave 6: enqueueProjectJob already sets lastOutcome internally, but we ensure it's set here too
-      finishIdleOutcome(project, outcome)
+  if (prepared.kind === "no-messages") {
+    outcome = finishIdleOutcome(project, "no-messages")
+  } else if (prepared.kind === "error") {
+    outcome = finishIdleOutcome(project, "error")
+  } else if (prepared.kind === "write-failed") {
+    outcome = finishIdleOutcome(project, "write-failed")
+  } else {
+    // Queue key is the source-version key, not just session ID
+    const queueKey = `idle:${prepared.sourceVersionKey}`
+    try {
+      outcome = await enqueueProjectJob(
+        project,
+        queueKey,
+        async () => {
+          try {
+            return await processPreparedIdleSource(opts, prepared)
+          } catch (error) {
+            // A queue job that reaches the writer but hits an unexpected
+            // application exception is an error, not a heuristic fallback.
+            void log(opts.client, "error", "idle memory pipeline failed", {
+              error: String(error),
+            })
+            return finishIdleOutcome(project, "error")
+          }
+        },
+      )
+    } catch {
+      // A rejection from the queue boundary itself is a queue failure.
+      outcome = finishIdleOutcome(project, "queue-failed")
     }
-  } finally {
-    stopActivity()
+    // Wave 6: enqueueProjectJob already sets lastOutcome internally, but we ensure it's set here too
+    finishIdleOutcome(project, outcome)
   }
   return outcome
 }

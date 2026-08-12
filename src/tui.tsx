@@ -2,15 +2,38 @@
 
 import type { TuiPluginModule as TuiPluginModuleType } from "@opencode-ai/plugin/tui"
 import { createSignal, onCleanup } from "solid-js"
-import { isMemoryActivityFresh } from "./memory/activity-state"
-import { resolveProjectPath } from "./memory/store"
+import { resolveProjectPath } from "./memory/paths"
+import { readRecentMemoryCommit } from "./memory/commit-pulse"
 
-const POLL_MS = 1_000
-const BLINK_MS = 650
-// The idle event and the marker write can happen in either order. Keep the
-// optimistic state around long enough for a fast write to be visible at least
-// once, while the marker remains the authority for longer-running work.
-const OPTIMISTIC_DWELL_MS = 1_500
+// TMTUI-2 (docs/TMTUI/implementation-plan.md §2.6–2.8): the composer status
+// element is a finite commit pulse. Idle renders a quiet `memory  ·`; a newly
+// detected durable STATE commit plays exactly one `● -> • -> ·` animation.
+// There is no continuous blink and no optimistic pulse from `session.idle`.
+//
+// The TMTUI-2 pulse module (commit-pulse.ts) exports the API consumed here:
+//
+//   export const MEMORY_COMMIT_RECENT_MS = 2_000
+//   export function memoryCommitPulsePath(project: string): string
+//   export async function recordMemoryCommit(project: string): Promise<void>
+//   export async function readRecentMemoryCommit(
+//     project: string,
+//     now?: number,
+//   ): Promise<number | null>
+//
+// `readRecentMemoryCommit` returns the marker's `committed_at` only when it is
+// a finite number within MEMORY_COMMIT_RECENT_MS of `now`; stale, future, and
+// malformed markers return `null`. TMTUI-2 consumes only this reader.
+
+// Baseline poll interval (docs/TMTUI/implementation-plan.md §2.7). The pulse
+// marker is durable telemetry, not a hot counter; 500 ms is the documented
+// conservative floor. `session.idle` acts purely as a poll accelerator.
+const POLL_MS = 500
+// Finite local animation stages (docs/TMTUI/implementation-plan.md §2.6):
+// bright ~350 ms, fade ~450 ms, idle thereafter (≈800 ms total).
+const BRIGHT_MS = 350
+const FADE_MS = 450
+
+type PulseStage = "idle" | "bright" | "fade"
 
 function projectFromState(path: { worktree: string; directory: string }): string | null {
   if (typeof path?.directory !== "string" || !path.directory) return null
@@ -22,49 +45,86 @@ const tui: TuiPluginModuleType["tui"] = async (api) => {
   api.slots.register({
     slots: {
       session_prompt_right: (_context, { session_id }) => {
-        const [active, setActive] = createSignal(false)
-        const [blink, setBlink] = createSignal(true)
+        const [pulseStage, setPulseStage] = createSignal<PulseStage>("idle")
         const project = projectFromState(api.state.path)
-        let optimisticUntil = 0
-        let optimisticTimer: ReturnType<typeof setTimeout> | undefined
+
+        // Last observed marker timestamp. The same or an older timestamp never
+        // retriggers; a newer one restarts the pulse from bright.
+        let lastSeenCommitAt = 0
+        // Guards against overlapping reads if one poll outlives the interval.
+        let pollInFlight = false
+        // Guards against async operations completing after component cleanup.
+        let disposed = false
+        let pulseTimer: ReturnType<typeof setTimeout> | undefined
+        let pollTimer: ReturnType<typeof setInterval> | undefined
+        let unsubscribe: (() => void) | undefined
+
+        const startPulse = () => {
+          if (disposed) return
+          if (pulseTimer) clearTimeout(pulseTimer)
+          setPulseStage("bright")
+          pulseTimer = setTimeout(() => {
+            if (disposed) return
+            setPulseStage("fade")
+            pulseTimer = setTimeout(() => {
+              if (disposed) return
+              setPulseStage("idle")
+              pulseTimer = undefined
+            }, FADE_MS)
+          }, BRIGHT_MS)
+        }
+
         const poll = () => {
-          if (!project) return void setActive(false)
-          void isMemoryActivityFresh(project).then((durableActive) => {
-            // A marker read can finish after an idle event. Never let that
-            // older read erase the event's short optimistic signal.
-            setActive(durableActive || optimisticUntil > Date.now())
-          }).catch(() => {
-            // Missing or malformed markers are normal for fast writes.
-            setActive(optimisticUntil > Date.now())
-          })
+          if (!project || disposed || pollInFlight) return
+          pollInFlight = true
+          void readRecentMemoryCommit(project)
+            .then((committedAt) => {
+              if (disposed) return
+              if (committedAt !== null && committedAt > lastSeenCommitAt) {
+                lastSeenCommitAt = committedAt
+                startPulse()
+              }
+            })
+            .catch(() => {
+              // Missing/malformed markers and telemetry I/O failures are
+              // normal; never invent a pulse from a read error.
+            })
+            .finally(() => {
+              pollInFlight = false
+            })
         }
-        const stopOptimisticActivity = () => {
-          optimisticTimer = undefined
-          poll()
-        }
-        const unsubscribe = project
+
+        // `session.idle` is a poll accelerator only (docs/TMTUI/
+        // implementation-plan.md §2.7). It never sets the pulse stage, so an
+        // idle event alone cannot turn the indicator green.
+        unsubscribe = project
           ? api.event.on("session.idle", (event) => {
               if (event.properties.sessionID !== session_id) return
-              optimisticUntil = Date.now() + OPTIMISTIC_DWELL_MS
-              setActive(true)
-              if (optimisticTimer) clearTimeout(optimisticTimer)
-              optimisticTimer = setTimeout(stopOptimisticActivity, OPTIMISTIC_DWELL_MS)
+              poll()
             })
           : undefined
+
         poll()
-        const pollTimer = setInterval(poll, POLL_MS)
-        const blinkTimer = setInterval(() => setBlink((value) => !value), BLINK_MS)
+        pollTimer = setInterval(poll, POLL_MS)
+
         onCleanup(() => {
-          clearInterval(pollTimer)
-          clearInterval(blinkTimer)
-          if (optimisticTimer) clearTimeout(optimisticTimer)
+          disposed = true
+          if (pollTimer) clearInterval(pollTimer)
+          if (pulseTimer) clearTimeout(pulseTimer)
           unsubscribe?.()
         })
+
+        // Theme-native colors only (docs/TMTUI/implementation-plan.md §2.8):
+        // the label and the idle dot use the muted text color; the finite
+        // pulse uses the theme's success color. No hard-coded green. The fade
+        // stage keeps the theme's success color per the recommended JSX shape.
         return (
-          <>
-            <text fg={active() && blink() ? api.theme.current.success : api.theme.current.textMuted}>●</text>
-            <text fg={api.theme.current.textMuted}> memory</text>
-          </>
+          <box flexDirection="row">
+            <text fg={api.theme.current.textMuted}>memory  </text>
+            <text fg={pulseStage() === "idle" ? api.theme.current.textMuted : api.theme.current.success}>
+              {pulseStage() === "bright" ? "●" : pulseStage() === "fade" ? "•" : "·"}
+            </text>
+          </box>
         )
       },
     },
