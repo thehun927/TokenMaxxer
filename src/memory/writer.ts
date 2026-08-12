@@ -413,6 +413,11 @@ async function processPreparedIdleSource(
     void log(client, "warn", "heuristic transaction commit-failed", { project })
     return "write-failed"
   }
+  if (heuristicResult.status === "budget-rejected") {
+    // Budget rejection: route through existing failure behavior
+    void log(client, "warn", "heuristic transaction budget-rejected", { project })
+    return "write-failed"
+  }
 
   const heuristicMemory = heuristicResult.value.memory
   await writeHeaderBestEffort(client, worktree, directory, heuristicMemory)
@@ -447,7 +452,7 @@ async function processPreparedIdleSource(
   // finalLLMMerge, processed extraction_key, and audit/provider/model/variant metadata.
   const hasCompletedSource = findProcessedSource(afterHeuristic, sourceVersionKey) !== null
   const hasFailedAudit = (afterHeuristic.llm_extraction_audits ?? []).some(
-    (a) => a.source_key === sourceVersionKey && a.terminal_outcome !== "success"
+    (a: { source_key?: string; terminal_outcome: string }) => a.source_key === sourceVersionKey && a.terminal_outcome !== "success"
   )
   const gatedConfig = await getLLMConfig(client, directory, {
     memory: afterHeuristic,
@@ -602,6 +607,11 @@ async function processPreparedIdleSource(
   if (finalResult.status === "commit-failed") {
     // Wave 6: Commit failed -> write-failed (not llm-failed)
     void log(client, "warn", "final llm transaction commit-failed", { project })
+    return finishIdleOutcome(project, "write-failed")
+  }
+  if (finalResult.status === "budget-rejected") {
+    // Budget rejection: route through existing failure behavior
+    void log(client, "warn", "final llm transaction budget-rejected", { project })
     return finishIdleOutcome(project, "write-failed")
   }
   if (finalResult.status === "noop" && finalResult.value.outcome === "noop") {

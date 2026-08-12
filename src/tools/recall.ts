@@ -124,6 +124,10 @@ function formatRecallPromoteResult(result: MemoryMutationResult<RecallPromoteOut
   if (result.status === "lock-timeout" || result.status === "commit-failed") {
     return "promotion-write-failed"
   }
+  if (result.status === "budget-rejected") {
+    // Budget rejection: route through existing failure behavior
+    return "promotion-write-failed"
+  }
   switch (result.value.outcome) {
     case "requested":
       return `Foundational review requested for ${result.value.id}. Human confirmation required: tokenmaxxer promote ${result.value.id}`

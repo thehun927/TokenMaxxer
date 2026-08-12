@@ -58,3 +58,13 @@ pull PR-9 diagnostics/status or PR-10 release/dependency work into this PR.
 - TypeScript check: `npx tsc --noEmit` → passed (exit 0).
 - Decision: keep broad persistence ceilings separate from tight automatic creation constants; migration repairs only oversized non-authoritative arrays deterministically and never truncates semantic text or invents provenance/evidence.
 - Wave 3 is complete. Wave 4 canonical `mutateMemory()` transaction-budget integration is now the next phase.
+
+## 2026-08-12 — Wave 4 canonical transaction budget reconciled
+
+- Owned transaction implementation: `src/memory/store.ts`; mechanical discriminant narrowing in `src/memory/writer.ts` and `src/tools/recall.ts`; storage contracts in `test/memory/pr8-storage-budget.test.ts`.
+- `MutationAction.commit` now accepts `budgetProtection`; `mutateMemory()` calculates the actual next revision before fitting, calls `fitMemoryToBudget()` as the sole storage-budget authority, returns typed `budget-rejected` with unchanged base revision and no write, and exposes the exact committed fitted `memory`.
+- Focused rerun: `npx vitest run test/memory/pr8-storage-budget.test.ts test/memory/store.test.ts test/memory/transaction.test.ts` → 55 passed, 0 failed.
+- Caller compatibility rerun: writer/recall suites pass except one existing writer-LLM assertion that still expects legacy `commit-failed`; actual result is the intentional new `budget-rejected` status. Wave 5 owns its public/internal outcome reconciliation.
+- TypeScript check: `npx tsc --noEmit` → passed (exit 0).
+- Decision: Wave 4 did not add a new public idle outcome; budget refusal remains an internal typed result and is mechanically routed through existing failure behavior until Wave 5 adds bounded reason mapping/protection at each caller.
+- Wave 4 is complete. Wave 5 mutation callers and retry/public-outcome semantics are now the active phase.

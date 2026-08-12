@@ -25,6 +25,7 @@ import {
   mutateMemory,
   readMemoryState,
   writeMemory,
+  type MemoryBudgetProtection,
 } from "../../src/memory/store"
 import { atomicWrite } from "../../src/util/fs"
 import { emptyMemory } from "../../src/memory/schema"
@@ -32,6 +33,7 @@ import { pruneOld, pruneOldForCommit } from "../../src/memory/writer"
 import { projectMemoryPath } from "../../src/memory/paths"
 import { MEMORY_MAX_BYTES, memorySizeBytes, serializeMemory } from "../../src/memory/memory-size"
 import type { MemoryFile, Decision, LLMAuditMetadata } from "../../src/memory/schema"
+import { fitMemoryToBudget, type MemoryBudgetFailureReason } from "../../src/memory/budget"
 
 /**
  * Deterministic decision factory for PR-8 tests.
@@ -85,6 +87,12 @@ function makeActiveFile(path: string): { path: string; reason: string; last_touc
     path,
     reason: "important file for the project work",
     last_touched: new Date().toISOString(),
+    provenance: {
+      extractor: "heuristic",
+      source_session_id: "session-0",
+      confidence: "heuristic",
+      evidence: [],
+    },
   }
 }
 
@@ -134,8 +142,7 @@ describe("PR-8 storage/accounting/transaction contracts", () => {
       expect(bytesBefore).toBeGreaterThan(MEMORY_MAX_BYTES)
 
       // Seed an over-cap but schema-valid state, then exercise the canonical
-      // transaction boundary. PR-8 fitting belongs to mutateMemory, not raw
-      // atomicWrite.
+      // transaction boundary. PR-8 Wave 4: mutateMemory uses fitMemoryToBudget.
       await atomicWrite(path, serializeMemory(mem))
       const result = await mutateMemory(
         { worktree: project, directory: project },
@@ -366,7 +373,7 @@ describe("PR-8 storage/accounting/transaction contracts", () => {
   })
 
   describe("mutateMemory budget rejection no write/no revision bump", () => {
-    it("over-cap state causes commit-failed, no write, no revision bump", async () => {
+    it("over-cap state causes budget-rejected, no write, no revision bump", async () => {
       const project = worktree
       const path = projectMemoryPath(project)
 
@@ -409,6 +416,10 @@ describe("PR-8 storage/accounting/transaction contracts", () => {
 
       // Verify typed budget rejection
       expect(result.status).toBe("budget-rejected")
+      expect(result.reason).toBe("foundational-state-exceeds-budget")
+      expect(result.revision).toBe(0) // No revision bump
+      expect(result.requiredBytes).toBeDefined()
+      expect(result.maxBytes).toBe(MEMORY_MAX_BYTES)
 
       // Verify no write occurred
       const read = await readMemoryState({ worktree: project, directory: project })
@@ -466,10 +477,53 @@ describe("PR-8 storage/accounting/transaction contracts", () => {
       expect(result.status).toBe("committed")
       expect(result.revision).toBe(1)
 
+      // Verify fitted memory is returned in result.memory
+      expect(result.memory).toBeDefined()
+      expect(memorySizeBytes(result.memory)).toBeLessThanOrEqual(MEMORY_MAX_BYTES)
+
+      // Verify result.value is the mutation value (not the fitted memory)
+      expect(result.value).toBeNull()
+    })
+
+    it("mutateMemory with budgetProtection returns fitted memory", async () => {
+      const project = worktree
+      const path = projectMemoryPath(project)
+
+      // Seed at revision 0
+      await atomicWrite(path, JSON.stringify(emptyMemory(project), null, 2), "utf8")
+
+      // Create a memory file that fits
+      const mem: MemoryFile = {
+        ...emptyMemory(project),
+        revision: 0,
+        current_task: "x".repeat(200),
+        active_files: [makeActiveFile("src/main.ts")],
+        decisions: [makeDecision("d1", "topic1", "decision1".repeat(100))],
+      }
+
+      // Mutate with budget protection
+      const protection: MemoryBudgetProtection = {
+        preserveProcessedSourceKeys: ["v2s:placeholder"],
+        preserveAuditSessionIDs: ["audit-0"],
+        preserveDecisionIDs: ["d1"],
+      }
+
+      const result = await mutateMemory(
+        { worktree: project, directory: project },
+        () => ({ kind: "commit", memory: mem, value: null, budgetProtection: protection }),
+      )
+
+      // Verify result
+      expect(result.status).toBe("committed")
+      expect(result.revision).toBe(1)
+
       // Verify fitted memory is returned
-      const fittedMemory = result.value
-      expect(fittedMemory).toBeDefined()
-      expect(memorySizeBytes(fittedMemory)).toBeLessThanOrEqual(MEMORY_MAX_BYTES)
+      expect(result.memory).toBeDefined()
+      expect(memorySizeBytes(result.memory)).toBeLessThanOrEqual(MEMORY_MAX_BYTES)
+
+      // Verify protection was applied (decision should be present)
+      expect(result.memory.decisions).toHaveLength(1)
+      expect(result.memory.decisions[0]?.id).toBe("d1")
     })
 
     it("pruneOldForCommit returns fitted memory or over-cap state", () => {

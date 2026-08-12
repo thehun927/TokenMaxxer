@@ -19,6 +19,7 @@ import {
   ProjectLockTimeoutError,
 } from "./project-lock"
 import type { ProjectLockOptions } from "./project-lock"
+import { fitMemoryToBudget, type MemoryBudgetFailureReason, type MemoryBudgetProtection } from "./budget"
 
 export type MemorySource = "project" | "global"
 
@@ -359,15 +360,16 @@ async function commitMemoryExact(
  * callback. `commit` persists a new memory; `noop` leaves STATE untouched.
  */
 export type MutationAction<T> =
-  | { kind: "commit"; memory: MemoryFile; value: T }
+  | { kind: "commit"; memory: MemoryFile; value: T; budgetProtection?: MemoryBudgetProtection }
   | { kind: "noop"; value: T }
 
 /**
  * Result of a `mutateMemory` transaction.
  */
 export type MemoryMutationResult<T> =
-  | { status: "committed"; value: T; revision: number }
+  | { status: "committed"; value: T; revision: number; memory: MemoryFile }
   | { status: "noop"; value: T; revision: number }
+  | { status: "budget-rejected"; reason: MemoryBudgetFailureReason; revision: number; requiredBytes?: number; maxBytes?: number }
   | { status: "lock-timeout" }
   | { status: "unavailable" }
   | { status: "commit-failed" }
@@ -388,6 +390,12 @@ export type MemoryMutationResult<T> =
  * The mutation callback is synchronous. If a caller needs an async step
  * inside the transaction body, it must do so BEFORE calling `mutateMemory`
  * (PR 2 §12 "no-lock zones").
+ *
+ * PR-8 Wave 4: fitMemoryToBudget is the sole storage-budget authority.
+ * - next.revision = base.revision + 1 is calculated first
+ * - fitMemoryToBudget(next, { protection: action.budgetProtection }) is called
+ * - budget rejection returns typed result with no write/no revision bump
+ * - successful commit uses exactly fitted.memory
  */
 export async function mutateMemory<T>(
   args: {
@@ -430,12 +438,30 @@ export async function mutateMemory<T>(
         } as const
       }
 
+      // PR-8 Wave 4: Calculate next.revision first, before budget fitting
       const next: MemoryFile = {
         ...action.memory,
         revision: base.revision + 1,
       }
 
-      const committed = await commitMemoryExact(project, next, { client: args.client })
+      // PR-8 Wave 4: fitMemoryToBudget is the sole storage-budget authority
+      const budgetResult = fitMemoryToBudget(next, {
+        protection: action.budgetProtection,
+      })
+
+      if (!budgetResult.ok) {
+        // Budget rejection: typed result with no write/no revision bump
+        return {
+          status: "budget-rejected",
+          reason: budgetResult.reason,
+          revision: base.revision,
+          requiredBytes: budgetResult.requiredBytes,
+          maxBytes: budgetResult.maxBytes,
+        } as const
+      }
+
+      // Budget success: commit exactly fitted.memory through commitMemoryExact
+      const committed = await commitMemoryExact(project, budgetResult.memory, { client: args.client })
       if (!committed.ok) {
         return { status: "commit-failed" } as const
       }
@@ -443,7 +469,8 @@ export async function mutateMemory<T>(
       return {
         status: "committed",
         value: action.value,
-        revision: next.revision,
+        revision: budgetResult.memory.revision,
+        memory: budgetResult.memory,
       } as const
     }, args.lockOptions)
   } catch (error) {
