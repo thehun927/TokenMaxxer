@@ -20,7 +20,7 @@ This directory is the canonical home for TokenMaxxer's **Concrete Reliability Im
 | PR 7 | Compaction quality and anti-drift | **Complete — Ship** | [`PR-7/`](./PR-7/) |
 | PR 8 | Guaranteed storage and injection budgets | **Complete — Ship** | [`PR-8/`](./PR-8/) |
 | PR 9 | Accurate diagnostics and artifact storage | **Complete — Ship** | [`PR-9/`](./PR-9/) |
-| PR 10 | Reproducible release and dependency hygiene | **Next** | `PR-10/` |
+| PR 10 | Reproducible release and dependency hygiene | **Implementation plan ready** | [`PR-10/`](./PR-10/) |
 
 ## PR directory convention
 
