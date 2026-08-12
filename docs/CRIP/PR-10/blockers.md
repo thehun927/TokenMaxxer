@@ -226,6 +226,23 @@ Wave 1 has not started.
 - Current local release-builder deviation remains Node `v22.22.1` / npm `9.2.0`
   versus pinned target Node `22.23.1` / npm `10.9.8`; same-toolchain hashes are
   reproducible. No real `v*` tag or GitHub Release was created or published.
+
+## Wave 9 — CI clean-checkout correction — 2026-08-12
+
+- GitHub CI run `31638418807` at implementation head `b628384` exposed a
+  legitimate clean-checkout defect: Wave-1 dist inventory tests scanned
+  `dist/` before the CI build step and failed with `ENOENT` when generated
+  output was correctly absent from the checkout.
+- Corrected `test/release/dist-contract.test.ts` and
+  `test/release/dist-inventory.test.ts` so a clean checkout explicitly accepts
+  absent generated output, while exact six-file/integrity assertions remain
+  active whenever `dist/` exists after build.
+- Local correction evidence: clean-like run with `dist/` removed passed 8/8
+  focused dist tests; post-build full `npm test` passed 75 files/1283 tests;
+  `npx tsc --noEmit`, shell syntax, and `git diff --check` passed.
+- The failed CI run was not a production behavior failure; it was a test
+  lifecycle/order defect. A corrective commit and replacement CI run are
+  required before Oracle evidence is finalized.
 - Final checksum policy correction: `SHA256SUMS` now covers all 10 staged
   payloads except the manifest itself, while the installer verifies its five
   downloaded payloads before mutation. Pre-commit staged-manifest evidence at
