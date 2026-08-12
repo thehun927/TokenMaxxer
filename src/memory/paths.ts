@@ -61,3 +61,11 @@ export function projectLockDir(project: string): string {
 export function projectStorageHash(project: string): string {
   return createHash("sha256").update(project).digest("hex").slice(0, 16)
 }
+
+/**
+ * Directory for project-local memory storage.
+ * Used by Wave 2 artifact storage for project-local artifacts.
+ */
+export function projectMemoryStorageDir(project: string): string {
+  return join(project, ".opencode", "memory")
+}

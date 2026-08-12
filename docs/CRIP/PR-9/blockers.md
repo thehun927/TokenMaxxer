@@ -36,3 +36,20 @@ deviations, and unresolved blockers.
   tests.
 - Wave 1 production behavior remains intentionally unimplemented; failures
   are carried forward as Wave 2–6 acceptance evidence.
+
+## 2026-08-12 — Wave 2 integrated validation
+
+- Implemented centralized diagnostic artifact storage in
+  `src/diagnostics/artifacts.ts` and typed contracts in
+  `src/diagnostics/artifacts.types.ts`; added project-local path helper in
+  `src/memory/paths.ts`.
+- Canonical behavior validated: explicit artifact filenames, UTF-8 byte limit
+  before disk, atomic project-local then hashed-global fallback, typed
+  `ok|missing|unavailable` reads, newest mtime selection with project tie,
+  safe-name rejection, no cache, and bounded failure results.
+- Luna rerun:
+  `npx vitest run test/diagnostics/artifacts.test.ts test/tools/pr9-status.test.ts`
+  — 2 files, 32/32 passed.
+- Luna rerun: `npx tsc --noEmit` — passed with no output.
+- `git diff --check` passed. `src/util/fs.ts` was restored to baseline and is
+  outside Wave 2 ownership.

@@ -1,267 +1,224 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest"
-import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
-import { dirname, join } from "node:path"
+import { describe, expect, it, beforeEach, afterEach } from "vitest"
+import { chmod, mkdtemp, mkdir, rm, utimes, writeFile } from "node:fs/promises"
+import { join } from "node:path"
 import { tmpdir } from "node:os"
 
 // Import the types that will exist in Wave 2
-import type {
-  DiagnosticArtifactName,
-  DiagnosticArtifactReadResult,
-  DiagnosticArtifactWriteResult,
+import type { DiagnosticArtifactName } from "../../src/diagnostics/artifacts.types"
+
+// Import the canonical API
+import {
+  writeDiagnosticArtifact,
+  readDiagnosticArtifact,
 } from "../../src/diagnostics/artifacts"
 
-// Mock the Wave 2 path helpers that don't exist yet
-vi.mock("../../src/memory/paths", () => ({
-  projectMemoryStorageDir: vi.fn((project: string) => join(project, ".opencode", "memory")),
-  globalProjectStorageDir: vi.fn((project: string) => {
-    // Use a deterministic hash based on project path for testing
-    const hash = project.split("/").reduce((acc, part) => {
-      let hash = 0
-      for (let i = 0; i < part.length; i++) {
-        const char = part.charCodeAt(i)
-        hash = ((hash << 5) - hash) + char
-        hash = hash & hash
-      }
-      return acc + hash.toString(16).padStart(8, "0")
-    }, "")
-    return join(process.env.HOME!, ".config/opencode/memory", hash)
-  }),
-  projectStorageHash: vi.fn((project: string) => {
-    // Use a deterministic hash based on project path for testing
-    const hash = project.split("/").reduce((acc, part) => {
-      let hash = 0
-      for (let i = 0; i < part.length; i++) {
-        const char = part.charCodeAt(i)
-        hash = ((hash << 5) - hash) + char
-        hash = hash & hash
-      }
-      return acc + hash.toString(16).padStart(8, "0")
-    }, "")
-    return hash
-  }),
-}))
-
-// Import the mocked path helpers
-import {
-  projectMemoryStorageDir,
-  globalProjectStorageDir,
-  projectStorageHash,
-} from "../../src/memory/paths"
+// Import path helpers (real global storage dir + stable hash, no mocks)
+import { globalProjectStorageDir, projectStorageHash } from "../../src/memory/paths"
 
 describe("Artifact storage contracts (Wave 2)", () => {
-  let homeDir: string
   const worktrees: string[] = []
+  const originalHome = process.env.HOME
 
   beforeEach(async () => {
-    // Isolate the global fallback namespace from the developer's real home
-    homeDir = await mkdtemp(join(tmpdir(), "tokenmaxxer-artifacts-"))
-    vi.stubEnv("HOME", homeDir)
-    vi.clearAllMocks()
-  })
-
-  afterEach(async () => {
-    vi.unstubAllEnvs()
-    await rm(homeDir, { recursive: true, force: true })
+    // Clear any previous worktrees
     await Promise.all(
       worktrees.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
     )
   })
 
+  afterEach(async () => {
+    // Restore HOME after each test
+    process.env.HOME = originalHome
+    await Promise.all(
+      worktrees.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
+    )
+  })
+
+  // Create a real project directory (project-local writes succeed).
+  async function makeProjectDir(): Promise<string> {
+    const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-artifacts-project-"))
+    worktrees.push(project)
+    return project
+  }
+
+  // Create a project path that is a FILE, so project-local mkdir fails
+  // (ENOTDIR) and the canonical API must fall back to global storage.
+  async function makeProjectFile(): Promise<string> {
+    const project = join(
+      tmpdir(),
+      `tokenmaxxer-artifacts-project-file-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    )
+    await writeFile(project, "project path is a file")
+    worktrees.push(project)
+    return project
+  }
+
+  // Isolate HOME so globalProjectStorageDir() resolves under a temp dir.
+  async function isolateHome(): Promise<string> {
+    const homeDir = await mkdtemp(join(tmpdir(), "tokenmaxxer-artifacts-home-"))
+    worktrees.push(homeDir)
+    process.env.HOME = homeDir
+    return homeDir
+  }
+
   describe("project/global artifact resolution", () => {
     it("project diagnostic path uses resolved project path", async () => {
-      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-"))
-      worktrees.push(project)
+      const project = await makeProjectDir()
+      await isolateHome()
 
-      const dir = projectMemoryStorageDir(project)
+      const dir = join(project, ".opencode", "memory")
       await mkdir(dir, { recursive: true })
 
       const promptPath = join(dir, "last_compaction_prompt.log")
-      const resultPath = join(dir, "last_compaction_result.json")
 
-      await writeFile(promptPath, "test prompt")
-      await writeFile(resultPath, '{"completed_at":"2026-08-12T00:00:00.000Z","session_id":"test-session"}')
-
-      // The actual implementation will read these files
-      const promptResult: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: "test prompt",
-        source: "project",
-        path: promptPath,
-        sizeBytes: 11,
-        mtime: Date.now(),
+      // Write using canonical API
+      const writeResult = await writeDiagnosticArtifact("last_compaction_prompt.log", project, "test prompt")
+      expect(writeResult.ok).toBe(true)
+      if (writeResult.ok) {
+        expect(writeResult.source).toBe("project")
+        expect(writeResult.path).toBe(promptPath)
+        expect(writeResult.sizeBytes).toBe(11)
       }
 
-      const resultResult: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: '{"completed_at":"2026-08-12T00:00:00.000Z","session_id":"test-session"}',
-        source: "project",
-        path: resultPath,
-        sizeBytes: 52,
-        mtime: Date.now(),
+      // Read using canonical API
+      const readResult = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(readResult.kind).toBe("ok")
+      if (readResult.kind === "ok") {
+        expect(readResult.content).toBe("test prompt")
+        expect(readResult.source).toBe("project")
+        expect(readResult.path).toBe(promptPath)
+        expect(readResult.sizeBytes).toBe(11)
       }
-
-      expect(promptResult.status).toBe("ok")
-      expect(promptResult.source).toBe("project")
-      expect(resultResult.status).toBe("ok")
-      expect(resultResult.source).toBe("project")
-
-      await rm(project, { recursive: true, force: true })
     })
 
     it("global diagnostic path uses existing stable project hash", async () => {
-      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-"))
-      worktrees.push(project)
+      const project = await makeProjectFile()
+      await isolateHome()
 
-      const hash = projectStorageHash(project)
       const globalDir = globalProjectStorageDir(project)
       await mkdir(globalDir, { recursive: true })
 
       const promptPath = join(globalDir, "last_compaction_prompt.log")
-      const resultPath = join(globalDir, "last_compaction_result.json")
 
+      // Write to global directory manually to simulate project-local write failure
       await writeFile(promptPath, "test prompt")
-      await writeFile(resultPath, '{"completed_at":"2026-08-12T00:00:00.000Z","session_id":"test-session"}')
 
-      // The actual implementation will read these files
-      const promptResult: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: "test prompt",
-        source: "global",
-        path: promptPath,
-        sizeBytes: 11,
-        mtime: Date.now(),
+      // Write using canonical API - should fall back to global since project-local write fails
+      const writeResult = await writeDiagnosticArtifact("last_compaction_prompt.log", project, "test prompt")
+      expect(writeResult.ok).toBe(true)
+      if (writeResult.ok) {
+        expect(writeResult.source).toBe("global")
+        expect(writeResult.path).toBe(promptPath)
       }
 
-      const resultResult: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: '{"completed_at":"2026-08-12T00:00:00.000Z","session_id":"test-session"}',
-        source: "global",
-        path: resultPath,
-        sizeBytes: 52,
-        mtime: Date.now(),
+      // Read using canonical API
+      const readResult = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(readResult.kind).toBe("ok")
+      if (readResult.kind === "ok") {
+        expect(readResult.content).toBe("test prompt")
+        expect(readResult.source).toBe("global")
+        expect(readResult.path).toBe(promptPath)
       }
-
-      expect(promptResult.status).toBe("ok")
-      expect(promptResult.source).toBe("global")
-      expect(resultResult.status).toBe("ok")
-      expect(resultResult.source).toBe("global")
-
-      await rm(project, { recursive: true, force: true })
     })
   })
 
   describe("mtime selection and local tie-break", () => {
     it("both readable -> newer mtime wins", async () => {
-      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-"))
-      worktrees.push(project)
+      const project = await makeProjectDir()
+      await isolateHome()
 
-      const dir = projectMemoryStorageDir(project)
+      const dir = join(project, ".opencode", "memory")
       await mkdir(dir, { recursive: true })
 
       const localPath = join(dir, "last_compaction_prompt.log")
-      const globalPath = join(globalProjectStorageDir(project), "last_compaction_prompt.log")
-      await mkdir(dirname(globalPath), { recursive: true })
+      const globalDir = globalProjectStorageDir(project)
+      await mkdir(globalDir, { recursive: true })
+
+      const globalPath = join(globalDir, "last_compaction_prompt.log")
 
       await writeFile(localPath, "local prompt")
       await writeFile(globalPath, "global prompt")
 
-      // Simulate mtime comparison: global is newer
-      const now = Date.now()
-      const globalMtime = now + 1000
-      const localMtime = now - 1000
+      // Deterministic mtimes: global is newer.
+      const base = Date.now()
+      await utimes(localPath, new Date(base - 1000), new Date(base - 1000))
+      await utimes(globalPath, new Date(base + 1000), new Date(base + 1000))
 
-      const result: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: "global prompt",
-        source: "global",
-        path: globalPath,
-        sizeBytes: 12,
-        mtime: globalMtime,
+      // Read using canonical API - should get global (newer mtime)
+      const result = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(result.kind).toBe("ok")
+      if (result.kind === "ok") {
+        expect(result.content).toBe("global prompt")
+        expect(result.source).toBe("global") // newer mtime wins
       }
-
-      expect(result.status).toBe("ok")
-      expect(result.source).toBe("global") // newer mtime wins
-
-      await rm(project, { recursive: true, force: true })
     })
 
     it("equal mtime -> local deterministic tie-break", async () => {
-      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-"))
-      worktrees.push(project)
+      const project = await makeProjectDir()
+      await isolateHome()
 
-      const dir = projectMemoryStorageDir(project)
+      const dir = join(project, ".opencode", "memory")
       await mkdir(dir, { recursive: true })
 
       const localPath = join(dir, "last_compaction_prompt.log")
-      const globalPath = join(globalProjectStorageDir(project), "last_compaction_prompt.log")
-      await mkdir(dirname(globalPath), { recursive: true })
+      const globalDir = globalProjectStorageDir(project)
+      await mkdir(globalDir, { recursive: true })
+
+      const globalPath = join(globalDir, "last_compaction_prompt.log")
 
       await writeFile(localPath, "local prompt")
       await writeFile(globalPath, "global prompt")
 
-      const now = Date.now()
+      // Deterministic equal mtimes.
+      const fixed = new Date(1700000000000)
+      await utimes(localPath, fixed, fixed)
+      await utimes(globalPath, fixed, fixed)
 
-      const result: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: "local prompt",
-        source: "project",
-        path: localPath,
-        sizeBytes: 11,
-        mtime: now,
+      // Read using canonical API - should get project (deterministic tie-break)
+      const result = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(result.kind).toBe("ok")
+      if (result.kind === "ok") {
+        expect(result.content).toBe("local prompt")
+        expect(result.source).toBe("project") // local wins on tie
       }
-
-      expect(result.status).toBe("ok")
-      expect(result.source).toBe("project") // local wins on tie
-
-      await rm(project, { recursive: true, force: true })
     })
   })
 
   describe("read-only fallback", () => {
     it("local unreadable + valid global: selects the global source as ok", async () => {
-      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-"))
-      worktrees.push(project)
+      const project = await makeProjectFile()
+      await isolateHome()
 
-      const dir = projectMemoryStorageDir(project)
-      await mkdir(dir, { recursive: true })
+      const globalDir = globalProjectStorageDir(project)
+      await mkdir(globalDir, { recursive: true })
 
-      const localPath = join(dir, "last_compaction_prompt.log")
-      const globalPath = join(globalProjectStorageDir(project), "last_compaction_prompt.log")
-      await mkdir(dirname(globalPath), { recursive: true })
+      const globalPath = join(globalDir, "last_compaction_prompt.log")
 
       // Write the file first
-      await writeFile(localPath, "local prompt")
       await writeFile(globalPath, "global prompt")
 
-      // Make local unreadable
-      await chmod(localPath, 0o000)
-
-      const result: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: "global prompt",
-        source: "global",
-        path: globalPath,
-        sizeBytes: 12,
-        mtime: Date.now(),
+      // Read using canonical API - should get global
+      const result = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(result.kind).toBe("ok")
+      if (result.kind === "ok") {
+        expect(result.content).toBe("global prompt")
+        expect(result.source).toBe("global")
+        expect(result.path).toBe(globalPath)
       }
-
-      expect(result.status).toBe("ok")
-      expect(result.source).toBe("global")
-      expect(result.path).toBe(globalPath)
-
-      await rm(project, { recursive: true, force: true })
     })
 
     it("neither readable + any read error -> unavailable", async () => {
-      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-"))
-      worktrees.push(project)
+      const project = await makeProjectDir()
+      await isolateHome()
 
-      const dir = projectMemoryStorageDir(project)
+      const dir = join(project, ".opencode", "memory")
       await mkdir(dir, { recursive: true })
 
       const localPath = join(dir, "last_compaction_prompt.log")
-      const globalPath = join(globalProjectStorageDir(project), "last_compaction_prompt.log")
-      await mkdir(dirname(globalPath), { recursive: true })
+      const globalDir = globalProjectStorageDir(project)
+      await mkdir(globalDir, { recursive: true })
+
+      const globalPath = join(globalDir, "last_compaction_prompt.log")
 
       // Write the files first
       await writeFile(localPath, "local prompt")
@@ -271,101 +228,66 @@ describe("Artifact storage contracts (Wave 2)", () => {
       await chmod(localPath, 0o000)
       await chmod(globalPath, 0o000)
 
-      const result: DiagnosticArtifactReadResult = {
-        status: "unavailable",
-        source: null,
-        path: null,
-        sizeBytes: 0,
-        errors: [
-          {
-            source: "project",
-            path: localPath,
-            code: "EACCES",
-          },
-          {
-            source: "global",
-            path: globalPath,
-            code: "EACCES",
-          },
-        ],
+      // Read using canonical API - should be unavailable
+      const result = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(result.kind).toBe("unavailable")
+      if (result.kind === "unavailable") {
+        expect(result.errors).toHaveLength(2)
       }
-
-      expect(result.status).toBe("unavailable")
-      expect(result.errors).toHaveLength(2)
-
-      await rm(project, { recursive: true, force: true })
     })
   })
 
   describe("process reload", () => {
     it("artifact read has no process cache dependency / sees replacement immediately", async () => {
-      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-"))
-      worktrees.push(project)
+      const project = await makeProjectDir()
+      await isolateHome()
 
-      const dir = projectMemoryStorageDir(project)
+      const dir = join(project, ".opencode", "memory")
       await mkdir(dir, { recursive: true })
 
-      const promptPath = join(dir, "last_compaction_prompt.log")
-      await writeFile(promptPath, "initial prompt")
+      // Write initial content
+      await writeDiagnosticArtifact("last_compaction_prompt.log", project, "initial prompt")
 
       // First read
-      const result1: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: "initial prompt",
-        source: "project",
-        path: promptPath,
-        sizeBytes: 14,
-        mtime: Date.now(),
+      const result1 = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(result1.kind).toBe("ok")
+      if (result1.kind === "ok") {
+        expect(result1.content).toBe("initial prompt")
       }
-
-      expect(result1.content).toBe("initial prompt")
 
       // Update the file
-      await writeFile(promptPath, "updated prompt")
+      await writeDiagnosticArtifact("last_compaction_prompt.log", project, "updated prompt")
 
       // Second read should see the update immediately (no cache)
-      const result2: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: "updated prompt",
-        source: "project",
-        path: promptPath,
-        sizeBytes: 15,
-        mtime: Date.now(),
+      const result2 = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(result2.kind).toBe("ok")
+      if (result2.kind === "ok") {
+        expect(result2.content).toBe("updated prompt")
       }
-
-      expect(result2.content).toBe("updated prompt")
-
-      await rm(project, { recursive: true, force: true })
     })
   })
 
   describe("two-project isolation", () => {
     it("two projects produce different global artifact directories", async () => {
-      const projectA = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-a-"))
-      const projectB = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-b-"))
-      worktrees.push(projectA, projectB)
-
-      const hashA = projectStorageHash(projectA)
-      const hashB = projectStorageHash(projectB)
+      const projectA = await makeProjectDir()
+      const projectB = await makeProjectDir()
+      await isolateHome()
 
       const globalDirA = globalProjectStorageDir(projectA)
       const globalDirB = globalProjectStorageDir(projectB)
 
       expect(globalDirA).not.toBe(globalDirB)
-      expect(globalDirA).toContain(hashA)
-      expect(globalDirB).toContain(hashB)
-
-      await rm(projectA, { recursive: true, force: true })
-      await rm(projectB, { recursive: true, force: true })
+      expect(globalDirA).toContain(projectStorageHash(projectA))
+      expect(globalDirB).toContain(projectStorageHash(projectB))
     })
 
     it("project A status shows A result only", async () => {
-      const projectA = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-a-"))
-      const projectB = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-b-"))
-      worktrees.push(projectA, projectB)
+      const projectA = await makeProjectDir()
+      const projectB = await makeProjectDir()
+      await isolateHome()
 
-      const dirA = projectMemoryStorageDir(projectA)
-      const dirB = projectMemoryStorageDir(projectB)
+      const dirA = join(projectA, ".opencode", "memory")
+      const dirB = join(projectB, ".opencode", "memory")
       await mkdir(dirA, { recursive: true })
       await mkdir(dirB, { recursive: true })
 
@@ -376,41 +298,29 @@ describe("Artifact storage contracts (Wave 2)", () => {
       await writeFile(resultPathB, '{"completed_at":"2026-08-12T01:00:00.000Z","session_id":"session-b"}')
 
       // Project A reads its own artifact
-      const resultA: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: '{"completed_at":"2026-08-12T00:00:00.000Z","session_id":"session-a"}',
-        source: "project",
-        path: resultPathA,
-        sizeBytes: 52,
-        mtime: Date.now(),
+      const resultA = await readDiagnosticArtifact("last_compaction_result.json", projectA)
+      expect(resultA.kind).toBe("ok")
+      if (resultA.kind === "ok") {
+        expect(resultA.content).toContain("session-a")
+        expect(resultA.path).toBe(resultPathA)
       }
 
       // Project B reads its own artifact
-      const resultB: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: '{"completed_at":"2026-08-12T01:00:00.000Z","session_id":"session-b"}',
-        source: "project",
-        path: resultPathB,
-        sizeBytes: 52,
-        mtime: Date.now(),
+      const resultB = await readDiagnosticArtifact("last_compaction_result.json", projectB)
+      expect(resultB.kind).toBe("ok")
+      if (resultB.kind === "ok") {
+        expect(resultB.content).toContain("session-b")
+        expect(resultB.path).toBe(resultPathB)
       }
-
-      expect(resultA.content).toContain("session-a")
-      expect(resultB.content).toContain("session-b")
-      expect(resultA.path).toBe(resultPathA)
-      expect(resultB.path).toBe(resultPathB)
-
-      await rm(projectA, { recursive: true, force: true })
-      await rm(projectB, { recursive: true, force: true })
     })
 
     it("project B status shows B result only", async () => {
-      const projectA = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-a-"))
-      const projectB = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-b-"))
-      worktrees.push(projectA, projectB)
+      const projectA = await makeProjectDir()
+      const projectB = await makeProjectDir()
+      await isolateHome()
 
-      const dirA = projectMemoryStorageDir(projectA)
-      const dirB = projectMemoryStorageDir(projectB)
+      const dirA = join(projectA, ".opencode", "memory")
+      const dirB = join(projectB, ".opencode", "memory")
       await mkdir(dirA, { recursive: true })
       await mkdir(dirB, { recursive: true })
 
@@ -421,162 +331,191 @@ describe("Artifact storage contracts (Wave 2)", () => {
       await writeFile(resultPathB, '{"completed_at":"2026-08-12T01:00:00.000Z","session_id":"session-b"}')
 
       // Project A reads its own artifact
-      const resultA: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: '{"completed_at":"2026-08-12T00:00:00.000Z","session_id":"session-a"}',
-        source: "project",
-        path: resultPathA,
-        sizeBytes: 52,
-        mtime: Date.now(),
+      const resultA = await readDiagnosticArtifact("last_compaction_result.json", projectA)
+      expect(resultA.kind).toBe("ok")
+      if (resultA.kind === "ok") {
+        expect(resultA.content).toContain("session-a")
+        expect(resultA.path).toBe(resultPathA)
       }
 
       // Project B reads its own artifact
-      const resultB: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: '{"completed_at":"2026-08-12T01:00:00.000Z","session_id":"session-b"}',
-        source: "project",
-        path: resultPathB,
-        sizeBytes: 52,
-        mtime: Date.now(),
+      const resultB = await readDiagnosticArtifact("last_compaction_result.json", projectB)
+      expect(resultB.kind).toBe("ok")
+      if (resultB.kind === "ok") {
+        expect(resultB.content).toContain("session-b")
+        expect(resultB.path).toBe(resultPathB)
       }
-
-      expect(resultA.content).toContain("session-a")
-      expect(resultB.content).toContain("session-b")
-      expect(resultA.path).toBe(resultPathA)
-      expect(resultB.path).toBe(resultPathB)
-
-      await rm(projectA, { recursive: true, force: true })
-      await rm(projectB, { recursive: true, force: true })
     })
   })
 
   describe("invalid result JSON handling", () => {
     it("malformed result JSON does not crash whole status", async () => {
-      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-"))
-      worktrees.push(project)
+      const project = await makeProjectDir()
+      await isolateHome()
 
-      const dir = projectMemoryStorageDir(project)
+      const dir = join(project, ".opencode", "memory")
       await mkdir(dir, { recursive: true })
 
       const resultPath = join(dir, "last_compaction_result.json")
       await writeFile(resultPath, "{ invalid json }")
 
-      const result: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: "{ invalid json }",
-        source: "project",
-        path: resultPath,
-        sizeBytes: 15,
-        mtime: Date.now(),
+      // Write using canonical API
+      await writeDiagnosticArtifact("last_compaction_result.json", project, "{ invalid json }")
+
+      // Read using canonical API
+      const result = await readDiagnosticArtifact("last_compaction_result.json", project)
+      expect(result.kind).toBe("ok")
+      if (result.kind === "ok") {
+        expect(result.content).toBe("{ invalid json }")
       }
-
-      expect(result.status).toBe("ok")
-      expect(result.content).toBe("{ invalid json }")
-
-      await rm(project, { recursive: true, force: true })
     })
 
     it("malformed result displays invalid/unavailable diagnostic", async () => {
-      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-"))
-      worktrees.push(project)
+      const project = await makeProjectDir()
+      await isolateHome()
 
-      const dir = projectMemoryStorageDir(project)
+      const dir = join(project, ".opencode", "memory")
       await mkdir(dir, { recursive: true })
 
       const resultPath = join(dir, "last_compaction_result.json")
       await writeFile(resultPath, '{"completed_at":"2026-08-12T00:00:00.000Z","session_id":"test-session"}')
 
-      const result: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: '{"completed_at":"2026-08-12T00:00:00.000Z","session_id":"test-session"}',
-        source: "project",
-        path: resultPath,
-        sizeBytes: 52,
-        mtime: Date.now(),
+      // Write using canonical API
+      await writeDiagnosticArtifact("last_compaction_result.json", project, '{"completed_at":"2026-08-12T00:00:00.000Z","session_id":"test-session"}')
+
+      // Read using canonical API
+      const result = await readDiagnosticArtifact("last_compaction_result.json", project)
+      expect(result.kind).toBe("ok")
+      if (result.kind === "ok") {
+        expect(result.content).toContain("completed_at")
+        expect(result.content).toContain("session_id")
       }
-
-      expect(result.status).toBe("ok")
-      expect(result.content).toContain("completed_at")
-      expect(result.content).toContain("session_id")
-
-      await rm(project, { recursive: true, force: true })
     })
   })
 
   describe("process-local labeling", () => {
     it("queue depth labeled process-local", async () => {
-      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-"))
-      worktrees.push(project)
+      const project = await makeProjectDir()
+      await isolateHome()
 
-      const dir = projectMemoryStorageDir(project)
+      const dir = join(project, ".opencode", "memory")
       await mkdir(dir, { recursive: true })
 
-      const promptPath = join(dir, "last_compaction_prompt.log")
-      await writeFile(promptPath, "test prompt")
+      // Write using canonical API
+      await writeDiagnosticArtifact("last_compaction_prompt.log", project, "test prompt")
 
-      const result: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: "test prompt",
-        source: "project",
-        path: promptPath,
-        sizeBytes: 11,
-        mtime: Date.now(),
+      // Read using canonical API
+      const result = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(result.kind).toBe("ok")
+      if (result.kind === "ok") {
+        expect(result.content).toBe("test prompt")
+        expect(result.source).toBe("project")
       }
-
-      expect(result.status).toBe("ok")
-      expect(result.source).toBe("project")
-
-      await rm(project, { recursive: true, force: true })
     })
 
     it("in-flight labeled process-local", async () => {
-      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-"))
-      worktrees.push(project)
+      const project = await makeProjectDir()
+      await isolateHome()
 
-      const dir = projectMemoryStorageDir(project)
+      const dir = join(project, ".opencode", "memory")
       await mkdir(dir, { recursive: true })
 
-      const promptPath = join(dir, "last_compaction_prompt.log")
-      await writeFile(promptPath, "test prompt")
+      // Write using canonical API
+      await writeDiagnosticArtifact("last_compaction_prompt.log", project, "test prompt")
 
-      const result: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: "test prompt",
-        source: "project",
-        path: promptPath,
-        sizeBytes: 11,
-        mtime: Date.now(),
+      // Read using canonical API
+      const result = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(result.kind).toBe("ok")
+      if (result.kind === "ok") {
+        expect(result.content).toBe("test prompt")
+        expect(result.source).toBe("project")
       }
-
-      expect(result.status).toBe("ok")
-      expect(result.source).toBe("project")
-
-      await rm(project, { recursive: true, force: true })
     })
 
     it("last idle outcome labeled process-local", async () => {
-      const project = await mkdtemp(join(tmpdir(), "tokenmaxxer-project-"))
-      worktrees.push(project)
+      const project = await makeProjectDir()
+      await isolateHome()
 
-      const dir = projectMemoryStorageDir(project)
+      const dir = join(project, ".opencode", "memory")
       await mkdir(dir, { recursive: true })
 
-      const promptPath = join(dir, "last_compaction_prompt.log")
-      await writeFile(promptPath, "test prompt")
+      // Write using canonical API
+      await writeDiagnosticArtifact("last_compaction_prompt.log", project, "test prompt")
 
-      const result: DiagnosticArtifactReadResult = {
-        status: "ok",
-        content: "test prompt",
-        source: "project",
-        path: promptPath,
-        sizeBytes: 11,
-        mtime: Date.now(),
+      // Read using canonical API
+      const result = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(result.kind).toBe("ok")
+      if (result.kind === "ok") {
+        expect(result.content).toBe("test prompt")
+        expect(result.source).toBe("project")
+      }
+    })
+  })
+
+  describe("write limits and safe names", () => {
+    it("over-limit content -> typed too-large, no write", async () => {
+      const project = await makeProjectDir()
+      await isolateHome()
+
+      const result = await writeDiagnosticArtifact("last_compaction_prompt.log", project, "1234567890", 5)
+      expect(result.ok).toBe(false)
+      if (!result.ok) {
+        expect(result.reason).toBe("too-large")
+        expect(result.sizeBytes).toBe(10)
+        expect(result.maxBytes).toBe(5)
       }
 
-      expect(result.status).toBe("ok")
-      expect(result.source).toBe("project")
+      // Nothing was written to disk.
+      const read = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(read.kind).toBe("missing")
+    })
 
-      await rm(project, { recursive: true, force: true })
+    it("UTF-8 byte count uses encoded bytes, not JS length", async () => {
+      const project = await makeProjectDir()
+      await isolateHome()
+
+      const content = "héllo wörld" // multibyte characters
+      const writeResult = await writeDiagnosticArtifact("last_compaction_prompt.log", project, content)
+      expect(writeResult.ok).toBe(true)
+      if (writeResult.ok) {
+        expect(writeResult.sizeBytes).toBe(Buffer.byteLength(content, "utf-8"))
+        expect(writeResult.sizeBytes).toBeGreaterThan(content.length)
+      }
+
+      const readResult = await readDiagnosticArtifact("last_compaction_prompt.log", project)
+      expect(readResult.kind).toBe("ok")
+      if (readResult.kind === "ok") {
+        expect(readResult.sizeBytes).toBe(Buffer.byteLength(content, "utf-8"))
+      }
+    })
+
+    it("traversal artifact name rejected", async () => {
+      const project = await makeProjectDir()
+      await isolateHome()
+
+      const badName = "../../etc/passwd" as unknown as DiagnosticArtifactName
+      await expect(writeDiagnosticArtifact(badName, project, "x")).rejects.toThrow(/unsafe diagnostic artifact name/)
+      await expect(readDiagnosticArtifact(badName, project)).rejects.toThrow(/unsafe diagnostic artifact name/)
+    })
+
+    it("both writes fail -> typed io-failed", async () => {
+      // Project path is a file -> project-local write fails.
+      const project = await makeProjectFile()
+
+      // HOME points under a file -> global write fails too.
+      const blocker = join(
+        tmpdir(),
+        `tokenmaxxer-artifacts-blocker-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      )
+      await writeFile(blocker, "blocker file")
+      worktrees.push(blocker)
+      process.env.HOME = join(blocker, "home")
+
+      const result = await writeDiagnosticArtifact("last_compaction_prompt.log", project, "test prompt")
+      expect(result.ok).toBe(false)
+      if (!result.ok) {
+        expect(result.reason).toBe("io-failed")
+      }
     })
   })
 })
