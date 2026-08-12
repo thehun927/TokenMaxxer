@@ -37,3 +37,14 @@ pull PR-9 diagnostics/status or PR-10 release/dependency work into this PR.
 - Decision: retain the failing assertions; they are the Wave-1 production contracts and were not weakened to match PR-7 behavior.
 - Decision: storage fixtures were corrected to use schema-valid provenance, to exercise `mutateMemory()` rather than raw writes for fitting, and to return the constructed irreducible candidate. The correction was completed after two writer lanes stopped without terminal results; ownership is now reconciled by Luna.
 - Wave 1 is complete. Production implementation may begin only in the next planned wave after this contract commit.
+
+## 2026-08-12 — Wave 2 budget primitives reconciled
+
+- Owned implementation: `src/memory/budget.ts`; `src/memory/memory-size.ts` remains at the canonical `MEMORY_MAX_BYTES = 8_192` and exact pretty-JSON UTF-8 accounting.
+- Owned focused contracts: `test/memory/pr8-budget-primitives.test.ts`.
+- Independent focused rerun: `npx vitest run test/memory/pr8-budget-primitives.test.ts` → 52 passed, 0 failed.
+- TypeScript check: `npx tsc --noEmit` → passed (exit 0).
+- The fit primitive now deep-copies input, threads each retention candidate, uses deterministic `now`, keeps protected source/audit/decision proof, bounds disposable source history, reduces top-level blocker/next-step arrays, and returns typed no-memory failures without an over-cap memory result.
+- Temporary measurement files created during fixture calibration (`measure.mjs`, `measure2.mjs`) are excluded from the deliverable and removed before commit.
+- Deepwork ignore rules were added once as required for `.slim/deepwork/`; the unrelated `opencode.json` change remains intentionally unstaged.
+- Wave 2 is complete. Wave 3 schema/migration compatibility is the next dependency-ordered phase; no Wave 4+ integration has started.

@@ -7,5 +7,9 @@ node_modules/
 .opencode/.tokenmaxxer-memory-activity
 *.tsbuildinfo
 .slim/deepwork/
+# BEGIN oh-my-opencode-slim worktrees
+.slim/worktrees/
+.slim/worktrees.json
+# END oh-my-opencode-slim worktrees
 docs/journal.md
 dist/
