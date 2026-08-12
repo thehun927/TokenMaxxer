@@ -26,10 +26,15 @@ TRANSACTION_DIR=""
 TARGETS=()
 BACKUPS=()
 COMMITTED=()
+TEMPORARIES=()
 
 die() { printf 'tokenmaxxer installer: %s\n' "$1" >&2; exit 1; }
 
 cleanup() {
+  local temporary
+  for temporary in "${TEMPORARIES[@]}"; do
+    rm -f "$temporary"
+  done
   [ -z "$STAGING_DIR" ] || rm -rf "$STAGING_DIR"
   [ -z "$TRANSACTION_DIR" ] || rm -rf "$TRANSACTION_DIR"
 }
@@ -50,6 +55,31 @@ rollback() {
     fi
   done
   cleanup
+}
+
+# Portable SHA-256 command abstraction. GNU coreutils exposes `sha256sum`;
+# macOS/BSD exposes `shasum -a 256`. Detection fails closed before any
+# download or destination mutation when neither tool is available.
+SHA256_CMD=""
+SHA256_CMD_ARGS=()
+
+detect_checksum_cmd() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    SHA256_CMD="sha256sum"
+    SHA256_CMD_ARGS=()
+  elif command -v shasum >/dev/null 2>&1; then
+    SHA256_CMD="shasum"
+    SHA256_CMD_ARGS=(-a 256)
+  else
+    die "sha256sum or shasum is required to verify the release"
+  fi
+}
+
+sha256_of() {
+  local file="$1" digest
+  digest="$("$SHA256_CMD" "${SHA256_CMD_ARGS[@]}" "$file" | awk '{print $1}')" \
+    || die "could not compute SHA-256 for $file"
+  printf '%s\n' "$digest"
 }
 
 download() {
@@ -97,7 +127,7 @@ verify_checksums() {
       *) die "unexpected SHA256SUMS filename: $filename" ;;
     esac
     [ -z "${seen[$filename]+x}" ] || die "duplicate SHA256SUMS entry: $filename"
-    seen["$filename"]=1
+    seen["$filename"]="$digest"
     count=$((count + 1))
   done < "$STAGING_DIR/SHA256SUMS"
   [ "$count" -ge 5 ] || die "SHA256SUMS must contain at least the installer payload entries"
@@ -105,7 +135,7 @@ verify_checksums() {
     [ -n "${seen[$expected]+x}" ] || die "SHA256SUMS is missing $expected"
   done
   for expected in RELEASE.json tokenmaxxer tokenmaxxer.js tokenmaxxer-tui.js tokenmaxxer-cli.js; do
-    actual="$(sha256sum "$STAGING_DIR/$expected" | awk '{print $1}')"
+    actual="$(sha256_of "$STAGING_DIR/$expected")"
     [ "$actual" = "${seen[$expected]}" ] || die "SHA256SUMS verification failed for $expected"
   done
 }
@@ -140,6 +170,7 @@ commit_targets() {
   TARGETS=("$PLUGINS_DIR/tokenmaxxer.js" "$PLUGINS_DIR/tokenmaxxer-tui.js" "$PLUGINS_DIR/tokenmaxxer-cli.js" "$BIN_DIR/tokenmaxxer" "$RECEIPT_FILE")
   BACKUPS=()
   COMMITTED=()
+  TEMPORARIES=()
   stage_configs
   for i in "${!TARGETS[@]}"; do
     target="${TARGETS[$i]}"
@@ -155,6 +186,7 @@ commit_targets() {
       *) die "unknown transaction target $target";;
     esac
     temporary="${target}.tmp.$$.$i"
+    TEMPORARIES+=("$temporary")
     cp "$staged" "$temporary"
     if [ -e "$target" ]; then
       backup="$TRANSACTION_DIR/backup-$i"
@@ -172,6 +204,7 @@ commit_targets() {
 STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tokenmaxxer-release.XXXXXX")"
 TRANSACTION_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tokenmaxxer-transaction.XXXXXX")"
 trap 'rollback' ERR INT TERM EXIT
+detect_checksum_cmd
 download "$SHA256SUMS_URL" "$STAGING_DIR/SHA256SUMS"
 download "$RELEASE_JSON_URL" "$STAGING_DIR/RELEASE.json"
 download "$PLUGIN_URL" "$STAGING_DIR/tokenmaxxer.js"

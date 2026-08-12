@@ -196,6 +196,42 @@ Wave 1 has not started.
   fixture-driven integrity and transaction contracts are green.
 - No real `v*` tag or GitHub Release was created or published.
 
+## Oracle remediation — B1–B4 — 2026-08-12
+
+- **B1 installer checksum/E2E closed:** production `install.sh` now stores the
+  parsed digest value, detects `sha256sum` or `shasum -a 256`, fails closed if
+  neither exists, and removes in-flight destination temp files during rollback
+  and cleanup. Real-shell tests execute the repository installer itself with
+  curl, wget, and shasum shims. Focused remediation suite: 71 passed,
+  including valid install, tamper/malformed/missing checksum refusal,
+  rollback, first-install cleanup, both downloader branches, and receipt.
+- **B2 immutable workflow closed:** release workflow queries the dedicated
+  `/repos/${GITHUB_REPOSITORY}/immutable-releases` endpoint using the explicit
+  `RELEASE_ADMIN_TOKEN` Administration-read secret with a fail-closed guard.
+  Draft publication remains ordered after complete asset/checksum/identity
+  verification; `gh release verify` occurs only immediately after publication.
+  The B2 workflow suite passed 29 focused checks.
+- **B3 ordinary CI gate closed:** CI now runs `npm run audit:release`, real
+  `release:stage` and `release:verify`, fail-closed empty tracked-dist
+  assertion, and `test/release/installer-e2e`. The B3 structural suite passed
+  13 checks; the existing workflow suite passed 23 checks.
+- **B4 runtime compatibility closed:** shipped `engines.node` is restored to
+  `>=18`; builder pinning remains separate in `.node-version`, packageManager,
+  setup-node, and RELEASE builder metadata. Runtime/builder separation and
+  host peer/minimum tests passed 10 checks.
+- Added `docs/RELEASING.md` covering the Administration-read prerequisite,
+  green CI, exact tag/version/commit procedure, draft-first sequence,
+  post-publication attestation verification, SHA256SUMS, never-reuse-tag rule,
+  and the no-real-release remediation boundary.
+- Sequential local remediation chain passed: `npm ci`; focused remediation
+  suites; full `npm test` (78 passed, 1 skipped file; 1321 passed, 1 skipped
+  test); typecheck; host contract; audit release; build/dist/TUI/CLI/package/
+  reproducibility checks; shell syntax; release dry-run and release verify;
+  YAML parse; diff-check; and empty tracked-dist assertion.
+- Local audit remains 5 low, 0 moderate, 0 high, 0 critical; the five low
+  findings remain explicitly triaged. No real tag or GitHub Release was
+  created or published during remediation.
+
 ## Wave 9 — Luna final integration evidence — 2026-08-12
 
 - Final pushed implementation head: `f82eb39ab6c1f57c1e7242dd05b23505ae4eda3c`.

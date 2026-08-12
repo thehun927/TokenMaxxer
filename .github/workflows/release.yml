@@ -31,14 +31,15 @@ jobs:
         with:
           bun-version: 1.3.14
 
-      - name: Prove immutable releases are enabled (fail closed)
+      - name: Prove immutable releases are enabled via Administration-read credential (fail closed)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
-          settings="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '{immutable_releases: .security_and_analysis.immutable_releases}')"
+          : "${GH_TOKEN:?secrets.RELEASE_ADMIN_TOKEN (Administration: read) is required; contents:write does not grant Administration read}"
+          settings="$(gh api "/repos/${GITHUB_REPOSITORY}/immutable-releases" --jq '{enabled: .enabled, enforced_by_owner: .enforced_by_owner}')"
           printf '%s\n' "$settings"
-          test "$(printf '%s' "$settings" | jq -r '.immutable_releases.enabled // false')" = true
+          test "$(printf '%s' "$settings" | jq -r '.enabled // false')" = true
 
       - name: Release identity preflight
         env:
@@ -90,12 +91,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" .release/RELEASE.json .release/SHA256SUMS .release/install.sh .release/tokenmaxxer .release/tokenmaxxer.js .release/tokenmaxxer-tui.js .release/tokenmaxxer-cli.js .release/tokenmaxxer.d.ts .release/tokenmaxxer-tui.d.ts .release/tokenmaxxer-cli.d.ts .release/tokenmaxxer-*.tgz
 
-      - name: Verify uploaded assets before publish
+      - name: Verify uploaded asset inventory and staged checksums before publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release verify "$GITHUB_REF_NAME"
           actual="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | map(.name) | sort | join("\n")')"
           tarball="$(printf '%s\n' .release/tokenmaxxer-*.tgz | xargs -n1 basename)"
           expected="$(printf '%s\n' RELEASE.json SHA256SUMS install.sh tokenmaxxer tokenmaxxer.js tokenmaxxer-tui.js tokenmaxxer-cli.js tokenmaxxer.d.ts tokenmaxxer-tui.d.ts tokenmaxxer-cli.d.ts "$tarball" | sort)"
@@ -107,7 +107,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$GITHUB_REF_NAME" --draft=false
 
-      - name: Verify published release
+      - name: Verify published release (immutable attestation, immediately after publish)
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release verify "$GITHUB_REF_NAME"

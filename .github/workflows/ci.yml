@@ -43,7 +43,7 @@ jobs:
         run: npm run verify:host-contract
 
       - name: Audit release dependencies
-        run: npm audit --audit-level=high
+        run: npm run audit:release
 
       - name: Build distribution
         run: npm run build
@@ -95,21 +95,22 @@ jobs:
         run: |
           set -euo pipefail
           version="$(node -p 'require("./package.json").version')"
-          npm run release:preflight -- --tag "v${version}" --commit "$(git rev-parse HEAD)" --dry-run
-          echo "release:dry-run passed; ordinary CI has no release write capability"
+          npm run release:dry-run
 
-      - name: Release-set checksum verification contract
+      - name: Release staging and checksum verification
         run: |
           set -euo pipefail
-          printf '%s\n' "release:verify SHA256SUMS is enforced by the tag-only release workflow"
-          printf '%s\n' "SHA256SUMS verification contract passed in installer fixtures"
+          version="$(node -p 'require("./package.json").version')"
+          npm run release:stage -- --tag "v${version}" --commit "$(git rev-parse HEAD)" --out .release
+          npm run release:verify -- --dir .release --tag "v${version}" --commit "$(git rev-parse HEAD)"
 
       - name: Verify installer contract fixtures
-        run: npx vitest run test/release/installer test/release/workflow
+        run: npx vitest run test/release/installer test/release/installer-e2e test/release/workflow
 
       - name: Verify release staging and release set contracts
         run: |
+          set -euo pipefail
           version="$(node -p 'require("./package.json").version')"
           npm run release:preflight -- --tag "v${version}" --commit "$(git rev-parse HEAD)" --dry-run
           git diff --check
-          git ls-files 'dist/**'
+          test -z "$(git ls-files 'dist/**')" || (echo "ERROR: dist/** files are tracked in git" && exit 1)
