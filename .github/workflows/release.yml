@@ -74,14 +74,8 @@ jobs:
       - name: Stage immutable release asset set
         run: |
           set -euo pipefail
-          rm -rf .release
-          mkdir .release
-          cp install.sh .release/install.sh
-          cp bin/tokenmaxxer .release/tokenmaxxer
-          cp dist/index.js dist/tui.js dist/cli.js .release/
-          cp dist/index.d.ts dist/tui.d.ts dist/cli.d.ts .release/
-          node -e 'const fs=require("node:fs"); const p=require("./package.json"); fs.writeFileSync(".release/RELEASE.json", JSON.stringify({schema_version:1,version:p.version,tag:process.env.RELEASE_TAG,commit:process.env.RELEASE_COMMIT,opencode_peer:p.peerDependencies["@opencode-ai/plugin"],opencode_minimum_verified:p.devDependencies["@opencode-ai/plugin"]},null,2)+"\n")'
-          (cd .release && sha256sum RELEASE.json tokenmaxxer tokenmaxxer.js tokenmaxxer-tui.js tokenmaxxer-cli.js > SHA256SUMS)
+          npm run release:stage -- --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --out .release
+          npm run release:verify -- --dir .release --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_COMMIT: ${{ github.sha }}
@@ -94,7 +88,7 @@ jobs:
       - name: Upload complete staged asset set
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" .release/RELEASE.json .release/SHA256SUMS .release/tokenmaxxer .release/tokenmaxxer.js .release/tokenmaxxer-tui.js .release/tokenmaxxer-cli.js .release/install.sh
+        run: gh release upload "$GITHUB_REF_NAME" .release/RELEASE.json .release/SHA256SUMS .release/install.sh .release/tokenmaxxer .release/tokenmaxxer.js .release/tokenmaxxer-tui.js .release/tokenmaxxer-cli.js .release/tokenmaxxer.d.ts .release/tokenmaxxer-tui.d.ts .release/tokenmaxxer-cli.d.ts .release/tokenmaxxer-*.tgz
 
       - name: Verify uploaded assets before publish
         env:
@@ -103,9 +97,10 @@ jobs:
           set -euo pipefail
           gh release verify "$GITHUB_REF_NAME"
           actual="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | map(.name) | sort | join("\n")')"
-          expected="$(printf '%s\n' RELEASE.json SHA256SUMS tokenmaxxer tokenmaxxer.js tokenmaxxer-tui.js tokenmaxxer-cli.js install.sh | sort)"
+          tarball="$(printf '%s\n' .release/tokenmaxxer-*.tgz | xargs -n1 basename)"
+          expected="$(printf '%s\n' RELEASE.json SHA256SUMS install.sh tokenmaxxer tokenmaxxer.js tokenmaxxer-tui.js tokenmaxxer-cli.js tokenmaxxer.d.ts tokenmaxxer-tui.d.ts tokenmaxxer-cli.d.ts "$tarball" | sort)"
           test "$actual" = "$expected"
-          (cd .release && sha256sum -c SHA256SUMS)
+          npm run release:verify -- --dir .release --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
 
       - name: Publish verified draft
         env:

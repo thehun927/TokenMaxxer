@@ -206,6 +206,24 @@ function validateNoExistingReleaseTags() {
   return []
 }
 
+function validateWorkflowTag(tag, commit) {
+  const violations = []
+  try {
+    const target = execFileSync("git", ["rev-list", "-n1", tag], { encoding: "utf8" }).trim()
+    if (target !== commit) {
+      violations.push({ field: "commit", message: `tag ${tag} targets ${target}, expected ${commit}` })
+    }
+  } catch {
+    violations.push({ field: "tag", message: `tag ${tag} is not available in the checkout` })
+  }
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", commit, "origin/main"])
+  } catch {
+    violations.push({ field: "commit", message: "tagged commit is not reachable from origin/main" })
+  }
+  return violations
+}
+
 function main() {
   const args = process.argv.slice(2)
 
@@ -213,6 +231,7 @@ function main() {
   let tag = null
   let commit = null
   const dryRun = args.includes("--dry-run")
+  const requireMainAncestor = args.includes("--require-main-ancestor")
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
@@ -265,7 +284,9 @@ function main() {
 
   // Validate no existing release tags
   console.log("\nValidating no existing release tags...")
-  const tagViolations = validateNoExistingReleaseTags()
+  const tagViolations = requireMainAncestor
+    ? validateWorkflowTag(tag, commit)
+    : validateNoExistingReleaseTags()
   if (tagViolations.length > 0) {
     console.error("Release tag violations:")
     tagViolations.forEach((v) => console.error(`  - ${v.field}: ${v.message}`))

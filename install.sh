@@ -86,25 +86,28 @@ NODE
 }
 
 verify_checksums() {
-  local digest filename extra count=0 expected
+  local digest filename extra count=0 expected actual
   declare -A seen=()
   while IFS=' ' read -r digest filename extra || [ -n "${digest:-}" ]; do
     [ -n "${digest:-}" ] || continue
     [ -z "${extra:-}" ] || die "malformed SHA256SUMS entry"
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "malformed SHA256SUMS digest"
     case "$filename" in
-      RELEASE.json|tokenmaxxer|tokenmaxxer.js|tokenmaxxer-tui.js|tokenmaxxer-cli.js) ;;
+      install.sh|RELEASE.json|tokenmaxxer|tokenmaxxer.js|tokenmaxxer-tui.js|tokenmaxxer-cli.js|tokenmaxxer.d.ts|tokenmaxxer-tui.d.ts|tokenmaxxer-cli.d.ts|tokenmaxxer-*.tgz) ;;
       *) die "unexpected SHA256SUMS filename: $filename" ;;
     esac
     [ -z "${seen[$filename]+x}" ] || die "duplicate SHA256SUMS entry: $filename"
     seen["$filename"]=1
     count=$((count + 1))
   done < "$STAGING_DIR/SHA256SUMS"
-  [ "$count" -eq 5 ] || die "SHA256SUMS must contain exactly five entries"
+  [ "$count" -ge 5 ] || die "SHA256SUMS must contain at least the installer payload entries"
   for expected in RELEASE.json tokenmaxxer tokenmaxxer.js tokenmaxxer-tui.js tokenmaxxer-cli.js; do
     [ -n "${seen[$expected]+x}" ] || die "SHA256SUMS is missing $expected"
   done
-  (cd "$STAGING_DIR" && sha256sum -c SHA256SUMS >/dev/null) || die "SHA256SUMS verification failed"
+  for expected in RELEASE.json tokenmaxxer tokenmaxxer.js tokenmaxxer-tui.js tokenmaxxer-cli.js; do
+    actual="$(sha256sum "$STAGING_DIR/$expected" | awk '{print $1}')"
+    [ "$actual" = "${seen[$expected]}" ] || die "SHA256SUMS verification failed for $expected"
+  done
 }
 
 stage_configs() {

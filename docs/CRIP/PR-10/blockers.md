@@ -196,6 +196,51 @@ Wave 1 has not started.
   fixture-driven integrity and transaction contracts are green.
 - No real `v*` tag or GitHub Release was created or published.
 
+## Wave 8 — Deterministic release staging and verification — 2026-08-12
+
+- Added deterministic `release:stage` and fail-closed `release:verify` commands.
+  They never create or push a Git tag and never call GitHub Release APIs.
+- Final local stage/verify identity: package `0.1.0`, tag `v0.1.0`, commit
+  `45592338a3fe79435f27668d89baeeb88a21cbd4`.
+- Exact staged asset set (11 files): `RELEASE.json`, `SHA256SUMS`,
+  `install.sh`, `tokenmaxxer`, `tokenmaxxer.js`, `tokenmaxxer-tui.js`,
+  `tokenmaxxer-cli.js`, `tokenmaxxer.d.ts`, `tokenmaxxer-tui.d.ts`,
+  `tokenmaxxer-cli.d.ts`, and `tokenmaxxer-0.1.0.tgz`.
+- SHA256SUMS installer payload evidence:
+  - `RELEASE.json` — `98e0bc13853eb323fe6b109730e9de41d0e4d484dfed3a91a9406d0817050a9e`
+  - `tokenmaxxer` — `765915aa0096c5501396e9e93f91ed172bd75888ad2b3c57e39058a90e36f8f9`
+  - `tokenmaxxer-cli.js` — `01f638ea5917931689e0e2ff5bbe24be1fa1d3632008e7ae913cac088305661f`
+  - `tokenmaxxer-tui.js` — `063b71d065a914c1216de76ee725c678674091c950ac0ccf88ebcf291a3a870b`
+  - `tokenmaxxer.js` — `5661d7f3959e6d7409aee9b3d89260403eadf36d960fd886661a042fce3737ee`
+- `npm run release:dry-run` and `npm run release:verify -- --dir .release`
+  passed. Tampered payload and unexpected extra asset were independently
+  rejected, then the restored set verified successfully.
+- `npx vitest run test/release/workflow/workflow-contract.test.ts
+  test/release/workflow/release-identity.test.ts
+  test/release/installer/installer-contract.test.ts`: 69 passed.
+- `node --check` for all three release scripts, `npx tsc --noEmit`, and both
+  workflow YAML parses: passed.
+- Corrected tag-release workflow integration to consume `release:stage` and
+  `release:verify`, upload the exact 11-file staged set, and verify the remote
+  asset set before draft publication.
+- Current local release-builder deviation remains Node `v22.22.1` / npm `9.2.0`
+  versus pinned target Node `22.23.1` / npm `10.9.8`; same-toolchain hashes are
+  reproducible. No real `v*` tag or GitHub Release was created or published.
+- Final checksum policy correction: `SHA256SUMS` now covers all 10 staged
+  payloads except the manifest itself, while the installer verifies its five
+  downloaded payloads before mutation. Pre-commit staged-manifest evidence at
+  implementation head `4559233` was:
+  `RELEASE.json` `98e0bc13853eb323fe6b109730e9de41d0e4d484dfed3a91a9406d0817050a9e`;
+  `install.sh` `67f85c89b034c334a35b1567dcd6f613f4848ec84e256a5a164497f380b33a3f`;
+  `tokenmaxxer` `765915aa0096c5501396e9e93f91ed172bd75888ad2b3c57e39058a90e36f8f9`;
+  `tokenmaxxer-0.1.0.tgz` `4d0dcdbcdf4412a0f5025bba46aecac1e683e540f1b539c1ded5325c42ee9853`;
+  `tokenmaxxer-cli.d.ts` `e3785b697e3eb2e81e7e2bfdc5d704d5ad6452fd2ce111a04bcb8ed0d32ee94b`;
+  `tokenmaxxer-cli.js` `01f638ea5917931689e0e2ff5bbe24be1fa1d3632008e7ae913cac088305661f`;
+  `tokenmaxxer-tui.d.ts` `d9d1b42e84b3c870739db5c48a88afed9d1fdba91e6178ad762cd9ea80f13996`;
+  `tokenmaxxer-tui.js` `063b71d065a914c1216de76ee725c678674091c950ac0ccf88ebcf291a3a870b`;
+  `tokenmaxxer.d.ts` `363ec6aa5dfc1155a20ae1b4a9001100e9fe858b296d960a261731050ea5b32d`;
+  `tokenmaxxer.js` `5661d7f3959e6d7409aee9b3d89260403eadf36d960fd886661a042fce3737ee`.
+
 ## Wave 6 — Pinned CI and tag-only release workflow — 2026-08-12
 
 - Pinned all workflow Actions by verified full SHA with tag comments:

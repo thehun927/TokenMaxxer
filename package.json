@@ -49,7 +49,11 @@
     "verify:dist": "node scripts/verify-dist.mjs",
     "verify:package": "node scripts/verify-package.mjs",
     "verify:reproducible-build": "node scripts/verify-reproducible-build.mjs",
-    "release:preflight": "node scripts/release-preflight.mjs --tag v$npm_package_version --commit $(git rev-parse HEAD)"
+    "audit:release": "npm audit --audit-level=high && npm audit --omit=dev --audit-level=low",
+    "release:preflight": "node scripts/release-preflight.mjs --tag v$npm_package_version --commit $(git rev-parse HEAD)",
+    "release:stage": "node scripts/release-stage.mjs",
+    "release:verify": "node scripts/release-verify.mjs",
+    "release:dry-run": "npm run release:stage -- --tag v$npm_package_version --commit $(git rev-parse HEAD) --out .release && npm run release:verify -- --dir .release --tag v$npm_package_version --commit $(git rev-parse HEAD)"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.18.15 <2.0.0",
