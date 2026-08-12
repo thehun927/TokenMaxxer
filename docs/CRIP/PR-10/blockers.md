@@ -196,6 +196,24 @@ Wave 1 has not started.
   fixture-driven integrity and transaction contracts are green.
 - No real `v*` tag or GitHub Release was created or published.
 
+## Wave 9 — Luna final integration evidence — 2026-08-12
+
+- Final pushed implementation head: `f82eb39ab6c1f57c1e7242dd05b23505ae4eda3c`.
+- Final exact implementation chain passed locally, including `npm ci`, full
+  tests (75 files/1283 passed), typecheck, host contract, audit gates, build,
+  exact dist/package/reproducibility checks, CLI smoke, shell syntax, release
+  dry-run, release verification, diff-check, and empty tracked-dist proof.
+- GitHub CI run `31638994522`, job `94256443040`, exact head `f82eb39`,
+  completed successfully with 26 passed steps, 0 skipped, 0 failed.
+- Final CI repair history is recorded here: run `31638418807` found the
+  clean-checkout dist test lifecycle defect; run `31638682137` found the
+  first CI dry-run version lookup; run `31638849051` found the second final
+  contract lookup. Corrective commits `dd20469`, `a3faacc`, and `f82eb39`
+  resolved those findings; the final run is green.
+- Final staged release evidence was regenerated for `f82eb39`, and no real
+  `v*` tag or GitHub Release was created or published. Wave 9 does not issue
+  an Oracle Ship verdict or declare CRIP complete.
+
 ## Wave 8 — Deterministic release staging and verification — 2026-08-12
 
 - Added deterministic `release:stage` and fail-closed `release:verify` commands.
