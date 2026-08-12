@@ -1,20 +1,31 @@
 # CRIP PR 8 — Guaranteed Storage and Injection Budgets
 
-**Status:** **Implementation plan ready**
+**Status:** **Complete — Ship**
 
-PR 8 makes TokenMaxxer's hard resource limits part of the reliability contract rather than a final-write fallback. Durable mutation fitting moves to the canonical transaction boundary, protected state gets typed no-write failure semantics when it cannot fit, and automatic durable context receives an independent deterministic UTF-8 byte ceiling.
+PR 8 makes TokenMaxxer's hard resource limits part of the reliability contract rather than a final-write fallback. Durable mutation fitting lives at the canonical transaction boundary, protected state has typed no-write failure semantics when it cannot fit, and automatic durable context has an independent deterministic UTF-8 byte ceiling.
 
 ## Release invariant
 
 > **Every successful durable mutation is schema-valid and guaranteed writable within the 8,192-byte STATE cap at its actual committed revision, while every automatic durable-context block is sanitized, semantically prioritized, and no larger than 4,096 UTF-8 bytes; protected human authority and operation-required proof are never silently discarded to satisfy either budget.**
 
+## Final release state
+
+**Final residual implementation:** `15d3bb55b180c1db4981abb517f6bd159c68e049`  
+**CI-tested validation head:** `79d17e0258176cad83dd862cbfa1561c177e10fd`  
+**Final Oracle verdict:** **Ship** — [`oracle-second-final-rereview.md`](./oracle-second-final-rereview.md)  
+**GitHub Actions:** run `31567759880` — 998 passed + 1 expected skip; full release chain green.
+
+The CI-tested head differs from the residual implementation only by an append-only `blockers.md` verification entry; no production or test code changed.
+
 ## Canonical artifacts
 
 - [`implementation-plan.md`](./implementation-plan.md) — concrete eight-wave plan, central transaction-budget design, typed irreducible failures, field/migration compatibility policy, 4KB injection selection algorithm, Luna/subagent orchestration rules, 80-case semantic release matrix, and Oracle attack surface.
-- `blockers.md` — append-only implementation blocker/decision log once implementation begins.
-- `oracle-investigation.md` — Luna's implementation handoff after all waves and exact-head verification.
-- `oracle-findings.md` — independent Oracle release-gate review.
-- `oracle-rereview.md`, `oracle-final-rereview.md`, etc. — focused remediation reviews if required.
+- [`blockers.md`](./blockers.md) — append-only implementation/remediation log.
+- [`oracle-investigation.md`](./oracle-investigation.md) — initial implementation handoff.
+- [`oracle-findings.md`](./oracle-findings.md) — initial independent Oracle **Block** report.
+- [`oracle-rereview.md`](./oracle-rereview.md) — first remediation handoff.
+- [`oracle-final-rereview.md`](./oracle-final-rereview.md) — focused Oracle re-review that found the final storage-policy/CI residuals.
+- [`oracle-second-final-rereview.md`](./oracle-second-final-rereview.md) — final independent Oracle **Ship** verdict.
 
 ## Baselines
 
@@ -23,7 +34,7 @@ PR 8 makes TokenMaxxer's hard resource limits part of the reliability contract r
 **PR 7 validation baseline:** `383d0190dc3fc43fbdc27d34b4065660222dbc1e`  
 **Implementation-plan commit:** `49028e58cbbcee6bd191e1f31b373661692ae363`
 
-PRs 1–7 are complete and cleared to Ship.
+PRs 1–8 are complete and cleared to Ship.
 
 ## Hard budgets
 
@@ -40,31 +51,22 @@ durable retention != automatic compaction injection
 
 A retained fact may be omitted from one automatic compaction block and remain available through pull-based recall.
 
-## Core implementation decisions
+## Shipped implementation decisions
 
-1. Keep `commitMemoryExact()` as the final 8KB defense, but replace weak writer-specific pruning with a typed `fitMemoryToBudget()` contract.
+1. Keep `commitMemoryExact()` as the final 8KB defense, with typed `fitMemoryToBudget()` as the canonical policy.
 2. Perform automatic fitting inside `mutateMemory()` **after** calculating the next revision, so revision digit growth is included in the budget.
 3. Return typed `budget-rejected` transaction results with no write and no revision bump.
 4. Protect PR-3 human foundational authority and transient operation-required proof such as a new PR-5 processed-source key or pending audit guard.
 5. Use tighter creation bounds for new automatic facts plus broader persistence compatibility ceilings for existing current-v3 STATE.
 6. Never silently truncate existing human-reviewed foundational topic/decision text merely to meet new automatic creation limits.
 7. Make `buildDurableBlock()` select sanitized render candidates in semantic priority order under a hard 4KB total budget including delimiters/newlines/prefixes.
-8. Use `[llm:eN]` with actual retained evidence count rather than a render ordinal while touching the compact renderer.
+8. Use `[llm:eN]` with actual retained evidence count rather than a render ordinal.
+9. Under real byte pressure, evict disposable metadata and ephemeral state incrementally before refusing a protected mutation.
+10. Generate HEADER from the actual committed fitted STATE, never from a pre-fit callback candidate.
 
-## Eight implementation waves
+## Scope boundaries preserved
 
-1. freeze storage/schema/injection contracts with failing tests;
-2. implement shared UTF-8/storage budget primitives and typed fitting;
-3. add schema bounds and current-v3 compatibility repair;
-4. make `mutateMemory()` the canonical automatic budget boundary;
-5. migrate writer, recall, and human CLI mutation paths;
-6. implement the 4KB deterministic durable-injection budget;
-7. run pressure/concurrency integration and repository-wide seam audit;
-8. run the full release chain and publish `oracle-investigation.md`, then stop for independent Oracle.
-
-## Important scope boundaries
-
-PR 8 does **not**:
+PR 8 did **not**:
 
 - persist per-project compaction/status diagnostics — PR 9;
 - replace process-global compaction timestamps — PR 9;
