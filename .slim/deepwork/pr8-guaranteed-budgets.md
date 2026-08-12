@@ -57,6 +57,8 @@ Wave 5 mutation callers and retry/public-outcome semantics are complete in
 independent durable-injection selection and 4,096-byte rendering are complete
 in `088fe28` with 78 focused contracts, 214 compaction tests, and a passing
 TypeScript check. Wave 7 pressure/concurrency integration and repository audit
-are now active. The
+completed in `abcbce9`, with 951/951 repository tests green after fixture
+reconciliation. Wave 8 release evidence and the evidence-only Oracle handoff
+are complete in `docs/CRIP/PR-8/oracle-investigation.md`. The
 unrelated `opencode.json` modification and untracked `.opencode/` state remain
 outside PR-8 ownership.

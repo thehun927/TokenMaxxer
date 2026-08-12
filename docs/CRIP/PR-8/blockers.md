@@ -101,3 +101,11 @@ pull PR-9 diagnostics/status or PR-10 release/dependency work into this PR.
 - Repository seam audit (src-only) found zero production `pruneOld()`/`pruneOldForCommit()` callers, all mutation callers routed through central fitting, read-only durable rendering, preserved PR-7 sanitization/augment-replace, and no PR-9/PR-10 scope leakage. Low-severity latent concerns remain: exported dead `pruneOldForCommit()` can return over-cap state if future callers misuse it, and direct commit failure reasons collapse to generic `commit-failed`; neither is an active production path.
 - Decision: do not expand Wave 7 into PR-9 diagnostics, PR-10 dependency cleanup, or unrelated dead-seam refactoring. Preserve concerns for the independent Oracle attack surface.
 - Wave 7 is complete. Wave 8 is now active: exact final release chain and evidence-only Oracle handoff.
+
+## 2026-08-12 — Wave 8 release chain and handoff
+
+- Exact implementation SHA: `abcbce9ae30e4c55b47261cee7971173023cfb79`.
+- Local release chain passed on that SHA: `npm test` (51 files / 951 tests), `npx tsc --noEmit`, `npm run verify:host-contract`, `npm run build`, `npm run verify-cli-bundle`, `npm run smoke:cli` (checks 46–49), `bash -n install.sh`, `bash -n bin/tokenmaxxer`, and `git diff --check`.
+- Build-generated tracked `dist/index.js` and `dist/tui.js` were restored after verification; the production/test tree remains exactly the implementation SHA.
+- No GitHub CI run/job exists for the exact SHA because it is local and unpushed. The latest observed CI run is explicitly recorded as non-evidence in `oracle-investigation.md`.
+- `docs/CRIP/PR-8/oracle-investigation.md` is complete as evidence-only handoff. No Oracle findings, Ship verdict, or PR-9 advancement is issued by this implementation lane.
