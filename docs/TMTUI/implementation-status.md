@@ -57,7 +57,7 @@
 - `bash -n install.sh`, `bash -n bin/tokenmaxxer`, and `git diff --check`: passed.
 - Focused pre-PR8 commit-pulse suite: 17 tests passed (invalid markers return `null` without deletion; reader is non-destructive; fresh marker survives a stale read).
 - Focused post-PR8 suites: 66 tests passed — `store-commit-pulse.test.ts` (10), `tmtui3-pulse-store.test.ts` (19), `tmtui3-pulse-writer.test.ts` (7), `commit-pulse.test.ts` (17), and `transaction.test.ts` (13). Coverage includes local/global success, telemetry isolation, non-committed outcomes, exact-once behavior, writer integration, transaction semantics, and legacy activity absence.
-- CI provisions Bun `1.3.14` explicitly and runs `check:tui-bundle` as a named step. The final-head CI run is recorded below after push.
+- CI provisions Bun `1.3.14` explicitly and runs `check:tui-bundle` as a named step. Final-head GitHub Actions run `31600259715` passed on `7f72152`.
 - No component-level TUI test was added: the repository has no OpenTUI mount/render harness or existing `test/tui` fixture, and the bounded test lane could not exercise the slot without production refactoring. The source-level contract remains verified by typecheck, the reactive bundle gate, and manual code review; component behavior remains a manual OpenCode acceptance item.
 
 ## Final validation and acceptance
