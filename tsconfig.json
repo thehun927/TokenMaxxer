@@ -10,6 +10,7 @@
     "skipLibCheck": true,
     "outDir": "./dist",
     "declaration": true,
+    "declarationDir": "./dist",
     "sourceMap": true,
     "lib": ["ES2022"],
     "types": ["node"],
@@ -18,5 +19,5 @@
     "verbatimModuleSyntax": false
   },
   "include": ["src"],
-  "exclude": ["dist", "test", "node_modules"]
+  "exclude": ["dist", "test", "node_modules", "src/memory", "src/util"]
 }

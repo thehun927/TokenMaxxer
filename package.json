@@ -34,7 +34,7 @@
     }
   },
   "scripts": {
-    "build": "rm -rf dist && npm run build:tui && npm run build:tui-decl && tsup src/index.ts --format esm --dts --no-splitting --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opentui/solid --external @opentui/core --external @opentui/keymap --external zod && tsup src/cli.ts --format esm --target node18 --out-dir dist --dts --no-splitting && npm run check:tui-bundle && npm run check-cli-bundle",
+    "build": "rm -rf dist && npm run build:tui && npm run build:tui-decl && tsup src/index.ts --format esm --dts --no-splitting --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opentui/solid --external @opentui/core --external @opentui/keymap --external zod && tsup src/cli.ts --format esm --target node18 --out-dir dist --dts --no-splitting && npm run check:tui-bundle && npm run check-cli-bundle && rm -rf dist/memory dist/util",
     "build:tui": "bun run scripts/build-tui.ts",
     "build:tui-decl": "tsc --emitDeclarationOnly --declaration --outDir dist --project tsconfig.tui-decl.json",
     "check:tui-bundle": "node scripts/check-tui-bundle.mjs",
@@ -45,7 +45,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck:host-contract": "tsc -p tsconfig.host-contract.json --noEmit",
-    "verify:host-contract": "node scripts/verify-host-contract.mjs && npm run typecheck:host-contract"
+    "verify:host-contract": "node scripts/verify-host-contract.mjs && npm run typecheck:host-contract",
+    "verify:dist": "node scripts/verify-dist.mjs",
+    "verify:package": "node scripts/verify-package.mjs",
+    "verify:reproducible-build": "node scripts/verify-reproducible-build.mjs"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.18.15 <2.0.0",
