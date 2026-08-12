@@ -31,6 +31,19 @@ deviations, and unresolved blockers.
   and accurate file-activity classification/stale-reason replacement (11).
 - `npx tsc --noEmit`: passed with no output.
 - `git diff --check`: passed.
+
+## 2026-08-12 — Wave 5 integrated validation
+
+- Hardened best-effort terminal/model-health persistence in
+  `src/memory/writer.ts`: unexpected throws are caught, warnings are bounded
+  to 500 characters, and required audit-guard failure remains fail-closed.
+- Luna rerun: `npx vitest run test/memory/pr9-persistence-warning.test.ts` —
+  1 file, 15/15 passed.
+- Luna rerun:
+  `npx vitest run test/memory/writer.test.ts test/memory/writer-llm.test.ts test/memory/writer-nongit.test.ts test/memory/writer-header.test.ts test/memory/transaction.test.ts test/memory/tmtui3-pulse-writer.test.ts`
+  — 6 files, 133/133 passed.
+- `npx tsc --noEmit`: passed with no output.
+- `git diff --check`: passed. No TUI or commit-pulse source changes.
 - Test-only repair deviations resolved before this validation: missing status
   filesystem imports and non-unique mocked project hashes in the Agent 1A
   tests.

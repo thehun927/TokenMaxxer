@@ -86,10 +86,21 @@ function finishIdleOutcome(project: string, outcome: IdleWriteOutcome): IdleWrit
   return outcome
 }
 
-function boundedDiagnosticValue(value: string): string {
-  return value.length <= MAX_DIAGNOSTIC_VALUE
+function boundedDiagnosticValue(value: string, maxChars = MAX_DIAGNOSTIC_VALUE): string {
+  return value.length <= maxChars
     ? value
-    : `${value.slice(0, MAX_DIAGNOSTIC_VALUE - 3)}...`
+    : `${value.slice(0, maxChars - 3)}...`
+}
+
+function boundedDiagnosticError(error: unknown, maxChars = 500): string {
+  const text = (() => {
+    try {
+      return String(error)
+    } catch {
+      return "[unknown error]"
+    }
+  })()
+  return boundedDiagnosticValue(text, maxChars)
 }
 
 /** Emit only bounded, non-secret extraction diagnostics through the v1 client. */
@@ -123,7 +134,7 @@ async function writeHeaderBestEffort(
   try {
     await writerModule.generateHeader(worktree, directory, mem)
   } catch (error) {
-    void log(client, "warn", "header generation failed", { error: String(error) })
+    void log(client, "warn", "header generation failed", { error: boundedDiagnosticError(error) })
   }
 }
 
@@ -913,7 +924,7 @@ export async function persistAuditGuardResult(
   } catch (error) {
     void log(opts.client, "warn", "audit guard transaction threw", {
       project,
-      error: String(error),
+      error: boundedDiagnosticError(error),
     })
     return { status: "failed", reason: "unexpected" }
   }
@@ -966,22 +977,31 @@ export async function persistTerminalTransaction(
   outcome: Exclude<AuditTerminalOutcome, "pending">,
 ): Promise<void> {
   const project = resolveProjectPath(opts.worktree, opts.directory)
-  const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
-    { worktree: opts.worktree, directory: opts.directory, client: opts.client },
-    (base) => {
-      const audits = base.llm_extraction_audits ?? []
-      if (!audits.some((a) => a.audit_session_id === auditSessionID)) {
-        // Audit row no longer exists; return noop rather than bumping revision.
-        return { kind: "noop", value: { outcome: "noop" } }
-      }
-      const updated = setAuditTerminalOutcome(base, auditSessionID, outcome)
-      // Return unpruned updated candidate with same audit ID protection
-      const budgetProtection: MemoryBudgetProtection = {
-        preserveAuditSessionIDs: [auditSessionID],
-      }
-      return { kind: "commit", memory: updated, value: { outcome: "committed" }, budgetProtection }
-    },
-  )
+  let result: MemoryMutationResult<{ outcome: "committed" | "noop" }>
+  try {
+    result = await mutateMemory<{ outcome: "committed" | "noop" }>(
+      { worktree: opts.worktree, directory: opts.directory, client: opts.client },
+      (base) => {
+        const audits = base.llm_extraction_audits ?? []
+        if (!audits.some((a) => a.audit_session_id === auditSessionID)) {
+          // Audit row no longer exists; return noop rather than bumping revision.
+          return { kind: "noop", value: { outcome: "noop" } }
+        }
+        const updated = setAuditTerminalOutcome(base, auditSessionID, outcome)
+        // Return unpruned updated candidate with same audit ID protection
+        const budgetProtection: MemoryBudgetProtection = {
+          preserveAuditSessionIDs: [auditSessionID],
+        }
+        return { kind: "commit", memory: updated, value: { outcome: "committed" }, budgetProtection }
+      },
+    )
+  } catch (error) {
+    void log(opts.client, "warn", "audit terminal transaction threw", {
+      project,
+      error: boundedDiagnosticError(error),
+    })
+    return
+  }
   if (result.status === "noop") return
   if (result.status === "lock-timeout") {
     void log(opts.client, "warn", "audit terminal transaction lock-timeout", { project })
@@ -1017,14 +1037,23 @@ export async function persistModelHealth(
   report: LLMHealthOutcomeReport,
 ): Promise<void> {
   const project = resolveProjectPath(opts.worktree, opts.directory)
-  const result = await mutateMemory<{ outcome: "committed" | "noop" }>(
-    { worktree: opts.worktree, directory: opts.directory, client: opts.client },
-    (base) => {
-      const updated = upsertModelHealth(base, report)
-      // Model health may remain best-effort and unprotected; no pruneOld call
-      return { kind: "commit", memory: updated, value: { outcome: "committed" } }
-    },
-  )
+  let result: MemoryMutationResult<{ outcome: "committed" | "noop" }>
+  try {
+    result = await mutateMemory<{ outcome: "committed" | "noop" }>(
+      { worktree: opts.worktree, directory: opts.directory, client: opts.client },
+      (base) => {
+        const updated = upsertModelHealth(base, report)
+        // Model health may remain best-effort and unprotected; no pruneOld call
+        return { kind: "commit", memory: updated, value: { outcome: "committed" } }
+      },
+    )
+  } catch (error) {
+    void log(opts.client, "warn", "model health transaction threw", {
+      project,
+      error: boundedDiagnosticError(error),
+    })
+    return
+  }
   if (result.status === "lock-timeout") {
     void log(opts.client, "warn", "model health transaction lock-timeout", { project })
     return
