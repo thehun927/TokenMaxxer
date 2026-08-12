@@ -18,7 +18,7 @@ This directory is the canonical home for TokenMaxxer's **Concrete Reliability Im
 | PR 5 | Source idempotency and truthful outcomes | **Complete — Ship** | [`PR-5/`](./PR-5/) |
 | PR 6 | Complete LLM trust boundary | **Complete — Ship** | [`PR-6/`](./PR-6/) |
 | PR 7 | Compaction quality and anti-drift | **Complete — Ship** | [`PR-7/`](./PR-7/) |
-| PR 8 | Guaranteed storage and injection budgets | **Next** | `PR-8/` |
+| PR 8 | Guaranteed storage and injection budgets | **Implementation plan ready** | [`PR-8/`](./PR-8/) |
 | PR 9 | Accurate diagnostics and artifact storage | Planned | `PR-9/` |
 | PR 10 | Reproducible release and dependency hygiene | Planned | `PR-10/` |
 
