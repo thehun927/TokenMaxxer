@@ -1,133 +1,592 @@
 <div align="center">
 
-# tokenmaxxer
+# TokenMaxxer
 
-**Session longevity & cross-session memory for [opencode](https://opencode.ai)**
+### Durable memory + compaction continuity for [OpenCode](https://opencode.ai)
 
-Never lose context to compaction again.
+**Your coding agent should remember what it already learned.**
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)]()
+[![Release](https://img.shields.io/github/v/release/thehun927/TokenMaxxer?label=release)](https://github.com/thehun927/TokenMaxxer/releases/latest)
+[![CI](https://github.com/thehun927/TokenMaxxer/actions/workflows/ci.yml/badge.svg)](https://github.com/thehun927/TokenMaxxer/actions/workflows/ci.yml)
+[![OpenCode](https://img.shields.io/badge/OpenCode-%3E%3D1.18.15%20%3C2.0.0-7c3aed)](https://opencode.ai)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Tools](#memory-tools) · [TIPS](#tips) · [Reliability](#reliability) · [Development](#development)
 
 </div>
 
 ---
 
-## The problem
+TokenMaxxer is an OpenCode plugin built for the point where AI coding sessions usually start to fall apart: **long-running work, context compaction, and coming back to a project later**.
 
-opencode is an AI coding agent that works in long sessions. When the context window fills up, opencode **compacts** — it asks the model to generate a summary that replaces the entire conversation. The agent then continues from that summary.
+It keeps a small, structured, per-project memory of the things that actually matter — the current task, active files, decisions, blockers, and next steps — then makes that state available to compaction and explicit recall tools.
 
-This causes two problems:
+**No database. No daemon. No automatic memory dump into the composer.** Just bounded durable state, explicit recall, safer compaction, and a tiny TUI signal when memory is actually committed.
 
-1. **Post-compaction quality drop.** The model's summary is unstructured. It often loses track of which files matter, what decisions were locked in, what was already tried and rejected. The agent resumes work confused — re-reading files it already explored, re-litigating decisions that were settled, repeating approaches that failed.
+## Why TokenMaxxer exists
 
-2. **No cross-session memory.** When you start a new session, the agent starts from scratch. It doesn't know what you were working on yesterday, which files matter, or what decisions were made in prior sessions. You have to re-explain everything.
+OpenCode can work for a long time, but context is still finite. When a session is compacted, a huge conversation gets reduced to a summary. When a new session starts, the model does not automatically know what happened yesterday.
 
-## The solution
+That creates familiar failure modes:
 
-tokenmaxxer is an opencode plugin that solves both problems in two layers:
-
-### Layer 1 — Compaction-quality hook
-
-When compaction fires, tokenmaxxer intercepts it (`experimental.session.compacting` hook) and augments the native compaction prompt with a **schema-constrained** one. The model is forced to produce a structured summary with exactly these sections:
-
-| Section | What it captures |
+| Without durable project memory | With TokenMaxxer |
 |---|---|
-| **Current task** | What we're doing and why |
-| **Active files** | Which files matter and why |
-| **Locked decisions** | Settled decisions that should NOT be relitigated |
-| **Open questions** | Unresolved decisions still in play |
-| **Blockers** | What's blocking progress |
-| **Next steps** | The concrete next 1-3 actions |
-| **What NOT to redo** | Approaches already tried and rejected |
+| Compaction drops an important decision | Durable decisions remain available to compaction and recall |
+| The agent re-reads files it already explored | Active-file memory tells it where the work is |
+| Settled architecture gets re-litigated | Decision authority preserves what is actually current |
+| Failed approaches get repeated | Structured context can carry blockers and prior direction forward |
+| A new session starts cold | `get_project_state` can restore the project thread immediately |
+| “Memory wrote” is hard to verify | The TUI pulses only after a real durable STATE commit |
 
-The model also receives a **durable context block** — recorded observations from prior sessions (current task, active files, valid decisions, blockers, next steps). The model is instructed to treat these as useful but potentially stale, and to verify against the conversation if they conflict.
+TokenMaxxer is not trying to make the model remember everything. **It is trying to preserve the right things.**
 
-**The result:** after compaction, the agent knows exactly what it was doing, which files it was working on, what decisions were locked in, and what to do next — without re-reading a single file.
+## What you get
 
-### Layer 2 — Per-project durable memory
+| | Feature | What it means |
+|---|---|---|
+| 🧠 | **Durable project memory** | Structured state survives across sessions and compactions. |
+| 🗜️ | **Compaction continuity** | Default augment mode preserves OpenCode's native compaction behavior while adding durable project context. |
+| 🔒 | **Human decision authority** | Important decisions can be promoted to foundational status only through an explicit interactive CLI review. |
+| 🧰 | **7 memory/efficiency tools** | The agent can recall state, query decisions, inspect active files, preview compaction, and check health on demand. |
+| 🟢 | **Commit-backed TUI indicator** | `memory  ·` pulses only when a durable STATE write really commits. |
+| 🧪 | **Optional structured LLM extraction** | Use a connected small model for stricter extraction, with validation, provenance, audit records, and heuristic fallback. |
+| 📦 | **Verified release installer** | Release identity and SHA-256 payloads are verified before installation; writes are transactional with rollback. |
+| 🛡️ | **Reliability-first internals** | Atomic writes, cross-process locking, bounded storage, corrupt-state recovery, authoritative reads, diagnostics, and fail-safe fallbacks. |
 
-On `session.idle` (when the agent finishes responding), tokenmaxxer:
+---
 
-1. Pulls the full session transcript through the host `PluginInput` v1 client
-   transport.
-2. Extracts structured facts using heuristics — current task, active files (from tool calls), decisions (from natural language), blockers, next steps.
-3. Merges with existing memory, superseding old decisions on the same topic.
-4. Prunes to stay under 8KB.
-5. Writes `STATE.json` silently.
+## Quick start
 
-Memory remains available through pull-based tools; tokenmaxxer does not automatically add project memory or current-task text to a new session:
+### Requirements
 
-```
-Session 1: "Let's use Postgres for the database"
-  → session.idle → STATE.json: { decisions: [{ topic: "postgres", ... }] }
+- OpenCode `>=1.18.15 <2.0.0`
+- Node.js 18+
+- Bash
+- `curl` or `wget`
+- `sha256sum` or `shasum -a 256`
 
-Session 2 (new): model calls get_project_state
-  → "You have a prior decision: use Postgres (SHA abc1234, 2026-08-08)"
-```
-
-### Generated single-file distribution
-
-The repository generates the built server and TUI artifacts in `dist/`. The build
-uses `--no-splitting`, so `dist/index.js` and `dist/tui.js` are each a
-self-contained target with no generated chunk files to copy alongside it.
-They retain imports only for host/runtime packages supplied by OpenCode or the
-installation's configured dependencies.
-
-### Silent server target and separate TUI target
-
-The server target (`dist/index.js`) is silent: memory work never writes text to
-the composer. Automatic text injection was removed so user-derived or
-truncated current-task text cannot surface as a composer message. Memory is
-accessed through explicit tools and the compaction flow instead.
-
-The separate TUI target (`dist/tui.js`) renders only the right-side `memory`
-indicator as a non-composer status surface. It never renders composer text and
-is not required for server memory, extraction, or the core plugin.
-
-### LLM extraction status
-
-The opt-in structured extraction path is shipped and has been verified end to
-end in this environment. A connected `ollama-cloud/gpt-oss:20b` returned
-`StructuredOutput`; tokenmaxxer Zod-validated and merged the facts, persisted
-an `llm_extraction_cache` entry in `STATE.json`, and retained an audit session
-titled `tokenmaxxer extract · …`.
-
-## Install
-
-### One-liner (global — recommended)
+### Install globally
 
 ```bash
 curl -fsSL https://github.com/thehun927/TokenMaxxer/releases/latest/download/install.sh | bash
 ```
 
-Restart opencode after installation. Both server layers are then active in all
-projects — no per-project config required.
+Then restart OpenCode.
 
-The one-liner downloads the immutable GitHub Release assets `tokenmaxxer.js`,
-`tokenmaxxer-tui.js`, `tokenmaxxer-cli.js`, and `tokenmaxxer` directly; it does
-not require a local build or model configuration for installation.
+The installer downloads assets from one exact immutable release, validates the release manifest, verifies SHA-256 checksums, stages the changes, and only then commits them. If a destination update fails mid-install, it rolls back the files it already changed.
 
-- **Layer 1** (compaction hook) fires on every `/compact`
-- **Layer 2** (memory + tools) silently writes `STATE.json` on session idle; it does not write to the composer
-- **7 custom tools** are registered and available to the agent in every session
+It installs:
 
-### Manual install from generated artifacts
+- the TokenMaxxer server plugin
+- the separate TUI plugin
+- the TokenMaxxer CLI bundle
+- the `tokenmaxxer` launcher in `~/.local/bin`
+- a local release receipt used by `tokenmaxxer version`
+
+It also preserves existing OpenCode configuration while adding the TokenMaxxer TUI entry and required runtime dependency ranges when those config files already exist.
+
+### Verify the install
+
+```bash
+tokenmaxxer version
+```
+
+If `~/.local/bin` is not on your `PATH`:
+
+```bash
+~/.local/bin/tokenmaxxer version
+```
+
+### Run OpenCode normally
+
+```bash
+opencode
+```
+
+This uses TokenMaxxer's default **heuristic memory extraction**. No model configuration is required for TokenMaxxer itself.
+
+### Run with structured LLM extraction enabled
+
+```bash
+tokenmaxxer opencode [args...]
+```
+
+The launcher starts OpenCode with `TOKENMAXXER_LLM_EXTRACT=1` for that child process. You still need a usable small model configured through OpenCode; TokenMaxxer does not provide credentials, entitlement, or model access.
+
+---
+
+## How it works
+
+```text
+                         ┌──────────────────────┐
+                         │   OpenCode session   │
+                         └──────────┬───────────┘
+                                    │
+                    ┌───────────────┴────────────────┐
+                    │                                │
+              session.idle                 context compaction
+                    │                                │
+                    ▼                                ▼
+          ┌───────────────────┐           ┌─────────────────────┐
+          │ Extract useful    │           │ Read durable state  │
+          │ project facts     │           │ + prior summary     │
+          └─────────┬─────────┘           └──────────┬──────────┘
+                    │                                │
+                    ▼                                ▼
+          ┌───────────────────┐           ┌─────────────────────┐
+          │ Merge + authority │           │ Augment native      │
+          │ + 8 KiB budget    │           │ compaction by       │
+          └─────────┬─────────┘           │ default             │
+                    │                     └──────────┬──────────┘
+                    ▼                                │
+          ┌───────────────────┐                      │
+          │ Atomic STATE      │                      │
+          │ transaction       │                      │
+          └─────────┬─────────┘                      │
+                    │                                │
+             successful commit                       │
+                    │                                │
+                    ▼                                ▼
+          ┌───────────────────┐           ┌─────────────────────┐
+          │ memory  ● → • → · │           │ Better continuity   │
+          │ TUI commit pulse  │           │ after compaction    │
+          └───────────────────┘           └─────────────────────┘
+
+        New session ──► get_project_state / recall_decision / get_active_files
+```
+
+### Layer 1 — Compaction continuity
+
+TokenMaxxer hooks OpenCode's `experimental.session.compacting` event.
+
+#### Default: augment mode
+
+The default is deliberately conservative:
+
+```text
+OpenCode native compaction prompt
+              +
+TokenMaxxer durable project context
+```
+
+TokenMaxxer leaves OpenCode's native prompt in control and appends bounded project memory. This gives compaction extra continuity without taking over the host's default compaction strategy.
+
+#### Optional: replace mode
+
+If you want TokenMaxxer's schema-constrained compaction prompt instead:
+
+```bash
+TOKENMAXXER_COMPACTION_MODE=replace opencode
+```
+
+Replace mode asks for a structured handoff containing:
+
+- **Current task**
+- **Active files**
+- **Locked decisions**
+- **Open questions**
+- **Blockers**
+- **Next steps**
+- **What NOT to redo**
+
+When available, the previous compaction summary is sanitized and used as another continuity anchor. If the history needed for replacement cannot be read safely, TokenMaxxer falls back to augment mode rather than forcing a weaker replacement.
+
+Legacy compatibility remains available:
+
+```bash
+TOKENMAXXER_NO_PROMPT=1   # augment
+TOKENMAXXER_NO_PROMPT=0   # replace
+```
+
+`TOKENMAXXER_COMPACTION_MODE` takes precedence when set. Invalid values fail safely to `augment`.
+
+### Layer 2 — Durable project memory
+
+On `session.idle`, TokenMaxxer reads the session transcript through OpenCode's host client and extracts a bounded project handoff:
+
+- current task
+- active files and why they matter
+- decisions and decision lineage
+- blockers
+- next steps
+- provenance for durable facts
+- bounded source/audit metadata
+
+That state is merged under a cross-process project transaction and constrained to an exact **8 KiB UTF-8 STATE budget**.
+
+TokenMaxxer prefers project-local storage:
+
+```text
+<project>/.opencode/memory/STATE.json
+```
+
+If the project path cannot be written, it can fall back to the project's hashed global namespace:
+
+```text
+~/.config/opencode/memory/<project-hash>/STATE.json
+```
+
+When both candidates exist, TokenMaxxer performs an authoritative read and deterministically chooses the current state using revision first, then mtime, then a project-local tie-break. An unreadable state is not silently treated as an empty state.
+
+### Memory is pull-based on purpose
+
+TokenMaxxer **does not automatically paste project memory into a new composer session**.
+
+Instead, the agent can pull exactly what it needs with TokenMaxxer's tools. This keeps memory useful without turning every new session into another hidden prompt payload.
+
+A simple resumed workflow looks like this:
+
+```text
+Session 1
+  "Use Postgres for persistence."
+       ↓
+  session.idle
+       ↓
+  durable decision written
+
+Session 2
+  get_project_state
+       ↓
+  "Prior project decision: use Postgres ..."
+```
+
+---
+
+## Memory tools
+
+TokenMaxxer registers **7 custom tools** in every OpenCode session:
+
+| Tool | Use it when... | What it gives the agent |
+|---|---|---|
+| `get_project_state` | Resuming work | Current task, active files, authoritative decisions, blockers, and next steps |
+| `recall_decision` | A previous architectural/product decision matters | Matching current decisions, or recent decisions when no topic is supplied |
+| `get_active_files` | The agent needs to re-orient in the codebase | Files currently associated with the work and why they matter |
+| `recall_promote` | A decision should become durable foundational guidance | A **request for human review** — not an automatic promotion |
+| `preview_compaction` | Context is getting large | A preview of what TokenMaxxer would contribute to compaction |
+| `head_files` | Exploring large files | Cheap first-N-line inspection instead of pulling whole files into context |
+| `tokenmaxxer_status` | Debugging or verifying health | Memory source/path, size, revision/decision state, write status, and compaction diagnostics |
+
+### Foundational decisions require a human
+
+An AI-generated decision cannot silently declare itself permanent.
+
+The flow is intentionally explicit:
+
+```text
+Agent calls recall_promote
+        ↓
+Decision is marked as requesting review
+        ↓
+Human inspects it with the CLI
+        ↓
+Human types the exact decision ID in an interactive TTY
+        ↓
+Decision becomes human-reviewed foundational authority
+```
+
+Useful commands:
+
+```bash
+# Show current authoritative decisions
+tokenmaxxer decisions
+
+# Include historical/non-authoritative details and conflicts
+tokenmaxxer decisions --all
+
+# Human-review a requested decision and promote it
+tokenmaxxer promote <decision-id>
+
+# Explicitly replace one human authority with another candidate
+tokenmaxxer supersede <candidate-id> --replaces <authority-id>
+```
+
+Use `--project <path>` when running the CLI outside the project directory.
+
+Promotion and supersession require a real interactive terminal. There is no `--yes` bypass.
+
+---
+
+## TUI indicator
+
+The optional TUI plugin adds a deliberately tiny status surface to the right side of the composer:
+
+```text
+memory  ·
+```
+
+It is **not** a generic activity light.
+
+A successful durable STATE commit creates a tiny commit marker. The TUI detects a fresh marker and plays one finite theme-native pulse:
+
+```text
+memory  ●  →  memory  •  →  memory  ·
+```
+
+So if a session goes idle but there was no new durable memory commit, the indicator stays quiet. That is expected behavior — the pulse means **"STATE committed"**, not merely **"TokenMaxxer ran."**
+
+The pulse marker contains only a timestamp and never contains transcript, prompt, or memory content.
+
+---
+
+## Optional LLM extraction
+
+Heuristic extraction is the default and permanent fallback. LLM extraction is opt-in:
+
+```bash
+TOKENMAXXER_LLM_EXTRACT=1 opencode
+```
+
+or:
+
+```bash
+tokenmaxxer opencode
+```
+
+### Model selection
+
+TokenMaxxer uses OpenCode's own provider/model inventory.
+
+1. A valid top-level `small_model` value such as `provider/model` is treated as an explicit override.
+2. Without an override, TokenMaxxer considers connected, active, zero-cost, tool-callable models and prefers candidates that expose a `none` reasoning variant.
+3. Automatic discovery does not silently substitute a paid model.
+4. If the selected model is unavailable, unauthenticated, incompatible, or returns invalid structured output, TokenMaxxer falls back to heuristics.
+
+List OpenCode's model inventory:
+
+```bash
+opencode models
+```
+
+Configure one exact model in OpenCode if desired:
+
+```jsonc
+{
+  "small_model": "provider/model"
+}
+```
+
+A model appearing in inventory does **not** guarantee that it is authenticated or entitled. If needed:
+
+```bash
+opencode auth login
+opencode auth list
+```
+
+### Why the LLM path is not blindly trusted
+
+Structured extraction is validated before it can merge into durable memory. Durable LLM decisions carry bounded provenance and evidence references, and successful extraction retains an audit session. If the model violates the structured-result contract, the result is rejected and heuristics remain available.
+
+LLM extraction also does not grant human authority. **Human-reviewed foundational state still requires the interactive CLI boundary.**
+
+---
+
+## TIPS
+
+A few habits make TokenMaxxer dramatically more useful:
+
+### 1. Tell the agent to restore state when you resume
+
+TokenMaxxer is pull-based, so a great first prompt in a resumed session is:
+
+```text
+Call get_project_state first, then continue from the existing project state.
+```
+
+That gives the agent a fast orientation pass without asking it to rediscover the project from scratch.
+
+### 2. Turn on OpenCode pruning
+
+Old tool output is usually the fattest part of a long context. TokenMaxxer works without pruning, but this is a strong companion configuration:
+
+```jsonc
+{
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "reserved": 25000
+  },
+  "watcher": {
+    "ignore": [
+      ".opencode/memory/**",
+      ".opencode/.tokenmaxxer-memory-activity"
+    ]
+  }
+}
+```
+
+`prune: true` removes old tool output before it becomes expensive baggage, while the memory layer preserves the durable project facts that actually need to survive.
+
+### 3. Promote architecture, not trivia
+
+Use `recall_promote` for decisions that should remain stable across many sessions — database choice, public API shape, security boundaries, migration strategy, invariants — not every local implementation detail.
+
+Foundational memory is most valuable when it is scarce and intentional.
+
+### 4. Use `recall_decision` before re-litigating something expensive
+
+Before changing auth, persistence, deployment, schema design, or another architectural choice, have the agent query prior decisions. It is much cheaper to discover *"we already decided this and here is why"* than to repeat the entire investigation.
+
+### 5. Use `head_files` for reconnaissance
+
+When the agent only needs imports, top-level declarations, or a quick shape check, `head_files` avoids spending context on thousands of irrelevant lines.
+
+### 6. Treat the TUI pulse literally
+
+No green pulse after `session.idle` does **not** automatically mean the plugin is broken. The indicator only pulses after the canonical durable commit boundary. If nothing changed, a quiet dot is correct.
+
+For actual health information, use:
+
+```text
+tokenmaxxer_status
+```
+
+### 7. Keep project memory out of Git
+
+Add this to project `.gitignore`:
+
+```gitignore
+.opencode/memory/STATE.json
+.opencode/memory/last_compaction_prompt.log
+.opencode/memory/last_compaction_result.json
+.opencode/memory/*.corrupt.*
+```
+
+The state can contain project decisions, session identifiers, and operational metadata. It is runtime memory, not source code.
+
+### 8. Use replace-mode compaction intentionally
+
+The default augment mode is the compatibility-first choice. If you specifically want TokenMaxxer to enforce its structured handoff schema, opt into replace mode and evaluate it on your workload:
+
+```bash
+TOKENMAXXER_COMPACTION_MODE=replace opencode
+```
+
+You can switch back to augment mode at any time without uninstalling anything.
+
+### 9. Let `tokenmaxxer decisions --all` explain confusing memory
+
+If a decision seems stale or contradictory, inspect authority, supersession, provenance, and unresolved human conflicts before editing STATE by hand:
+
+```bash
+tokenmaxxer decisions --all
+```
+
+The CLI is designed to make decision lineage inspectable without bypassing the store's transaction and authority rules.
+
+---
+
+## Diagnostics
+
+Start with the tool:
+
+```text
+tokenmaxxer_status
+```
+
+Useful artifacts include:
+
+| What | Location |
+|---|---|
+| Project-local memory | `.opencode/memory/STATE.json` |
+| Global fallback memory | `~/.config/opencode/memory/<project-hash>/STATE.json` |
+| Last TokenMaxxer compaction payload | `.opencode/memory/last_compaction_prompt.log` or global fallback |
+| Last successful compaction diagnostic | `.opencode/memory/last_compaction_result.json` or global fallback |
+| Corrupt-state backups | alongside the affected STATE file |
+| Commit-pulse telemetry | `~/.config/opencode/memory/<project-hash>/.commit-pulse` |
+| Release identity | `~/.config/opencode/tokenmaxxer-release.json` |
+
+Check plugin logs when needed:
+
+```bash
+grep "tokenmaxxer plugin loaded" ~/.local/share/opencode/log/opencode.log
+grep "compaction hook fired" ~/.local/share/opencode/log/opencode.log
+```
+
+Diagnostic persistence is best-effort and isolated from memory correctness: a diagnostic write failure does not turn a successful STATE transaction into a failed one.
+
+---
+
+## Reliability
+
+TokenMaxxer treats project memory as state, not as a convenient scratch file.
+
+That means the implementation includes:
+
+- atomic writes
+- explicit schema migration
+- exact UTF-8 storage budgets
+- bounded automatic field creation
+- corrupt-file backup/recovery
+- authoritative local/global read selection
+- monotonic revisions
+- cross-process project locking
+- source idempotency tracking
+- decision supersession and authority resolution
+- provenance and evidence contracts
+- human-reviewed foundational trust
+- bounded diagnostic artifacts
+- safe compaction fallbacks
+- reproducible release checks
+- immutable release manifests and SHA-256 verification
+- transactional installer rollback
+
+### CRIP: Concrete Reliability Implementation Plan
+
+Before the first immutable `v0.1.0` release, TokenMaxxer completed a ten-workstream **Concrete Reliability Implementation Plan (CRIP)** covering storage authority, cross-process transactions, decision trust, host contracts, source idempotency, LLM trust boundaries, compaction quality, bounded storage, diagnostics, and release hygiene.
+
+**All 10/10 workstreams reached independently reviewed `Complete — Ship` status.**
+
+The review trail is intentionally public:
+
+- [`docs/CRIP/README.md`](docs/CRIP/README.md) — CRIP index and status
+- [`docs/CRIP/assessment.md`](docs/CRIP/assessment.md) — original reliability assessment
+- [`docs/CRIP/implementation-plan.md`](docs/CRIP/implementation-plan.md) — ten-workstream implementation plan
+- [`docs/CRIP/post-crip-adversarial-review.md`](docs/CRIP/post-crip-adversarial-review.md) — post-program adversarial review
+- [`docs/CRIP/post-crip-hardening-plan.md`](docs/CRIP/post-crip-hardening-plan.md) — public follow-up hardening roadmap
+
+The post-CRIP audit deliberately continues attacking edge cases rather than pretending the project is finished forever. That roadmap is part of the reliability story, not something hidden from it.
+
+---
+
+## Manual install / build from source
+
+For development or a source build:
 
 ```bash
 git clone https://github.com/thehun927/TokenMaxxer.git
 cd TokenMaxxer
 npm ci
 npm run build
-mkdir -p ~/.config/opencode/plugins
-cp dist/index.js ~/.config/opencode/plugins/tokenmaxxer.js       # generated server target, global (all projects)
-cp dist/tui.js ~/.config/opencode/plugins/tokenmaxxer-tui.js     # generated TUI target, global (all projects)
-# or: cp dist/index.js .opencode/plugins/tokenmaxxer.js       # local (single project)
 ```
 
-For a global install, add `"./plugins/tokenmaxxer-tui.js"` once to the
-`plugin` array in `~/.config/opencode/tui.json` without removing existing
-entries. Also ensure `~/.config/opencode/package.json` has these dependency
-ranges (the one-liner adds them without running a network install):
+The build produces self-contained generated targets without code-split chunk files:
+
+```text
+dist/index.js   # server plugin
+dist/tui.js     # TUI plugin
+dist/cli.js     # human-review CLI
+```
+
+Copy the server and TUI targets for a global install:
+
+```bash
+mkdir -p ~/.config/opencode/plugins
+cp dist/index.js ~/.config/opencode/plugins/tokenmaxxer.js
+cp dist/tui.js ~/.config/opencode/plugins/tokenmaxxer-tui.js
+cp dist/cli.js ~/.config/opencode/plugins/tokenmaxxer-cli.js
+```
+
+For the TUI target, add this entry to the `plugin` array in `~/.config/opencode/tui.json` without removing existing entries:
+
+```jsonc
+{
+  "plugin": [
+    "./plugins/tokenmaxxer-tui.js"
+  ]
+}
+```
+
+The OpenCode config package also needs compatible runtime dependencies:
 
 ```json
 {
@@ -140,307 +599,97 @@ ranges (the one-liner adds them without running a network install):
 }
 ```
 
-Restart opencode after copying both files so the server and separate TUI
-targets, dependencies, and TUI configuration are loaded.
+Restart OpenCode after installing or replacing plugin targets.
 
-The installer also provides a `tokenmaxxer` launcher. After installation, run
-OpenCode with extraction enabled for the child process:
+> **Developer note:** the build pipeline includes a Bun-based TUI build step in addition to the Node/npm toolchain. Use the repository's pinned runtime/version files when developing.
 
-```bash
-tokenmaxxer opencode [args]
-```
-
-This launcher requires the tokenmaxxer plugin/launcher to be installed and a
-configured, connected, accessible small model. It only supplies the extraction
-opt-in environment; it does not provide model credentials or entitlement.
-
-### Optional tuning (not required)
-
-For better token efficiency, add to your project's `opencode.json`:
-
-```jsonc
-{
-  "compaction": { "auto": true, "prune": true, "reserved": 25000 },
-  "watcher": { "ignore": [".opencode/memory/**"] }
-}
-```
-
-| Setting | Why |
-|---|---|
-| `compaction.prune: true` | Drops old tool outputs — the biggest single token saver. Tokenmaxxer works without it, but compaction is less efficient. |
-| `compaction.reserved: 25000` | Headroom so compaction doesn't overflow. |
-| `watcher.ignore` | Stops the file watcher from processing the plugin's writes to `.opencode/memory/`. Harmless without it, but slightly cleaner. |
-
-### .gitignore
-
-Add to your project `.gitignore`:
-
-```
-.opencode/memory/STATE.json
-.opencode/memory/last_compaction_prompt.log
-.opencode/memory/*.corrupt.*
-```
-
-`STATE.json` contains session IDs and project decisions — don't commit it.
-
-## Tools
-
-The plugin registers 7 custom tools, available to the agent in every session:
-
-| Tool | When to use | What it returns |
-|---|---|---|
-| `get_project_state` | **Call once at session start** when resuming work | Full project memory: current task, active files, valid decisions, blockers, next steps |
-| `recall_decision` | When you need to recall a prior decision | Decisions matching a topic query (or most recent if no query) |
-| `get_active_files` | When you need to know which files matter | Files being worked on and why each matters |
-| `recall_promote` | When a decision should never be forgotten | Requests human review to mark a decision as foundational — always included in compaction context |
-| `preview_compaction` | When context is getting large | Previews what would survive compaction before it fires |
-| `head_files` | When exploring large files | First N lines of files — cheaper than full `read` |
-| `tokenmaxxer_status` | When debugging | Plugin health: memory file path, size, decision count, last write, last compaction |
-
-## Kill switch
-
-If the schema-constrained compaction prompt makes things worse, disable it without uninstalling:
-
-```bash
-TOKENMAXXER_NO_PROMPT=1
-```
-
-This selects augment mode for compatibility: the plugin leaves `output.prompt` unset and appends its data-only context, letting opencode use its default compaction prompt. The compaction hook always augments the native prompt with structured context; it does not replace it.
-
-## Optional LLM extraction
-
-Heuristic extraction remains the default. LLM extraction is **opt-in**. Start
-OpenCode with:
-
-```bash
-TOKENMAXXER_LLM_EXTRACT=1 opencode
-```
-
-Alternatively, the installer-provided launcher enables the same environment for
-its child process:
-
-```bash
-tokenmaxxer opencode [args]
-```
-
-The launcher is available only after plugin/launcher installation and still
-requires an accessible configured/connected small model. Heuristic extraction remains the
-durable fallback when the opt-in path is disabled, the model cannot be used, or
-the structured result is invalid.
-
-When enabled, tokenmaxxer resolves the extraction model from the user's
-OpenCode installation:
-
-1. If `small_model` is a valid `provider/model` string in the host config, it
-   is the explicit model override. The verified example for this environment is
-   `ollama-cloud/gpt-oss:20b`; it is not a permanent or universal recommendation.
-2. If `small_model` is absent or malformed, tokenmaxxer reads the host provider
-   inventory from connected providers in `data.all[].models`, keeps only active,
-   zero-cost, tool-callable models, and prefers candidates that advertise an
-   explicit `none` reasoning variant. A `none` variant is not required: if no
-   preferred candidate has one, another eligible candidate may be selected in
-   host provider-list and model-map order.
-3. Automatic discovery never falls back to a paid model, including a paid
-   Anthropic model. Provider and model names are not hardcoded.
-
-Structured extraction uses `variant: none` when the selected model advertises
-that variant. If it does not, extraction uses the selected model without
-forcing an unavailable variant. The verified explicit
-`ollama-cloud/gpt-oss:20b` example has no `none` variant and remains a valid
-explicit choice. Heuristics remain the fallback when the selected model cannot
-be used or its structured result is invalid.
-
-An OpenCode model listing is inventory only. It does not guarantee
-authentication, entitlement, thinking/tool-choice compatibility, or adherence
-to the structured-result contract. The selected model still needs to be
-available through a connected provider. If a model request returns `401`,
-authenticate and verify the provider before enabling extraction:
-
-```bash
-opencode auth login
-```
-
-Complete the OpenCode/Zen provider flow, then confirm the connection with:
-
-```bash
-opencode auth list
-```
-
-Auto-discovery selects models only from connected providers. An explicit
-`small_model` that is listed but unavailable, not entitled, not authenticated,
-or incompatible falls back to heuristic extraction rather than being replaced
-with another model.
-
-Extraction uses the host `PluginInput` v1 client transport; it does not create
-a separate SDK-v2 bridge. The generated client types omit JSON-schema fields
-that the existing server responses already provide, so the session prompt
-request and result each use one localized compatibility cast. Zod validates
-the structured result after the result cast. This is a bounded compatibility
-risk: a transport or validation failure is retried once and then fails safe to
-heuristic extraction rather than replacing it with an alternate bridge.
-
-Free offerings change, and providers may apply their own data-use policies.
-This selection policy makes no permanent claim about which model is best.
-
-### List and configure models
-
-List the models available to the OpenCode installation that is running the
-plugin. The list describes inventory; it does not prove that a model is
-authenticated, entitled, compatible, or currently usable:
-
-```bash
-opencode models
-```
-
-To select one exact model, copy its provider and model IDs into the top-level
-`small_model` setting. The value must use the `provider/model` form:
-
-```jsonc
-{
-  "small_model": "ollama-cloud/gpt-oss:20b"
-}
-```
-
-Use the exact provider and model identifiers shown by OpenCode. The verified
-Ollama Cloud value above is an environment-specific example, not a promise
-that the model will remain available, entitled, compatible, or preferable.
-With a valid override, tokenmaxxer does not replace it with an automatically
-discovered model. Remove it (or correct it) to use eligible-model discovery.
-
-The extraction prompt has a strict structured-output contract. In particular,
-every `active_files` object requires both `path` and `reason`, and every
-`decisions` object requires both `topic` and `decision`. Assistant prose,
-free-form JSON, and code fences do not satisfy the contract.
-
-### Run a real extraction test
-
-Use a fresh source session so an earlier cache entry cannot satisfy the test.
-Do not use `opencode run` for this validation: `opencode run` may exit before
-the fire-and-forget `session.idle` handlers finish. It can therefore create the
-source session without persisting memory or the retained audit extraction
-session.
-
-1. In the target project, start an interactive OpenCode process, either
-   directly or through the installed launcher:
-
-   ```bash
-   TOKENMAXXER_LLM_EXTRACT=1 opencode
-   ```
-
-   ```bash
-   tokenmaxxer opencode
-   ```
-
-2. Send a prompt with an explicit decision and next step, for example: “For an
-   extraction test, explicitly decide to keep the heuristic fallback available,
-   state one next step, and do not edit files.”
-3. Keep the process open after the response until the source session is idle and
-   its detached idle work has completed.
-4. Confirm that `.opencode/memory/STATE.json` has a newer timestamp than before
-   the test and contains an `llm_extraction_cache` entry. Its key includes the
-   source session, canonical input, and selected provider/model.
-5. Run `opencode session list` and confirm it includes a visible retained
-   session titled `tokenmaxxer extract · ...`.
-
-The verified run used the connected `ollama-cloud/gpt-oss:20b` model: the host
-returned `StructuredOutput`, tokenmaxxer Zod-validated and merged the facts,
-and the cache and retained audit session were both present. A model listing
-alone is not a successful extraction test; authentication, entitlement,
-thinking/tool-choice behavior, and structured-result adherence must work.
-
-The retained session is a normal audit record and is never deleted. If
-discovery finds no eligible connected model, no cache entry or audit session is
-created because the opt-in path correctly uses heuristics only.
-
-## Debugging
-
-| What | Where |
-|---|---|
-| Plugin health | Call the `tokenmaxxer_status` tool |
-| Last injected compaction prompt | `.opencode/memory/last_compaction_prompt.log` |
-| Last compaction result | `.opencode/memory/last_compaction_result.json` |
-| Raw memory file | `.opencode/memory/STATE.json` (human-readable JSON) |
-| Corrupt file backups | `.opencode/memory/*.corrupt.*` |
-| Plugin load confirmation | opencode logs: `grep "tokenmaxxer plugin loaded" ~/.local/share/opencode/log/opencode.log` |
-| Compaction hook confirmation | opencode logs: `grep "compaction hook fired" ~/.local/share/opencode/log/opencode.log` |
-
-## How memory extraction works
-
-The heuristic extractor scans the session transcript on `session.idle` and extracts:
-
-- **Current task** — first natural-language user message (skips XML, JSON, code blocks)
-- **Active files** — from `read`/`edit`/`write`/`bash` tool calls (path field `filePath`), filtered to real source files (URLs, system paths, and paths without extensions are rejected)
-- **Decisions** — from user and assistant text, using keyword matching (`let's`, `decided`, `chose`, `go with`, etc.) with:
-  - **Sentence-initial requirement** — keywords must be at the start of a sentence or after a clause boundary (prevents "The decision regex has a gap" from matching)
-  - **Pre-keyword negation** — checks 3 words before the keyword for `not`/`never`/`avoid`/`skip`/`reject`
-  - **Post-keyword negation** — checks 3 words after the keyword (catches "decided to not use X")
-  - **Code block stripping** — fenced code blocks, inline code, and JSON-like lines are removed before scanning
-  - **Quality filters** — topics must be plausible nouns (rejects common English words, code fragments, JSON artifacts)
-  - **Tool outputs excluded** — only natural language conversation is scanned, not file contents or logs
-- **Blockers** — last assistant message, lines containing `blocked`/`can't`/`fails`/`error`/`stuck`
-- **Next steps** — last assistant message, numbered lists and `next:`/`then:`/`TODO` lines
-
-Memory is merged across sessions: new decisions on the same topic supersede old ones (exact normalized topic match, not substring — "auth" does not clobber "authentication"). The file is pruned to 8KB: invalid decisions dropped first, then old active files, then decisions older than 30 days, then last-resort truncation.
-
-## Limitations
-
-- **Heuristic extraction is conservative.** It prioritizes precision over recall — it would rather produce no decisions than wrong ones. Decisions stated in unusual phrasing will be missed. Optional structured LLM extraction is available through `TOKENMAXXER_LLM_EXTRACT=1`, with heuristics retained as the durable fallback.
-- **Host client type compatibility.** The host `PluginInput` v1 client transport's generated types omit existing server JSON-schema fields. Two localized casts bridge only the session prompt request and result, with Zod validation, one retry, and heuristic fallback. This bounded risk is not a separate SDK-v2 bridge.
-- **No per-turn history pruning.** The plugin only intervenes at compaction time. Per-turn pruning would require the `experimental.chat.messages.transform` hook (which exists in the opencode API but is undocumented and unstable).
-- **Durable recency uses the last three recorded source sessions.** Session IDs are retained in a bounded history, while older decisions remain available through the recall tools.
-- **Event handlers are fire-and-forget.** opencode does not await async event handlers. If opencode exits while `writeMemoryOnIdle` is in flight, the write may not complete. Atomic writes (temp file + rename) prevent corruption — the worst case is a missed write, never a corrupt file.
-- **Non-git directories.** opencode sets `worktree` to `/` in non-git directories. The plugin falls back to `directory` (session CWD) in this case.
+---
 
 ## Architecture
 
-```
+```text
 src/
-  index.ts                # Plugin entry — wires all hooks
-  types.ts                # Shared types (CompactionInput, TranscriptPart, etc.)
-  config.ts               # Options + legacy compatibility mapping (TOKENMAXXER_NO_PROMPT)
-  memory/
-    schema.ts             # Zod schemas (MemoryFile, Decision, ActiveFile)
-    migrate.ts            # Version-aware migration (v1 → v2)
-    store.ts              # Read/write STATE.json (cached, mtime-invalidated, corrupt recovery)
-    writer.ts             # Heuristic/LLM extraction, merge, prune, STATE.json writes
-    extract-llm.ts        # Opt-in structured extraction, model discovery, cache
-    extract-prompt.ts     # Canonical extraction input and prompt
-    reader.ts             # Query helpers for tools
-  compaction/
-    prompt.ts             # Schema-constrained compaction prompt
-    durable.ts            # Builds durable-state block (bounded: foundational + recent + top-5 older)
-  tools/
-    recall.ts             # recall_decision, get_active_files, get_project_state, recall_promote
-    efficiency.ts         # preview_compaction, head_files
-    status.ts             # tokenmaxxer_status
-  util/
-    git.ts                # Current git SHA (Bun.$ with child_process fallback)
-    log.ts                # client.app.log wrapper (never throws)
-    fs.ts                 # Atomic write, safe read, mtime, ensureDir
+├── index.ts                  # Plugin entry: hooks, idle writes, compaction diagnostics
+├── config.ts                 # Compaction mode configuration + legacy mapping
+├── cli.ts                    # Human decision-review CLI
+├── tui.tsx                   # Commit-backed OpenCode TUI indicator
+├── host/                     # Verified host-contract adapters
+├── diagnostics/              # Bounded prompt/result diagnostic artifacts
+├── compaction/
+│   ├── prompt.ts             # Augment + schema-constrained replacement payloads
+│   ├── durable.ts            # Bounded durable context construction
+│   ├── history.ts            # Previous-compaction summary recovery
+│   └── sanitize.ts           # Previous-summary sanitization
+├── memory/
+│   ├── schema.ts             # Versioned Zod memory/provenance schemas
+│   ├── store.ts              # Authoritative reads + transactional persistence
+│   ├── project-lock.ts       # Cross-process project lock
+│   ├── budget.ts             # Deterministic 8 KiB fitting/protection policy
+│   ├── writer.ts             # Idle extraction + merge pipeline
+│   ├── merge.ts              # Durable state merge semantics
+│   ├── decision-authority.ts # Authority/conflict resolution
+│   ├── decision-review.ts    # Human promotion/supersession boundary
+│   ├── extract-llm.ts        # Optional structured LLM extraction
+│   ├── provider-inventory.ts # Connected model discovery
+│   └── commit-pulse.ts       # Successful-commit telemetry for the TUI
+├── tools/
+│   ├── recall.ts             # Memory and decision tools
+│   ├── efficiency.ts         # preview_compaction + head_files
+│   ├── bounds.ts             # Tool result bounds
+│   └── status.ts             # tokenmaxxer_status
+└── util/                     # Atomic FS, logging, git helpers
 ```
+
+The server and TUI are intentionally separate. Memory work never needs to render composer text, and the TUI is not required for extraction, recall, or compaction behavior.
+
+---
 
 ## Development
 
 ```bash
-npm ci                # Install dev deps (vitest, tsup, typescript, zod, @opencode-ai/plugin)
-npm test            # Run the test suite
-npm run build        # Rebuild the tracked single-file server and TUI targets
-npx tsc --noEmit    # Type check
+npm ci
+npm test
+npm run build
+npx tsc --noEmit
 ```
 
-## Project structure
+Useful reliability/release checks:
 
+```bash
+npm run verify:host-contract
+npm run verify:dist
+npm run verify:package
+npm run verify:reproducible-build
+npm run audit:release
+npm run release:dry-run
 ```
-docs/
-  PLAN.md            # Original 708-line design spec
-  IMPLEMENTATION.md  # Build guide with function specs, test plan, corrected milestone order
-test/
-  fixtures/          # Transcript fixtures for heuristic extraction tests
-  memory/            # Schema, merge, prune, writer, migrate tests
-  compaction/        # Prompt, durable, bounded policy tests
-  tools/             # Recall, efficiency, status tool tests
-```
+
+Additional project documentation lives under [`docs/`](docs/), including the original design, implementation guide, TUI work, CRIP review trail, reliability plans, release process, and future ideas.
+
+---
+
+## Limitations
+
+TokenMaxxer is intentionally conservative, and a few boundaries are worth understanding:
+
+- **Heuristic extraction favors precision over recall.** Unusual decision phrasing can be missed. LLM extraction can improve structure, but remains optional and validated.
+- **Memory is pull-based in new sessions.** The agent needs to call a recall tool such as `get_project_state`; TokenMaxxer does not automatically inject STATE into every composer session.
+- **OpenCode event handlers are asynchronous.** An abrupt process exit can prevent detached idle work from finishing. Atomic persistence protects existing state from partial writes.
+- **The project has an active post-CRIP hardening roadmap.** The public adversarial review documents remaining edge cases rather than claiming universal correctness.
+- **OpenCode APIs evolve.** TokenMaxxer verifies a known host contract and currently declares compatibility with `>=1.18.15 <2.0.0`.
+
+---
 
 ## License
 
-MIT
+[MIT](LICENSE)
+
+---
+
+<div align="center">
+
+**Long sessions should get smarter, not more forgetful.**
+
+If TokenMaxxer saves your agent from re-learning the same project twice, star the repo and put that context window back to work. ⭐
+
+</div>
