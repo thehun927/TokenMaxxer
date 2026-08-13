@@ -64,6 +64,7 @@ CRIP remains **Complete — Ship, 10/10**; this was a narrowly scoped post-Ship 
 - [`oracle-findings.md`](./oracle-findings.md) — initial independent Block findings.
 - [`oracle-rereview.md`](./oracle-rereview.md), [`oracle-final-rereview.md`](./oracle-final-rereview.md), [`oracle-second-rereview.md`](./oracle-second-rereview.md) — remediation evidence/reviews.
 - [`oracle-second-final-rereview.md`](./oracle-second-final-rereview.md) — final independent **Ship** verdict.
+- [`../post-crip-adversarial-review.md`](../post-crip-adversarial-review.md) — post-program audit covering the first real release plus all original CRIP assessment findings.
 
 ## Shipped distribution strategy
 
@@ -99,11 +100,24 @@ One `package.json` version, `v<version>` tag, and exact 40-hex source commit ide
 
 The release installer may be fetched through GitHub's latest-release asset redirect, but once executing it pins all payload downloads to its embedded exact tag and verifies them before modifying an existing installation.
 
-## Release boundary after hotfix Ship
+## First immutable release — v0.1.0
 
-The original implementation/Oracle review intentionally created no real `v*` tag and no GitHub Release. After Ship, `v0.1.0` was created at `ca4e11f...`; failed first-release attempts remained fail-closed and created no draft or GitHub Release.
+The first published release now exists and is immutable:
 
-The post-Ship lifecycle hotfix has now independently shipped. The validated release source tree is `c5b2cd2f0bcc56ad41ac2b9b4f335019990f75b9`. Because `v0.1.0` has not been published as a GitHub Release, the operational release step is to recreate/retarget the still-unpublished annotated `v0.1.0` tag onto that validated hotfix tree and use the resulting new tag-push workflow as first-release evidence. Historical run `31651601925` remains diagnostic history only.
+```text
+release: v0.1.0
+source:  c5b2cd2f0bcc56ad41ac2b9b4f335019990f75b9
+tag object: 62c2da8c112e7a4f6b84163a0fac2d49662f8580
+release workflow: 31662898531
+```
+
+The workflow successfully completed immutable-release preflight, exact tag/version/commit validation, the full release validation chain, staging, draft creation, asset upload, pre-publish inventory/checksum verification, and publication. GitHub currently reports the release as `immutable: true`, and GitHub's release attestation exists and binds the `v0.1.0` release/tag plus the published asset digests.
+
+The workflow itself concluded red only at the final immediate `gh release verify` step: the attestation was not yet queryable in the sub-second interval immediately after publication, but became available afterward. The post-CRIP adversarial review records this as release-gate reliability finding **A8**, not a release-integrity failure. Future release workflows should poll/retry post-publish attestation verification instead of assuming zero propagation delay.
+
+A separate earlier tag attempt also exposed a nondeterministic TMTUI commit-pulse test race; that is recorded as **A7** in the post-CRIP review.
+
+Do not delete, recreate, retag, or republish `v0.1.0`: it is now the immutable first release. Future workflow hardening applies to subsequent versions.
 
 ## Scope preserved
 
