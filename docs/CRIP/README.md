@@ -8,6 +8,7 @@ This directory is the canonical home for TokenMaxxer's **Concrete Reliability Im
 
 - [`assessment.md`](./assessment.md) — independent codebase assessment that established the confirmed reliability findings.
 - [`implementation-plan.md`](./implementation-plan.md) — canonical ten-PR Concrete Reliability Implementation Plan.
+- [`post-crip-adversarial-review.md`](./post-crip-adversarial-review.md) — comprehensive post-program adversarial audit of the shipped codebase against every original assessment finding. CRIP remains 10/10 Complete — Ship; the audit identifies **0 Critical, 3 High, 6 Medium, and 2 Low/maintainability** residual or newly exposed hardening findings.
 
 ## PR status
 
@@ -25,6 +26,18 @@ This directory is the canonical home for TokenMaxxer's **Concrete Reliability Im
 | PR 10 | Reproducible release and dependency hygiene | **Complete — Ship** | [`PR-10/`](./PR-10/) |
 
 The final PR-10 Oracle gate is recorded in [`PR-10/oracle-second-final-rereview.md`](./PR-10/oracle-second-final-rereview.md). The reviewed implementation head is `ca4e11f440494aae8b8ba02ce33ba72acd315a3a`; GitHub CI run `31650370812` passed on that exact tree. No release tag was created before the final Ship verdict.
+
+PR 10 subsequently received the independently reviewed post-Ship release-tag lifecycle hotfix at `c5b2cd2f0bcc56ad41ac2b9b4f335019990f75b9`; see [`PR-10/post-ship-release-tag-hotfix-oracle-final.md`](./PR-10/post-ship-release-tag-hotfix-oracle-final.md). The first `v0.1.0` immutable release is operational evidence considered by the post-CRIP adversarial review.
+
+## Post-program hardening boundary
+
+The post-CRIP audit does **not** reopen or invalidate the ten completed workstreams. It distinguishes successful CRIP implementation from universal claims at newly attacked seams. Its three High findings are:
+
+1. physical project path aliases can derive separate global namespaces/locks for one underlying repository;
+2. automatic compaction does not yet consume the centralized decision-authority/trusted-foundation view;
+3. the first heuristic source transaction can miss a completion marker inserted after its outer pre-read and return `cache-hit` after a durable mutation.
+
+Those findings should be handled as a separately reviewed hardening tranche before describing the core invariants as universal across aliases, legacy states and adversarial cross-process source timing.
 
 ## PR directory convention
 
