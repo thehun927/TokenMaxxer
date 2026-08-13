@@ -6,6 +6,7 @@
 - Hotfix plan/current-main baseline: `499fa01e856593c266e22a3de9fe9f50c0eeb409`
 - Original release implementation: `ca4e11f440494aae8b8ba02ce33ba72acd315a3a`
 - Implementation hotfix commit: `c5b2cd2f0bcc56ad41ac2b9b4f335019990f75b9`
+- Handoff document commit: `e4e0f9ae749bf590e42444299ab98553bf1e1bda`
 - Package version: `0.1.0`
 
 The obsolete ambient zero-release-tag assertion was historical pre-Ship
@@ -159,8 +160,8 @@ During implementation and handoff:
 - Git fixture setup emits Git's harmless default-branch advisory and an
   expected empty-index `git rm` diagnostic while constructing an orphan
   fixture. The fixture tests pass and clean up their temporary repositories.
-- This document is added after the implementation CI run; its final handoff
-  commit and any resulting ordinary CI run must be recorded when available.
+- The handoff document commit `e4e0f9ae749bf590e42444299ab98553bf1e1bda`
+  passed ordinary CI run `31660763135`, job `verify` / `94324908325`.
 
 Luna did not issue Ship, move `v0.1.0`, create a release, create a draft, or
 weaken immutable-release controls. Stop here for independent Oracle review.
