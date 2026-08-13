@@ -25,9 +25,20 @@ PR 10 is the final CRIP workstream. It removes ambiguous committed-`dist/` relea
 
 Final Oracle verdict: [`oracle-second-final-rereview.md`](./oracle-second-final-rereview.md) — **Ship**.
 
+## Post-Ship release hotfix
+
+The first real `v0.1.0` release attempt exposed one lifecycle-only release validation defect after the Ship verdict: implementation-era tests and the dry-run preflight still assumed that the repository must contain zero `v*` tags. Once `v0.1.0` legitimately existed, the tag workflow passed immutable-release and exact-tag preflight but failed the full suite before staging or draft creation.
+
+CRIP remains **Complete — Ship**; this is a narrowly scoped post-Ship release-hygiene hotfix, not a reopened reliability workstream.
+
+Implementation plan: [`post-ship-release-tag-hotfix-plan.md`](./post-ship-release-tag-hotfix-plan.md).
+
+Until that hotfix is implemented and independently reviewed, do not publish the first immutable GitHub Release. The existing historical workflow run `31651601925` is associated with the pre-hotfix `ca4e11f...` tag target and must not be treated as final release evidence.
+
 ## Canonical artifacts
 
 - [`implementation-plan.md`](./implementation-plan.md) — concrete nine-wave implementation plan, generated-only dist strategy, immutable release contract, transactional installer, dependency policy, pinned workflow actions, documentation truth pass, 100-case semantic release matrix, Luna/subagent ownership, and Oracle attack surface.
+- [`post-ship-release-tag-hotfix-plan.md`](./post-ship-release-tag-hotfix-plan.md) — lifecycle-correct tag/preflight hotfix plan discovered during first real release execution.
 - [`blockers.md`](./blockers.md) — append-only implementation/decision log.
 - [`dependency-audit.json`](./dependency-audit.json) — implementation-head npm audit snapshot.
 - [`dependency-audit.md`](./dependency-audit.md) — advisory triage and disposition.
@@ -72,7 +83,9 @@ The release installer may be fetched through GitHub's latest-release asset redir
 
 ## Release boundary after Ship
 
-Implementation and Oracle review intentionally created no real `v*` tag and no GitHub Release. With the independent Ship verdict recorded, the maintainer may now follow [`../../RELEASING.md`](../../RELEASING.md) to create the first real annotated release tag and allow the tag-only workflow to publish the immutable release.
+The original implementation/Oracle review intentionally created no real `v*` tag and no GitHub Release. After Ship, `v0.1.0` was created and the real release workflow exposed the post-Ship lifecycle defect documented above. No GitHub Release or draft was created by those failed attempts.
+
+After the hotfix receives its own independent Ship verdict, follow [`../../RELEASING.md`](../../RELEASING.md) together with the hotfix plan's post-review tag procedure to create the first immutable release from the validated hotfix tree.
 
 ## Scope preserved
 
