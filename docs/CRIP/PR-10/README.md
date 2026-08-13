@@ -25,20 +25,38 @@ PR 10 is the final CRIP workstream. It removes ambiguous committed-`dist/` relea
 
 Final Oracle verdict: [`oracle-second-final-rereview.md`](./oracle-second-final-rereview.md) — **Ship**.
 
-## Post-Ship release hotfix
+## Post-Ship release hotfix — Complete — Ship
 
-The first real `v0.1.0` release attempt exposed one lifecycle-only release validation defect after the Ship verdict: implementation-era tests and the dry-run preflight still assumed that the repository must contain zero `v*` tags. Once `v0.1.0` legitimately existed, the tag workflow passed immutable-release and exact-tag preflight but failed the full suite before staging or draft creation.
+The first real `v0.1.0` release attempt exposed one lifecycle-only release validation defect after the Ship verdict: implementation-era tests and dry-run preflight still assumed that the repository must contain zero `v*` tags. Once `v0.1.0` legitimately existed, the tag workflow passed immutable-release and exact-tag preflight but failed the full suite before staging or draft creation.
 
-CRIP remains **Complete — Ship**; this is a narrowly scoped post-Ship release-hygiene hotfix, not a reopened reliability workstream.
+The lifecycle hotfix removes ambient zero-tag authority from perpetual validation. Ordinary CI and dry-run validation now tolerate historical release tags, while real publication mode validates only the requested tag's exact target plus `origin/main` ancestry and retains non-dry-run HEAD authenticity.
 
-Implementation plan: [`post-ship-release-tag-hotfix-plan.md`](./post-ship-release-tag-hotfix-plan.md).
+Hotfix implementation:
 
-Until that hotfix is implemented and independently reviewed, do not publish the first immutable GitHub Release. The existing historical workflow run `31651601925` is associated with the pre-hotfix `ca4e11f...` tag target and must not be treated as final release evidence.
+```text
+c5b2cd2f0bcc56ad41ac2b9b4f335019990f75b9
+```
+
+Exact implementation CI:
+
+```text
+run 31660513870
+job 94324172875
+81 passed test files + 1 skipped
+1351 passed tests + 1 skipped
+33/33 focused lifecycle + identity tests
+```
+
+Independent hotfix verdict: [`post-ship-release-tag-hotfix-oracle-final.md`](./post-ship-release-tag-hotfix-oracle-final.md) — **Ship**.
+
+CRIP remains **Complete — Ship, 10/10**; this was a narrowly scoped post-Ship release-hygiene correction, not a reopened reliability workstream.
 
 ## Canonical artifacts
 
 - [`implementation-plan.md`](./implementation-plan.md) — concrete nine-wave implementation plan, generated-only dist strategy, immutable release contract, transactional installer, dependency policy, pinned workflow actions, documentation truth pass, 100-case semantic release matrix, Luna/subagent ownership, and Oracle attack surface.
 - [`post-ship-release-tag-hotfix-plan.md`](./post-ship-release-tag-hotfix-plan.md) — lifecycle-correct tag/preflight hotfix plan discovered during first real release execution.
+- [`post-ship-release-tag-hotfix-investigation.md`](./post-ship-release-tag-hotfix-investigation.md) — Luna hotfix implementation evidence and H1–H30 mapping.
+- [`post-ship-release-tag-hotfix-oracle-final.md`](./post-ship-release-tag-hotfix-oracle-final.md) — independent final hotfix **Ship** verdict.
 - [`blockers.md`](./blockers.md) — append-only implementation/decision log.
 - [`dependency-audit.json`](./dependency-audit.json) — implementation-head npm audit snapshot.
 - [`dependency-audit.md`](./dependency-audit.md) — advisory triage and disposition.
@@ -81,11 +99,11 @@ One `package.json` version, `v<version>` tag, and exact 40-hex source commit ide
 
 The release installer may be fetched through GitHub's latest-release asset redirect, but once executing it pins all payload downloads to its embedded exact tag and verifies them before modifying an existing installation.
 
-## Release boundary after Ship
+## Release boundary after hotfix Ship
 
-The original implementation/Oracle review intentionally created no real `v*` tag and no GitHub Release. After Ship, `v0.1.0` was created and the real release workflow exposed the post-Ship lifecycle defect documented above. No GitHub Release or draft was created by those failed attempts.
+The original implementation/Oracle review intentionally created no real `v*` tag and no GitHub Release. After Ship, `v0.1.0` was created at `ca4e11f...`; failed first-release attempts remained fail-closed and created no draft or GitHub Release.
 
-After the hotfix receives its own independent Ship verdict, follow [`../../RELEASING.md`](../../RELEASING.md) together with the hotfix plan's post-review tag procedure to create the first immutable release from the validated hotfix tree.
+The post-Ship lifecycle hotfix has now independently shipped. The validated release source tree is `c5b2cd2f0bcc56ad41ac2b9b4f335019990f75b9`. Because `v0.1.0` has not been published as a GitHub Release, the operational release step is to recreate/retarget the still-unpublished annotated `v0.1.0` tag onto that validated hotfix tree and use the resulting new tag-push workflow as first-release evidence. Historical run `31651601925` remains diagnostic history only.
 
 ## Scope preserved
 
