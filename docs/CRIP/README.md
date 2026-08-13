@@ -9,6 +9,7 @@ This directory is the canonical home for TokenMaxxer's **Concrete Reliability Im
 - [`assessment.md`](./assessment.md) — independent codebase assessment that established the confirmed reliability findings.
 - [`implementation-plan.md`](./implementation-plan.md) — canonical ten-PR Concrete Reliability Implementation Plan.
 - [`post-crip-adversarial-review.md`](./post-crip-adversarial-review.md) — comprehensive post-program adversarial audit of the shipped codebase against every original assessment finding. CRIP remains 10/10 Complete — Ship; the audit identifies **0 Critical, 3 High, 6 Medium, and 2 Low/maintainability** residual or newly exposed hardening findings.
+- [`post-crip-hardening-plan.md`](./post-crip-hardening-plan.md) — **canonical "what's next" roadmap** for the post-CRIP findings, ordered by dependency and severity with concrete remediation and adversarial acceptance criteria.
 
 ## PR status
 
@@ -38,6 +39,33 @@ The post-CRIP audit does **not** reopen or invalidate the ten completed workstre
 3. the first heuristic source transaction can miss a completion marker inserted after its outer pre-read and return `cache-hit` after a durable mutation.
 
 Those findings should be handled as a separately reviewed hardening tranche before describing the core invariants as universal across aliases, legacy states and adversarial cross-process source timing.
+
+### What is next
+
+The authoritative execution order is maintained in [`post-crip-hardening-plan.md`](./post-crip-hardening-plan.md).
+
+The **minimum next-release hardening gate** is:
+
+```text
+A1 physical project identity
+A2 compaction authority/trust alignment
+A3 source-idempotency transaction recheck
+A7 deterministic commit-pulse test
+A8 bounded immutable-attestation verification retry
+A9 explicit/portable installer shell contract
+```
+
+After that:
+
+```text
+A4 decide the durable source-completion horizon
+A5 fix first-run non-git LLM identity
+A6 prove runtime host compatibility before fail-open
+A10 make status authority-aware
+A11 refactor writer.ts only after behavior is frozen
+```
+
+When implementation begins, create a separately reviewed `docs/CRIP/post-CRIP-hardening/` tranche directory rather than altering historical PR 1–10 review artifacts.
 
 ## PR directory convention
 
