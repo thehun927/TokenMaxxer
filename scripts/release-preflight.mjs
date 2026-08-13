@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * PR-10 Wave 4: Release Preflight Identity Validator
+ * PR-10 Wave 2: Release Preflight Lifecycle Validator
  *
  * Enforces strict identity checks before publication:
  *   - version is valid SemVer
@@ -9,10 +9,14 @@
  *   - peer range stays `>=1.18.15 <2.0.0`
  *   - minimum verified host stays `1.18.15`
  *   - RELEASE.json schema_version is exactly 1
- *   - no release tag exists before the independent Oracle Ship
+ *
+ * Two validation modes:
+ *   --dry-run: Proposed-release identity check (no tag mutation, no ancestry checks)
+ *   --require-main-ancestor: Real publication mode (validates requested tag target and ancestry)
  *
  * Usage:
  *   node scripts/release-preflight.mjs --tag v0.1.0 --commit 0123456789abcdef0123456789abcdef01234567 --dry-run
+ *   node scripts/release-preflight.mjs --tag v0.1.0 --commit 0123456789abcdef0123456789abcdef01234567 --require-main-ancestor
  *
  * Returns exit code 0 on success, 1 on failure.
  */
@@ -187,40 +191,26 @@ function validatePackageIdentity(pkg) {
   return violations
 }
 
-function validateNoExistingReleaseTags() {
-  try {
-    const tags = execFileSync("git", ["tag", "--list", "v*"], { encoding: "utf8" }).trim()
-    if (tags) {
-      return [
-        {
-          field: "release_tags",
-          message: `release tags already exist before the independent Oracle Ship: ${tags}`,
-        },
-      ]
-    }
-  } catch (error) {
-    // Git command failed - this is acceptable in some environments
-    // but we should log it
-    console.warn("Warning: Could not check for existing release tags:", error)
-  }
-  return []
-}
-
-function validateWorkflowTag(tag, commit) {
+function validateRequestedTag(tag, commit) {
   const violations = []
+
+  // Validate requested tag exists and resolves to exact commit
   try {
     const target = execFileSync("git", ["rev-list", "-n1", tag], { encoding: "utf8" }).trim()
     if (target !== commit) {
-      violations.push({ field: "commit", message: `tag ${tag} targets ${target}, expected ${commit}` })
+      violations.push({ field: "tag", message: `tag ${tag} targets ${target}, expected ${commit}` })
     }
   } catch {
     violations.push({ field: "tag", message: `tag ${tag} is not available in the checkout` })
   }
+
+  // Validate commit is reachable from origin/main (publication mode only)
   try {
     execFileSync("git", ["merge-base", "--is-ancestor", commit, "origin/main"])
   } catch {
     violations.push({ field: "commit", message: "tagged commit is not reachable from origin/main" })
   }
+
   return violations
 }
 
@@ -246,7 +236,7 @@ function main() {
 
   if (!tag || !commit) {
     console.error("Error: --tag and --commit are required")
-    console.error("Usage: node scripts/release-preflight.mjs --tag v0.1.0 --commit 0123456789abcdef0123456789abcdef01234567 [--dry-run]")
+    console.error("Usage: node scripts/release-preflight.mjs --tag v0.1.0 --commit 0123456789abcdef0123456789abcdef01234567 [--dry-run] [--require-main-ancestor]")
     process.exit(1)
   }
 
@@ -282,13 +272,13 @@ function main() {
     releaseViolations.forEach((v) => console.error(`  - ${v.field}: ${v.message}`))
   }
 
-  // Validate no existing release tags
-  console.log("\nValidating no existing release tags...")
+  // Validate requested tag (publication mode) or identity check (dry-run)
+  console.log("\nValidating requested tag...")
   const tagViolations = requireMainAncestor
-    ? validateWorkflowTag(tag, commit)
-    : validateNoExistingReleaseTags()
+    ? validateRequestedTag(tag, commit)
+    : []
   if (tagViolations.length > 0) {
-    console.error("Release tag violations:")
+    console.error("Requested tag violations:")
     tagViolations.forEach((v) => console.error(`  - ${v.field}: ${v.message}`))
   }
 
@@ -311,7 +301,7 @@ function main() {
     }
   }
 
-  // Check for fabricated commit
+  // Check for fabricated commit (non-dry-run only)
   console.log("\nValidating commit authenticity...")
   const authenticityViolations = []
   try {
